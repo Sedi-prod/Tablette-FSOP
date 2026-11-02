@@ -1,0 +1,41 @@
+{
+  "name": "sedi-tablette-frontend",
+  "version": "1.0.0",
+  "description": "Interface frontend pour la tablette SEDI",
+  "scripts": {
+    "start": "npx http-server . -p 8080 --cors -o",
+    "dev": "npx http-server . -p 8080 --cors -o",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:coverage:sonar": "vitest run --config vitest.sonar.mjs --coverage",
+    "test:ui": "vitest --ui",
+    "test:watch": "vitest --watch"
+  },
+  "keywords": [
+    "sedi",
+    "frontend",
+    "tablette"
+  ],
+  "author": "SEDI",
+  "license": "MIT",
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@vitest/coverage-v8": "4.1.12",
+    "@vitest/ui": "4.1.12",
+    "happy-dom": "^21.0.4",
+    "http-server": "^14.1.1",
+    "iconv-lite": "^0.7.3",
+    "jsdom": "^27.2.0",
+    "vitest": "4.1.12"
+  },
+  "overrides": {
+    "qs": "^6.17.1",
+    "source-map-js": "^1.2.2",
+    "vitest": "4.1.12",
+    "@vitest/coverage-v8": "4.1.12",
+    "@vitest/ui": "4.1.12",
+    "@vitest/mocker": "4.1.12"
+  }
+}

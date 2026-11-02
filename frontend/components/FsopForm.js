@@ -1,0 +1,2636 @@
+/**
+ * Composant pour afficher et remplir un formulaire FSOP de manière interactive
+ */
+import { collectLotsForVoieCell, collectLotsForLotCell, normalizeFsopLotKey, parseSavedVoies, parseSavedEtiquettes, cellHasEtiquetteSplit } from './fsopForm/lotMatching.js?v=20260908.11';
+import { loadStructure } from './fsopForm/loadStructure.js?v=20260908.11';
+const CHECKBOX_LINE_RE = /^([☐☑✓□]|\[[ x]\])[\t ]+(\S[\s\S]{0,400})$/i;
+/** "Nombre d'essai (≤ 3) : ☐ ☐ ☐" — several boxes after a label */
+const INLINE_CHECKBOX_GROUP_RE = /^(.+?)\s*:\s*((?:[☐☑✓□◻⬜]|\[[ x]\])(?:[\t ]+(?:[☐☑✓□◻⬜]|\[[ x\]])){1,7})\s*$/i;
+const UNIT_SPEC_RE = /\d{1,8}[\t ](?:h|min|°C|°F)/i;
+const STEP_NUMBER_PREFIX_RE = /^(\d{1,2}(?:[a-z])?)[ \t]*[-–.][ \t]*/i;
+const FULL_PATH_HINT_RE = /tra[cç]abilit[eé]|interfero|faces[_ ]?optiques|[a-z]:\s*[\\/]|code_article|n[°º]\s*du\s*lt/i;
+const REPORT_FOLDER_RE = /\*?(INTERFERO[_\w]*|FACES[_ ]?OPTIQUES[_\w]*)\*?/i;
+const CANONICAL_REPORT_ROOT = 'X:/Traçabilité/Code_article/N° du LT';
+
+/**
+ * Word sometimes drops "X:/Traçabilité/Code_article" and only keeps "/N° du LT/INTERFERO_E".
+ * Expand short report paths back to the full template path for display.
+ */
+function expandFsopReportPath(text) {
+    let t = String(text || '');
+    if (!REPORT_FOLDER_RE.test(t) && !/n[°º]\s*du\s*lt/i.test(t)) return t;
+    // Already a full-ish path (with or without underscore in Code_article)
+    if (/tra[cç]abilit/i.test(t) && /code[_\s-]?article/i.test(t)) return t;
+    if (/[A-Za-z]\s*:?\s*[\\/][^\n]{0,40}tra[cç]abilit/i.test(t)) return t;
+
+    // "... sous /N° du LT/INTERFERO_E" or "... sous INTERFERO_E"
+    t = t.replace(
+        /(?:sous\s+)?(?:[\\/])?(?:N[°º]\s*du\s*LT\s*[\\/]\s*)?\*?(INTERFERO[_\w]*|FACES[_ ]?OPTIQUES[_\w]*)\*?/gi,
+        (_m, folder) => `sous ${CANONICAL_REPORT_ROOT}/${String(folder).replace(/^\*|\*$/g, '')}`
+    );
+
+    t = t.replace(
+        /(?:sous\s+)?[\\/]?N[°º]\s*du\s*LT(?![\\/]\S)/gi,
+        `sous ${CANONICAL_REPORT_ROOT}`
+    );
+
+    return t;
+}
+
+/**
+ * Protect path-like spans before blank/N° input rewrites.
+ */
+function extractProtectedPaths(text) {
+    const pathSlots = [];
+    let protectedText = String(text || '');
+    protectedText = protectedText.replace(
+        /(?:[A-Za-z]\s*:\s*[\\/]|[A-Za-z]\s+[\\/]|\\\\\w|[\\/]?[Tt]ra[cç]abilit[eéé]|[\\/]?N[°º]\s*du\s*LT|[\\/]?\*?(?:INTERFERO|FACES[_ ]?OPTIQUES)[_\w]*)[^\n]{0,220}/gi,
+        (m) => {
+            const token = `__FSOP_PATH_${pathSlots.length}__`;
+            pathSlots.push(m.trim());
+            return token;
+        }
+    );
+    return { protectedText, pathSlots };
+}
+
+class FsopForm {
+    constructor(apiService, notificationManager) {
+        this.apiService = apiService;
+        this.notificationManager = notificationManager;
+        this.formData = {
+            placeholders: {},
+            tables: {},
+            passFail: {},
+            checkboxes: {},
+            reference: '',
+            taggedMeasures: {}
+        };
+        this.structure = null;
+        this.container = null;
+    }
+
+    /**
+     * Initialise le formulaire avec la structure du template
+     */
+    async loadStructure(templateCode) {
+        return loadStructure.call(this, templateCode);
+    }
+
+    /**
+     * Génère le HTML du formulaire depuis la structure
+     */
+    render(container, initialData = {}) {
+        if (!this.structure) {
+            throw new Error('Structure non chargée. Appelez loadStructure() d\'abord.');
+        }
+
+        this.container = container;
+        this.formData = {
+            placeholders: { ...initialData.placeholders },
+            tables: { ...initialData.tables },
+            wordlikeTables: { ...initialData.wordlikeTables },
+            passFail: { ...initialData.passFail },
+            checkboxes: { ...initialData.checkboxes },
+            textFields: { ...initialData.textFields },
+            reference: initialData.reference || this.structure.reference?.value || this.structure.reference?.placeholder || '',
+            taggedMeasures: { ...initialData.taggedMeasures },
+            fsopLots: initialData.fsopLots || null,
+            preferredLot: initialData.preferredLot || null,
+            preferredRubrique: initialData.preferredRubrique || null,
+            operatorOptions: initialData.operatorOptions || []
+        };
+        
+        // ⚡ FIX: S'assurer que le numéro de lancement est toujours dans placeholders pour {{LT}}
+        if (initialData.launchNumber && !this.formData.placeholders['{{LT}}']) {
+            this.formData.placeholders['{{LT}}'] = initialData.launchNumber;
+            console.log(`✅ Numéro lancement ajouté aux placeholders: ${initialData.launchNumber}`);
+        }
+
+        // Word-like rendering: preserve exact order (paragraphs/tables/page breaks)
+        // Always prepend the identity header (logo / Cordon / N° cordon / SILOG / LT / désignation)
+        if (Array.isArray(this.structure.blocks) && this.structure.blocks.length > 0) {
+            container.innerHTML = `
+                <div class="fsop-form-container">
+                    ${this.buildIdentityHeaderHtml(initialData)}
+                    ${this.renderWordLike(this.structure.blocks)}
+                </div>
+            `;
+            this.attachEventListeners();
+            return;
+        }
+
+        let html = '<div class="fsop-form-container">';
+        html += this.buildIdentityHeaderHtml(initialData);
+        
+        // Render placeholders (if any remain after header fields)
+        if (this.structure.placeholders && this.structure.placeholders.length > 0) {
+            const headerPlaceholders = this.structure.headerFields?.map(f => f.placeholder).filter(Boolean) || [];
+            const remainingPlaceholders = this.structure.placeholders.filter(p => !headerPlaceholders.includes(p));
+            
+            if (remainingPlaceholders.length > 0) {
+                html += '<div class="fsop-section fsop-placeholders">';
+                html += '<h3><i class="fas fa-tag"></i> Informations générales</h3>';
+                
+                remainingPlaceholders.forEach(placeholder => {
+                    const tag = placeholder.replace(/[{}]/g, '');
+                    const label = this.getPlaceholderLabel(tag);
+                    const value = this.formData.placeholders[placeholder] || '';
+                    
+                    html += `
+                        <div class="fsop-field">
+                            <label for="placeholder_${tag}">${label}</label>
+                            <input 
+                                type="text" 
+                                id="placeholder_${tag}" 
+                                data-placeholder="${placeholder}"
+                                value="${this.escapeHtml(value)}"
+                                class="fsop-input"
+                            />
+                        </div>
+                    `;
+                });
+                
+                html += '</div>';
+            }
+        }
+
+        // Render sections
+        if (this.structure.sections && this.structure.sections.length > 0) {
+            this.structure.sections.forEach(section => {
+                html += this.renderSection(section);
+            });
+        }
+
+        html += '</div>';
+
+        container.innerHTML = html;
+
+        // Attach event listeners
+        this.attachEventListeners();
+    }
+
+    /**
+     * Titre produit du FSOP (ex. "Cordon OHA"), jamais un libellé de champ ("cordon :").
+     */
+    resolveDocumentTitle() {
+        const badTitle = (t) => {
+            const s = String(t || '').trim();
+            if (!s) return true;
+            if (/^(n[°º]?\s*)?cordon\s*:?\s*$/i.test(s)) return true;
+            if (/num[eé]ro\s+(de\s+)?cordon/i.test(s) && s.length < 45) return true;
+            if (/^r[eé]f[eé]rence\s+silog/i.test(s)) return true;
+            return false;
+        };
+
+        const candidates = [];
+        const push = (t) => {
+            const s = String(t || '').trim();
+            if (!s || badTitle(s)) return;
+            candidates.push(s);
+        };
+
+        push(this.structure?.documentTitle);
+        push(this.structure?.metadata?.source?.replace(/\.docx$/i, ''));
+
+        const blocks = Array.isArray(this.structure?.blocks) ? this.structure.blocks : [];
+        for (const b of blocks.slice(0, 25)) {
+            if (b?.type !== 'paragraph') continue;
+            const t = String(b.text || '').trim();
+            if (/^cordon\s+\S+/i.test(t) && t.length <= 60) {
+                push(t);
+                break;
+            }
+        }
+
+        const preferred = candidates.find((t) => /^cordon\s+\S+/i.test(t)) ||
+            candidates.find((t) => /cordon/i.test(t)) ||
+            candidates[0];
+        return preferred || 'Formulaire FSOP';
+    }
+
+    /**
+     * En-tête identité Word (logo SEDI / titre Cordon / N° cordon + tableau SILOG/LT/désignation).
+     * Toujours affiché, y compris en mode word-like.
+     */
+    buildIdentityHeaderHtml(initialData = {}) {
+        const fieldsFromStructure = Array.isArray(this.structure?.headerFields) ? this.structure.headerFields : [];
+        const byKey = new Map(fieldsFromStructure.map((f) => [f.key, f]));
+
+        const ensureField = (key, label, placeholder = null) => {
+            if (byKey.has(key)) return byKey.get(key);
+            return { key, label, placeholder, value: '' };
+        };
+
+        // Always keep the 4 identity cells from the Word template, even if parser missed one.
+        const cordonField = ensureField('NUMERO_CORDON', 'N° cordon :');
+        const gridFields = [
+            ensureField('NUMERO_CORDON', 'Numéro de cordon :'),
+            ensureField('REFERENCE_SILOG', 'Référence SILOG :'),
+            ensureField('NUMERO_LANCEMENT', 'Numéro lancement :', '{{LT}}'),
+            ensureField('DESIGNATION', 'Désignation :')
+        ];
+
+        const resolveValue = (field) => {
+            const fieldKey = field.placeholder || field.key;
+            if (field.key === 'NUMERO_LANCEMENT') {
+                return this.formData.placeholders['{{LT}}'] ||
+                    this.formData.placeholders[field.placeholder] ||
+                    this.formData.placeholders[fieldKey] ||
+                    initialData.placeholders?.['{{LT}}'] ||
+                    initialData.placeholders?.[field.placeholder] ||
+                    initialData.placeholders?.[fieldKey] ||
+                    initialData.launchNumber || '';
+            }
+            if (field.key === 'REFERENCE_SILOG' || field.key === 'NUMERO_SERIE') {
+                return this.formData.placeholders['{{SN}}'] ||
+                    this.formData.placeholders[field.placeholder] ||
+                    this.formData.placeholders[fieldKey] ||
+                    initialData.placeholders?.['{{SN}}'] ||
+                    initialData.placeholders?.[field.placeholder] ||
+                    initialData.placeholders?.[fieldKey] ||
+                    initialData.serialNumber || '';
+            }
+            return this.formData.placeholders[field.placeholder] ||
+                this.formData.placeholders[field.key] ||
+                this.formData.placeholders[fieldKey] ||
+                initialData.placeholders?.[field.placeholder] ||
+                initialData.placeholders?.[field.key] ||
+                initialData.placeholders?.[fieldKey] || '';
+        };
+
+        let html = '<div class="fsop-header-section">';
+        html += '<div class="fsop-header-top">';
+        html += '<div class="fsop-header-logo">';
+        html += '<div class="fsop-logo-text">SEDI<span class="fsop-logo-dot">•</span>ATI</div>';
+        html += '<div class="fsop-logo-subtitle">by Fiber Optics Group</div>';
+        html += '</div>';
+
+        const documentTitle = this.resolveDocumentTitle();
+        html += `<div class="fsop-header-title">${this.escapeHtml(documentTitle)}</div>`;
+
+        const cordonValue = resolveValue(cordonField);
+        html += `
+            <div class="fsop-header-cordon">
+                <label for="header_${cordonField.key}">${this.escapeHtml(cordonField.label.replace(/\s*:?\s*$/, '') + ' :')}</label>
+                <input
+                    type="text"
+                    id="header_${cordonField.key}_top"
+                    data-placeholder="${cordonField.placeholder || cordonField.key}"
+                    value="${this.escapeHtml(cordonValue)}"
+                    class="fsop-input fsop-header-input fsop-cordon-input"
+                />
+            </div>
+        `;
+        html += '</div>'; // header-top
+
+        html += '<div class="fsop-header-box fsop-header-identity-grid">';
+        gridFields.forEach((field) => {
+            const value = resolveValue(field);
+            const label = /:\s*$/.test(field.label) ? field.label : `${field.label} :`;
+            html += `
+                <div class="fsop-header-box-field">
+                    <label for="header_${field.key}">${this.escapeHtml(label)}</label>
+                    <input
+                        type="text"
+                        id="header_${field.key}"
+                        data-placeholder="${field.placeholder || field.key}"
+                        data-field-key="${field.key}"
+                        value="${this.escapeHtml(value)}"
+                        class="fsop-input fsop-header-box-input"
+                    />
+                </div>
+            `;
+        });
+        html += '</div>';
+        html += '</div>'; // header-section
+        return html;
+    }
+
+    renderWordLike(blocks) {
+        // Render in "single page" mode by default: keep A4 width, but don't split by page breaks.
+        // This matches the user's request to keep everything on the same page.
+        let html = '<div class="fsop-word-doc"><div class="fsop-page fsop-page-single">';
+        const sourceBlocks = Array.isArray(blocks) ? blocks : [];
+        const sourceTitleCount = sourceBlocks.reduce((acc, b) => {
+            if (b?.type !== 'paragraph') return acc;
+            const text = String(b?.text || '').trim();
+            return /^\d{1,2}(?:[a-z])?[ \t]*[-–.][ \t]*\S+/i.test(text) ? acc + 1 : acc;
+        }, 0);
+
+        let blankId = 0;
+
+        const buildWordlikeOperatorSelect = (placeholderKey) => {
+            const operatorOptions = Array.isArray(this.formData.operatorOptions) ? this.formData.operatorOptions : [];
+            const savedOperator = String(this.formData.placeholders?.[placeholderKey] || '').trim();
+            const isOtherValue = savedOperator && !operatorOptions.some((opt) => opt.initials === savedOperator);
+            let optionsHtml = '<option value="">-- Choisir --</option>';
+            operatorOptions.forEach((opt) => {
+                const selected = savedOperator === opt.initials ? 'selected' : '';
+                optionsHtml += `<option value="${this.escapeHtml(opt.initials)}" ${selected}>${this.escapeHtml(opt.label)}</option>`;
+            });
+            optionsHtml += `<option value="__OTHER__" ${isOtherValue ? 'selected' : ''}>Autre…</option>`;
+            return `
+                <span class="fsop-operator-cell fsop-operator-inline">
+                    <select class="fsop-operator-select fsop-wordlike-operator-select" data-placeholder="${this.escapeHtml(placeholderKey)}" ${isOtherValue ? 'style="display:none"' : ''}>
+                        ${optionsHtml}
+                    </select>
+                    <input type="text" class="fsop-operator-other-input fsop-ind-input" data-placeholder="${this.escapeHtml(placeholderKey)}" value="${this.escapeHtml(isOtherValue ? savedOperator : '')}" placeholder="Initiales" ${isOtherValue ? '' : 'style="display:none"'} />
+                </span>
+            `;
+        };
+
+        const renderTextWithInputs = (text) => {
+            if (!text) return '';
+            const makeBlankInput = (maxLen = 32) => {
+                const placeholderKey = `{{TEXT_BLANK_${++blankId}}}`;
+                const currentValue = this.formData.placeholders?.[placeholderKey] || '';
+                return `<input class="fsop-ind-input" type="text" maxlength="${maxLen}" data-placeholder="${placeholderKey}" value="${this.escapeHtml(currentValue)}" />`;
+            };
+
+            // Protect / expand file paths so "N° du LT" never becomes an input
+            // and short "/N° du LT/INTERFERO_E" becomes the full Traçabilité path.
+            const expanded = expandFsopReportPath(text);
+            const { protectedText, pathSlots } = extractProtectedPaths(expanded);
+            const pathContext = FULL_PATH_HINT_RE.test(expanded) || pathSlots.length > 0;
+
+            let out = this.escapeHtml(protectedText);
+            out = out.replace(/\{\{([A-Z0-9_]+)\}\}/g, (_m, tag) => {
+                const placeholder = `{{${tag}}}`;
+                const val = this.formData.placeholders?.[placeholder] ||
+                           (tag === 'LT' ? (this.formData.placeholders?.['{{LT}}'] || '') : '');
+                return `<input class="fsop-inline-input" type="text" data-placeholder="${placeholder}" value="${this.escapeHtml(val)}" />`;
+            });
+            
+            // Detect "MO #### ind ___" (and Word leftovers like "ind 76___40") → one clean input.
+            out = out.replace(
+                /\bMO[ \t]*([\d \t]{3,8})[ \t]+ind(?=[\s_☐☑□◻⬜\d]|$)(?:[\s_]*(?:\d{1,4}|_{1,}|[☐☑□◻⬜]))*/gi,
+                (_m, moRaw) => {
+                    const moNumber = String(moRaw || '').replace(/\s+/g, '');
+                    const placeholderKey = `{{IND_MO${moNumber}}}`;
+                    const currentValue = this.formData.placeholders?.[placeholderKey] || '';
+                    return `MO ${this.escapeHtml(String(moRaw || '').trim())} ind <input class="fsop-ind-input" type="text" maxlength="24" data-placeholder="${placeholderKey}" value="${this.escapeHtml(currentValue)}" placeholder="ind" />`;
+                }
+            );
+
+            // Strip any leftover digits / underscores glued after the ind input (36, 67, 8, …)
+            out = out.replace(/(ind\s*<input\b[^>]*class="fsop-ind-input"[^>]*>)(?:[\s\u00a0]*(?:\d{1,4}|_{2,}))+/gi, '$1');
+
+            // "Numéro ___ de série des cordons" next to Traçabilité is a label, not a fillable blank.
+            out = out.replace(/\b(num(?:é|e)ro)\s+_{2,}(\s*de\s+s[eé]rie)/gi, '$1$2');
+            out = out.replace(/\b(num(?:é|e)ro)\s+_{2,}(\s*des?\s+c\s*ordons)/gi, '$1$2');
+            out = out.replace(/\bc\s+ordons\b/gi, 'cordons');
+
+            out = out.replace(/\b(num(?:é|e)ro)\s+_{2,}(?!\s*de\s+s[eé]rie)/gi, (_m, label) => {
+                if (pathContext) return _m;
+                return `${this.escapeHtml(label)} ${makeBlankInput(32)}`;
+            });
+
+            out = out.replace(/_{3,}/g, () => {
+                if (pathContext) return '___';
+                return makeBlankInput(32);
+            });
+
+            out = out.replace(/(?:[-–—─_]\s*){3,}/g, () => {
+                if (pathContext) return '____';
+                return makeBlankInput(32);
+            });
+
+            // Opérateur + blank/input → dropdown (after blanks became <input>)
+            out = out.replace(/\b(op[ée]rateur)\b(?:\s*[:：])?\s*(?:_{2,}|[□◻⬜☐]|<input\b[^>]*>)/gi, (_m, label) => {
+                const key = `{{OP_${++blankId}}}`;
+                return `${this.escapeHtml(label)} ${buildWordlikeOperatorSelect(key)}`;
+            });
+
+            // Do NOT rewrite bare "N°" / "numero" in path / report contexts.
+            if (!pathContext) {
+                out = out.replace(/\b(num(?:é|e)ro|n°|no)\b(?!\s*<input)\s*(?=($|[A-ZÀ-Ý]))/gi, (_m, label) => {
+                    return `${this.escapeHtml(label)} ${makeBlankInput(32)} `;
+                });
+            }
+
+            // Do NOT turn checkbox rows (☐ ☐ ☐) into a text field — handled as real checkboxes.
+            out = out.replace(/(?:[◻⬜]\s*){2,}/g, (match) => {
+                const boxes = (match.match(/[◻⬜]/g) || []).length;
+                const maxLen = Math.max(2, Math.min(8, boxes));
+                return makeBlankInput(maxLen);
+            });
+
+            out = out.replace(/\bjj\/mm\/aaaa\b/gi, () => {
+                const placeholderKey = `{{TEXT_DATE_${++blankId}}}`;
+                const currentValue = this.formData.placeholders?.[placeholderKey] || '';
+                return `<input class="fsop-ind-input fsop-cell-input-date" type="date" data-placeholder="${placeholderKey}" value="${this.escapeHtml(currentValue)}" />`;
+            });
+            out = out.replace(/\bhh:mm\b/gi, () => {
+                const placeholderKey = `{{TEXT_TIME_${++blankId}}}`;
+                const currentValue = this.formData.placeholders?.[placeholderKey] || '';
+                return `<input class="fsop-ind-input fsop-cell-input-time" type="time" data-placeholder="${placeholderKey}" value="${this.escapeHtml(currentValue)}" />`;
+            });
+
+            // Final sweep: digits still stuck after ind inputs
+            out = out.replace(/(ind\s*<input\b[^>]*class="fsop-ind-input"[^>]*>)(?:[\s\u00a0]*\d{1,4})+/gi, '$1');
+
+            pathSlots.forEach((pathText, idx) => {
+                const safe = this.escapeHtml(pathText);
+                out = out.replace(
+                    `__FSOP_PATH_${idx}__`,
+                    `<span class="fsop-full-path" title="${safe}">${safe}</span>`
+                );
+            });
+            
+            return out;
+        };
+
+        const renderPassFailLine = (text) => {
+            // "Contact A_P : PASS FAIL" or "... PASS FAIL enregistrement sous ..."
+            const m = String(text || '').match(/^(.+?)\s*:\s*PASS\s+FAIL\b([\s\S]*)$/i);
+            if (!m) return null;
+            const label = m[1].trim();
+            const rest = String(m[2] || '').trim();
+            if (!label || label.length > 180) return null;
+            const key = label;
+            const current = this.formData.passFail?.wordlike?.[key] || '';
+            const labelHtml = renderTextWithInputs(label);
+            const restHtml = rest ? ` <span class="fsop-word-passfail-rest">${renderTextWithInputs(rest)}</span>` : '';
+            return `
+                <div class="fsop-word-passfail">
+                    <span class="fsop-word-passfail-label">${labelHtml} :</span>
+                    <label class="fsop-word-passfail-opt ${current === 'PASS' ? 'active' : ''}">
+                        <input type="radio" name="pf_${this.escapeHtml(key)}" value="PASS" data-passfail-key="${this.escapeHtml(key)}" ${current === 'PASS' ? 'checked' : ''}/>
+                        PASS
+                    </label>
+                    <label class="fsop-word-passfail-opt ${current === 'FAIL' ? 'active' : ''}">
+                        <input type="radio" name="pf_${this.escapeHtml(key)}" value="FAIL" data-passfail-key="${this.escapeHtml(key)}" ${current === 'FAIL' ? 'checked' : ''}/>
+                        FAIL
+                    </label>
+                    ${restHtml}
+                </div>
+            `;
+        };
+
+        const renderCheckboxLine = (text) => {
+            // Pattern: "☐ Label" or "[ ] Label" (including lines with MO / ind)
+            const m = CHECKBOX_LINE_RE.exec(String(text || '').trim());
+            if (!m) return null;
+            const sym = m[1];
+            const label = m[2].trim();
+            const labelHtml = renderTextWithInputs(label);
+            const checked = /[☑✓x]/i.test(sym);
+            const id = `cb_${++blankId}`;
+            const saved = this.formData.checkboxes?.wordlike?.[label];
+            const isChecked = saved === true || (saved == null && checked);
+            return `
+                <label class="fsop-word-checkbox">
+                    <input id="${id}" type="checkbox" data-checkbox-label="${this.escapeHtml(label)}" ${isChecked ? 'checked' : ''} />
+                    <span class="fsop-word-checkbox-label">${labelHtml}</span>
+                </label>
+            `;
+        };
+
+        const renderInlineCheckboxGroup = (text) => {
+            // Pattern: "Nombre d'essai (≤ 3) : ☐ ☐ ☐"
+            const m = INLINE_CHECKBOX_GROUP_RE.exec(String(text || '').trim());
+            if (!m) return null;
+            const label = m[1].trim();
+            if (!label || label.length > 120) return null;
+            const boxTokens = m[2].match(/[☐☑✓□◻⬜]|\[[ x\]]/gi) || [];
+            if (boxTokens.length < 2) return null;
+
+            const boxesHtml = boxTokens.map((sym, idx) => {
+                const key = `${label}#${idx + 1}`;
+                const checkedDefault = /[☑✓x]/i.test(sym);
+                const saved = this.formData.checkboxes?.wordlike?.[key];
+                const isChecked = saved === true || (saved == null && checkedDefault);
+                const id = `cb_${++blankId}`;
+                return `
+                    <label class="fsop-word-checkbox fsop-word-checkbox-inline" title="${this.escapeHtml(`${label} ${idx + 1}`)}">
+                        <input id="${id}" type="checkbox" data-checkbox-label="${this.escapeHtml(key)}" ${isChecked ? 'checked' : ''} />
+                    </label>
+                `;
+            }).join('');
+
+            return `
+                <div class="fsop-word-checkbox-group">
+                    <span class="fsop-word-checkbox-group-label">${renderTextWithInputs(label)} :</span>
+                    <span class="fsop-word-checkbox-group-boxes">${boxesHtml}</span>
+                </div>
+            `;
+        };
+
+        const stripStepNumberPrefix = (text) => String(text || '').replace(STEP_NUMBER_PREFIX_RE, '').trim();
+
+        const isIdentityHeaderTable = (rows) => {
+            const flat = (Array.isArray(rows) ? rows : [])
+                .flat()
+                .map((c) => String(c?.text || '').toLowerCase())
+                .join(' | ');
+            const hits = [
+                /num[eé]ro\s+de\s+cordon|n[°º]\s*cordon/i,
+                /r[eé]f[eé]rence\s+silog/i,
+                /num[eé]ro\s+lancement/i,
+                /d[eé]signation/i
+            ].filter((re) => re.test(flat)).length;
+            return hits >= 2;
+        };
+
+        const isSkippableHeaderParagraph = (text) => {
+            const t = String(text || '').trim();
+            if (!t) return false;
+            if (/^cordon\s+/i.test(t) && t.length <= 60) return true;
+            if (/^n[°º]\s*cordon\s*:?\s*$/i.test(t)) return true;
+            if (/^by\s+fiber\s+optics/i.test(t)) return true;
+            if (/^sedi/i.test(t) && /ati/i.test(t) && t.length <= 40) return true;
+            return false;
+        };
+
+        const normalizeCellText = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+
+        const looksLikeTitleText = (t) => {
+            const s = normalizeCellText(t);
+            if (!s) return false;
+            // Common patterns in FSOP templates
+            // - "1. Montage ..." / "1- Montage ..." / "12. Contrôle ..." / "11a. Montage ..."
+            if (/^\d{1,2}(?:[a-z])?[ \t]*[-–.][ \t]*\S+/i.test(s)) return true;
+            // - "Général :" etc.
+            if (s.length <= 80 && /:[ \t]*$/.test(s)) return true;
+            // - "Mesure ... : MO 776 ind ___" (colon not at end, but it's still a heading-like line)
+            if (s.length <= 130 && /\bMO\s*\d{3,5}\b/i.test(s) && /\bind\b/i.test(s)) return true;
+            return false;
+        };
+
+        const extractTableBanners = (rows) => {
+            const safe = Array.isArray(rows) ? rows.slice() : [];
+            const banners = [];
+            const isBareSectionNumber = (t) => {
+                const s = normalizeCellText(t);
+                if (!s) return false;
+                return /^\d{1,2}(?:[a-z])?[ \t]*\.?[ \t]*$/i.test(s);
+            };
+            const normalizeSectionNumber = (t) => normalizeCellText(t).replace(/\s+/g, '').replace(/\.$/, '');
+            const looksLikeStandaloneTitle = (t) => {
+                const s = normalizeCellText(t);
+                if (!s) return false;
+                if (s.length > 140) return false;
+                // Avoid promoting common table headers as section titles
+                if (/^(date|op[ée]rateur|lot|heure|mesures?|composant)$/i.test(s)) return false;
+                return /[A-Za-zÀ-ÿ]/.test(s);
+            };
+
+            // We peel off up to first 3 rows if they look like merged-title rows
+            for (let k = 0; k < 3; k++) {
+                if (safe.length === 0) break;
+                const r = safe[0] || [];
+                const nonEmptyCells = (r || []).filter(c => normalizeCellText(c?.text)).filter(Boolean);
+                if (nonEmptyCells.length === 1) {
+                    const only = nonEmptyCells[0];
+                    const text = normalizeCellText(only?.text);
+                    if (!looksLikeTitleText(text)) break;
+                    banners.push(text);
+                    safe.shift();
+                    continue;
+                }
+
+                // Also handle the common pattern where Word puts the number in a separate cell:
+                // [ "1" | "Montage du ..." ] (often with merged background/fill)
+                if (nonEmptyCells.length === 2) {
+                    const a = normalizeCellText(nonEmptyCells[0]?.text);
+                    const b = normalizeCellText(nonEmptyCells[1]?.text);
+                    // Determine which is number vs title
+                    let num = '';
+                    let title = '';
+                    if (isBareSectionNumber(a) && (looksLikeTitleText(b) || looksLikeStandaloneTitle(b))) {
+                        num = normalizeSectionNumber(a);
+                        title = b;
+                    } else if (isBareSectionNumber(b) && (looksLikeTitleText(a) || looksLikeStandaloneTitle(a))) {
+                        num = normalizeSectionNumber(b);
+                        title = a;
+                    }
+                    if (num && title) {
+                        banners.push(`${num}- ${title}`);
+                        safe.shift();
+                        continue;
+                    }
+                }
+
+                break;
+            }
+
+            return { banners, rows: safe };
+        };
+
+        // Track current CodeOperation (ex: "MO 1336") while iterating blocks, so we can map lots precisely.
+        let currentCodeOperation = '';
+        // Auto-numbering fallback for Word-numbered headings where the number is not present in extracted text.
+        // We only apply this to "main step" titles that include MO + ind markers to avoid numbering subtitles.
+        let autoTitleCounter = 0;
+
+        const bumpCounterFromExplicit = (explicit) => {
+            const s = String(explicit || '').trim();
+            const m = s.match(/^(\d{1,2})/);
+            if (!m) return;
+            const n = Number.parseInt(m[1], 10);
+            if (Number.isFinite(n) && n > autoTitleCounter) autoTitleCounter = n;
+        };
+
+        const isMainStepTitleWithoutNumber = (text) => {
+            const s = normalizeCellText(text);
+            if (!s) return false;
+            // Must look like a heading-ish line and include MO marker
+            if (!looksLikeTitleText(s)) return false;
+            // If it already starts with a number, not our case
+            if (/^\d{1,2}(?:[a-z])?[ \t]*[-–.]/i.test(s)) return false;
+            // Heuristic: real main steps in this FSOP contain "MO xxxx ind ___"
+            if (/\bMO\s*\d{3,5}\b/i.test(s) && /\bind\b/i.test(s)) return true;
+            return false;
+        };
+
+        const renderTitleHtml = (titleText, explicitNumber = '') => {
+            const raw = String(titleText || '').trim();
+            const stripped = stripStepNumberPrefix(raw);
+            const number = String(explicitNumber || '').trim() || (STEP_NUMBER_PREFIX_RE.exec(raw)?.[1] || '');
+            const clean = stripped || raw;
+            const mo = extractMoFromText(clean);
+            if (mo) currentCodeOperation = mo;
+            const numberHtml = number
+                ? `<span class="fsop-word-title-number">${this.escapeHtml(String(number))}.</span>`
+                : '';
+            return `
+                <div class="fsop-word-title">
+                    ${numberHtml}
+                    <span class="fsop-word-title-text">${renderTextWithInputs(clean)}</span>
+                </div>
+            `;
+        };
+
+        const renderAutoNumberedTitle = (text) => {
+            autoTitleCounter += 1;
+            return renderTitleHtml(text, String(autoTitleCounter));
+        };
+
+        const extractMoFromText = (text) => {
+            const t = String(text || '');
+            const m = t.match(/\bMO\s*0*(\d{3,5})\b/i);
+            if (!m) return '';
+            return `MO ${m[1]}`;
+        };
+
+        const buildLotIndex = () => {
+            const lines = Array.isArray(this.formData?.fsopLots?.lines) ? this.formData.fsopLots.lines : [];
+            const index = new Map(); // "MO 1336|CODE" -> uniqueLot
+            for (const ln of lines) {
+                const op = String(ln?.codeOperation || '').trim().toUpperCase();
+                const rub = String(ln?.codeRubrique || '').trim().toUpperCase();
+                const uniqueLot = String(ln?.uniqueLot || '').trim();
+                if (!op || !rub || !uniqueLot) continue;
+                index.set(`${op}|${rub}`, uniqueLot);
+            }
+            return index;
+        };
+
+        const lotIndex = buildLotIndex();
+
+        const renderTable = (rows, tableBlockId) => {
+            const safeRows = rows || [];
+            if (safeRows.length === 0) {
+                return '<table class="fsop-word-table"></table>';
+            }
+
+            // Identity header is rendered by buildIdentityHeaderHtml — skip Word duplicate.
+            if (isIdentityHeaderTable(safeRows)) {
+                return '';
+            }
+
+            // Strict base-file fidelity:
+            // do not peel/rebuild title rows from tables; keep rows exactly as extracted.
+            const banners = [];
+            const effectiveRows = safeRows;
+
+            // Decide whether first row is a real "table header" row (Mesures/Date/Opérateur/etc.)
+            const firstRow = effectiveRows[0] || [];
+            const headerKeywords = ['date', 'opérateur', 'operateur', 'mesures', 'heure', 'temps', 'composant', 'lot', 'perte', 'db', 'rl'];
+            const rowLooksLikeHeader = (row) => {
+                const cells = Array.isArray(row) ? row : [];
+                const texts = cells.map(c => normalizeCellText(c?.text).toLowerCase()).filter(Boolean);
+                if (texts.length === 0) return false;
+                const hits = texts.reduce((acc, t) => acc + (headerKeywords.some(k => t === k || t.includes(k)) ? 1 : 0), 0);
+                // require at least 2 header-ish cells (avoid the "Numéro de lancement" block at top)
+                return hits >= 2;
+            };
+            const useThead = rowLooksLikeHeader(firstRow);
+
+            const head = useThead ? firstRow : [];
+            const body = useThead ? effectiveRows.slice(1) : effectiveRows;
+
+            // data-table-idx must match backend injectTableData indexing (0-based order of <w:tbl> in doc)
+            const tableIdx = Number.isFinite(tableBlockId) ? Math.max(0, tableBlockId - 1) : 0;
+
+            const inferColumnKind = (headerText) => {
+                const h = String(headerText || '').toLowerCase();
+                if (h.includes('heure') || h.includes('time')) return 'time';
+                if (h.includes('date')) return 'date';
+                if (h.includes('opérateur') || h.includes('operateur')) return 'operator';
+                return 'text';
+            };
+            const columnKinds = useThead ? head.map((c) => inferColumnKind((c?.text || '').trim())) : [];
+
+            const tableHeadersText = useThead ? head.map((c) => normalizeCellText(c?.text)).join(' | ').toLowerCase() : '';
+            // Rule requested: DO NOT auto-fill lots in "Collage" tables (even if they have a Lot column)
+            const isCollageTable = tableHeadersText.includes('collage');
+            const isComposantLotTable = tableHeadersText.includes('composant') && tableHeadersText.includes('lot');
+
+            const normalizeKey = normalizeFsopLotKey;
+
+            const extractParenHints = (s) => {
+                const text = String(s || '');
+                const hints = [];
+                const re = /\(([^)]*)\)/g;
+                let m;
+                while ((m = re.exec(text)) !== null) {
+                    const inside = (m[1] || '').trim();
+                    if (!inside) continue;
+                    const nk = normalizeKey(inside);
+                    if (nk.length >= 6) hints.push({ raw: inside, nk });
+                }
+                return hints;
+            };
+
+            const isLotColumn = (colIdx) => {
+                if (!useThead) return false;
+                const header = normalizeCellText(head?.[colIdx]?.text);
+                return /\blot\b/i.test(header);
+            };
+
+            const findComponentColIndex = () => {
+                if (!useThead) return 0;
+                for (let i = 0; i < head.length; i++) {
+                    const h = normalizeCellText(head?.[i]?.text).toLowerCase();
+                    if (h.includes('composant')) return i;
+                }
+                return 0;
+            };
+            const composantColIdx = findComponentColIndex();
+
+            const buildComponentLotMap = () => {
+                const items = Array.isArray(this.formData?.fsopLots?.items) ? this.formData.fsopLots.items : [];
+                const map = new Map(); // normalized component key -> lot (only if unambiguous)
+                for (const it of items) {
+                    const keyRaw = String(it?.codeRubrique || '').trim(); // in ERP, this is often the component code for BOM lines
+                    const lots = Array.isArray(it?.lots) ? it.lots.map(x => String(x || '').trim()).filter(Boolean) : [];
+                    if (!keyRaw) continue;
+                    if (lots.length !== 1) continue; // only safe when exactly 1 lot
+                    const nk = normalizeKey(keyRaw);
+                    if (!nk) continue;
+                    map.set(nk, lots[0]);
+                }
+                return map;
+            };
+            const componentLotMap = buildComponentLotMap();
+
+            const inferLotForRow = (rowIdx) => {
+                if (isCollageTable) return '';
+                if (!isComposantLotTable) return '';
+
+                // If there is exactly 1 unique lot overall, it's safe to use it.
+                const uniqueLots = Array.isArray(this.formData?.fsopLots?.uniqueLots)
+                    ? this.formData.fsopLots.uniqueLots.map(x => String(x || '').trim()).filter(Boolean)
+                    : [];
+                if (uniqueLots.length === 1) return uniqueLots[0];
+
+                const compText = normalizeCellText(body?.[rowIdx]?.[composantColIdx]?.text || '');
+                if (!compText) return '';
+
+                // If we know the current MO, prefer exact mapping by (MO|CodeRubrique) using the backend `lines` index.
+                if (currentCodeOperation) {
+                    // Try hints (parentheses) as the likely CodeRubrique
+                    const hints = extractParenHints(compText);
+                    for (const h of hints) {
+                        const lot = lotIndex.get(`${currentCodeOperation.toUpperCase()}|${h.raw.trim().toUpperCase()}`);
+                        if (lot) return lot;
+                        // Also try normalized key match if codeRubrique has punctuation differences
+                        for (const [k, v] of lotIndex.entries()) {
+                            const [op, rub] = k.split('|');
+                            if (op !== currentCodeOperation.toUpperCase()) continue;
+                            if (normalizeKey(rub) === h.nk) return v;
+                        }
+                    }
+                }
+
+                const compNk = normalizeKey(compText);
+                // 1) direct exact match
+                if (compNk && componentLotMap.has(compNk)) return componentLotMap.get(compNk);
+
+                // 2) if there are hints in parentheses (often contains the real reference), match by inclusion
+                const hints = extractParenHints(compText);
+                for (const h of hints) {
+                    for (const [k, lot] of componentLotMap.entries()) {
+                        if (k.includes(h.nk) || h.nk.includes(k)) return lot;
+                    }
+                }
+
+                // 3) best-effort fuzzy: choose the longest inclusion match (avoid tiny matches)
+                let best = { score: 0, lot: '' };
+                for (const [k, lot] of componentLotMap.entries()) {
+                    if (k.length < 8) continue;
+                    if (!compNk) continue;
+                    if (k.includes(compNk) || compNk.includes(k)) {
+                        const score = Math.min(k.length, compNk.length);
+                        if (score > best.score) best = { score, lot };
+                    }
+                }
+                return best.lot || '';
+            };
+
+            const getSavedCellValue = (rowIdx, colIdx) => {
+                // Word-like tables are stored by numeric table index (as string in JSON).
+                const key = String(tableIdx);
+                // Check wordlikeTables first (for Word-like rendering), then fallback to tables
+                return (
+                    this.formData?.wordlikeTables?.[key]?.[rowIdx]?.[colIdx] ??
+                    this.formData?.wordlikeTables?.[tableIdx]?.[rowIdx]?.[colIdx] ??
+                    this.formData?.tables?.[key]?.[rowIdx]?.[colIdx] ??
+                    this.formData?.tables?.[tableIdx]?.[rowIdx]?.[colIdx] ??
+                    ''
+                );
+            };
+
+            const normalizeTime = (value) => {
+                const v = String(value || '').trim();
+                if (!v) return '';
+                // HH:MM
+                const m1 = v.match(/^(\d{1,2}):(\d{2})$/);
+                if (m1) {
+                    const hh = String(Math.min(23, Math.max(0, Number.parseInt(m1[1], 10)))).padStart(2, '0');
+                    const mm = String(Math.min(59, Math.max(0, Number.parseInt(m1[2], 10)))).padStart(2, '0');
+                    return `${hh}:${mm}`;
+                }
+                // HHhMM
+                const m2 = v.match(/^(\d{1,2})\s*h\s*(\d{2})$/i);
+                if (m2) {
+                    const hh = String(Math.min(23, Math.max(0, Number.parseInt(m2[1], 10)))).padStart(2, '0');
+                    const mm = String(Math.min(59, Math.max(0, Number.parseInt(m2[2], 10)))).padStart(2, '0');
+                    return `${hh}:${mm}`;
+                }
+                return v;
+            };
+
+            const normalizeDateToISO = (value) => {
+                const v = String(value || '').trim();
+                if (!v) return '';
+                if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v; // already ISO
+                // DD/MM/YYYY or DD-MM-YYYY
+                const m = v.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/);
+                if (m) {
+                    const dd = String(Math.min(31, Math.max(1, Number.parseInt(m[1], 10)))).padStart(2, '0');
+                    const mm = String(Math.min(12, Math.max(1, Number.parseInt(m[2], 10)))).padStart(2, '0');
+                    const yyyy = String(Number.parseInt(m[3], 10));
+                    return `${yyyy}-${mm}-${dd}`;
+                }
+                return '';
+            };
+
+            const renderCell = (cell, tagName, rowIdx, colIdx, isHeader) => {
+                const attrs = [];
+                if (cell?.colspan) attrs.push(`colspan="${cell.colspan}"`);
+                if (cell?.rowspan && cell.rowspan > 1) attrs.push(`rowspan="${cell.rowspan}"`);
+                if (cell?.fill) attrs.push(`style="background:${this.escapeHtml(cell.fill)}"`);
+
+                const cellText = (cell?.text || '').trim();
+                const isBlank = !cellText || /^_{3,}$/.test(cellText);
+
+                const prevCellTextSameRow = (() => {
+                    if (colIdx <= 0) return '';
+                    if (isHeader) return String(head[colIdx - 1]?.text || '').trim();
+                    if (rowIdx >= 0 && Array.isArray(body[rowIdx])) {
+                        return String(body[rowIdx][colIdx - 1]?.text || '').trim();
+                    }
+                    return '';
+                })();
+                const prevCellLower = prevCellTextSameRow.toLowerCase();
+                const isLaunchLabelPrev =
+                    /^(num[eé]ro[ \t]+lancement|num[eé]ro[ \t]+de[ \t]+c[oô]eur(?:[ \t]*\+[ \t]*num[eé]ro[ \t]+de[ \t]+lancement)?)\s*:?\s*$/i
+                        .test(prevCellLower);
+                const isCordonLabelPrev = /^(num[eé]ro[ \t]+de[ \t]+cordon|n[°º][ \t]*cordon)\s*:?\s*$/i.test(prevCellLower);
+                const isSilogLabelPrev = /^r[eé]f[eé]rence[ \t]+silog\s*:?\s*$/i.test(prevCellLower);
+                const isDesignationLabelPrev = /^d[eé]signation\s*:?\s*$/i.test(prevCellLower);
+                const isHeaderValueAfterLabel = isBlank && (isLaunchLabelPrev || isCordonLabelPrev || isSilogLabelPrev || isDesignationLabelPrev);
+                
+                const content = (() => {
+                    const prevIsTracabilite = /^tra[cç]abilit/i.test(prevCellLower);
+                    const looksLikeSerieLabel = /num[eé]ro.*s[eé]rie|s[eé]rie.*cordon/i.test(cellText);
+
+                    // Header cells are never editable (except for placeholders)
+                    if (isHeader) {
+                        // Some FSOP variants have an empty first header cell in extraction.
+                        // Restore a meaningful visible title instead of showing it blank.
+                        if (colIdx === 0 && isBlank) {
+                            const bannerText = String((banners && banners.length > 0) ? banners[banners.length - 1] : '').trim();
+                            const cleanBanner = bannerText
+                                .replace(/^\d{1,2}(?:[a-z])?[ \t]*[-–.][ \t]*/i, '')
+                                .replace(/[ \t]*:[ \t]*MO[ \t]*\d{3,5}[ \t]*ind[^\n]*$/i, '')
+                                .trim();
+                            if (cleanBanner) return renderTextWithInputs(cleanBanner);
+
+                            const otherHeaders = (head || []).slice(1).map((c) => normalizeCellText(c?.text).toLowerCase()).join(' | ');
+                            if (/\bdate\b/.test(otherHeaders) && /\bop[ée]rateur\b/.test(otherHeaders) && /\blot\b/.test(otherHeaders)) {
+                                return 'Opération';
+                            }
+                        }
+                        // Cell next to "Traçabilité": keep "Numéro de série des cordons" as plain label (no blank).
+                        if (prevIsTracabilite && (looksLikeSerieLabel || isBlank)) {
+                            const label = looksLikeSerieLabel
+                                ? cellText.replace(/_{2,}/g, ' ').replace(/\s+/g, ' ').trim()
+                                : 'Numéro de série des cordons';
+                            return this.escapeHtml(label);
+                        }
+                        return cellText ? renderTextWithInputs(cellText) : `<span class="fsop-cell-empty"></span>`;
+                    }
+
+                    // Body: same rule for Traçabilité row labels
+                    if (prevIsTracabilite && looksLikeSerieLabel) {
+                        return this.escapeHtml(cellText.replace(/_{2,}/g, ' ').replace(/\s+/g, ' ').trim());
+                    }
+                    if (prevIsTracabilite && isBlank && !getSavedCellValue(rowIdx, colIdx)) {
+                        // Empty cell right after Traçabilité header label — not a useful fillable field
+                        return this.escapeHtml('Numéro de série des cordons');
+                    }
+                    // Body cells:
+                    // - Keep the document look (no extra inputs) except for Date/Heure columns which must be fillable with native pickers.
+                    const kind = (useThead ? (columnKinds[colIdx] || 'text') : 'text');
+                    let effectiveKind = kind;
+                    const saved = getSavedCellValue(rowIdx, colIdx);
+                    const rowText = (!isHeader && Array.isArray(body[rowIdx]))
+                        ? body[rowIdx].map((c) => normalizeCellText(c?.text)).join(' | ').toLowerCase()
+                        : '';
+                    const rowLooksTimeBased = /\bheure\b|\bhh\s*[:h]\s*mm\b/.test(rowText);
+                    const prevRowSameColText = (!isHeader && rowIdx > 0 && Array.isArray(body[rowIdx - 1]))
+                        ? normalizeCellText(body[rowIdx - 1]?.[colIdx]?.text).toLowerCase()
+                        : '';
+                    if (effectiveKind === 'date' && rowLooksTimeBased && colIdx > 0) {
+                        effectiveKind = 'time';
+                    }
+                    if (effectiveKind === 'date' && /\bheure\b|\bhh\s*[:h]\s*mm\b/.test(prevRowSameColText)) {
+                        effectiveKind = 'time';
+                    }
+                    if (effectiveKind === 'date' && /\bhh\s*[:h]\s*mm\b|\bheure\b/i.test(cellText)) {
+                        effectiveKind = 'time';
+                    }
+
+                    if (effectiveKind === 'date') {
+                        const hasMeaningfulText = !!cellText && !/^(jj|dd)\s*[\/-]\s*(mm)\s*[\/-]\s*(aaaa|yyyy)$/i.test(cellText);
+                        if (hasMeaningfulText && !saved && !isBlank) {
+                            return renderTextWithInputs(cellText);
+                        }
+                        const placeholderLike = /^(jj|dd)\s*[\/-]\s*(mm)\s*[\/-]\s*(aaaa|yyyy)$/i.test(cellText);
+                        const iso = normalizeDateToISO(saved || (placeholderLike ? '' : cellText));
+                        const valueAttr = iso ? ` value="${this.escapeHtml(iso)}"` : '';
+                        return `<input class="fsop-cell-input fsop-cell-input-date" type="date" data-row="${rowIdx}" data-col="${colIdx}"${valueAttr} />`;
+                    }
+
+                    if (effectiveKind === 'time') {
+                        const hasMeaningfulText = !!cellText && !/^(hh)\s*[:h]\s*(mm)$/i.test(cellText);
+                        if (hasMeaningfulText && !saved && !isBlank) {
+                            return renderTextWithInputs(cellText);
+                        }
+                        const placeholderLike = /^(hh)\s*[:h]\s*(mm)$/i.test(cellText);
+                        const hhmm = normalizeTime(saved || (placeholderLike ? '' : cellText));
+                        const valueAttr = hhmm ? ` value="${this.escapeHtml(hhmm)}"` : '';
+                        return `<input class="fsop-cell-input fsop-cell-input-time" type="time" data-row="${rowIdx}" data-col="${colIdx}"${valueAttr} />`;
+                    }
+
+                    // Special handling for "Opérateur" columns: render as dropdown with "Autre..." option
+                    if (kind === 'operator') {
+                        const savedOperator = String(saved || '').trim();
+                        const operatorOptions = Array.isArray(this.formData.operatorOptions) ? this.formData.operatorOptions : [];
+                        const isOtherValue = savedOperator && !operatorOptions.some(opt => opt.initials === savedOperator);
+                        
+                        // Build options HTML
+                        let optionsHtml = '<option value="">-- Choisir --</option>';
+                        operatorOptions.forEach(opt => {
+                            const selected = savedOperator === opt.initials ? 'selected' : '';
+                            optionsHtml += `<option value="${this.escapeHtml(opt.initials)}" ${selected}>${this.escapeHtml(opt.label)}</option>`;
+                        });
+                        optionsHtml += '<option value="__OTHER__" ' + (isOtherValue ? 'selected' : '') + '>Autre…</option>';
+                        
+                        // If saved value is "other" (not in list), show input; otherwise show select
+                        if (isOtherValue) {
+                            return `
+                                <div class="fsop-operator-cell">
+                                    <select class="fsop-operator-select" data-row="${rowIdx}" data-col="${colIdx}" style="display: none;">
+                                        ${optionsHtml}
+                                    </select>
+                                    <input type="text" class="fsop-operator-other-input fsop-cell-input" data-row="${rowIdx}" data-col="${colIdx}" value="${this.escapeHtml(savedOperator)}" placeholder="Initiales opérateur" />
+                                </div>
+                            `;
+                        } else {
+                            return `
+                                <div class="fsop-operator-cell">
+                                    <select class="fsop-operator-select fsop-cell-input" data-row="${rowIdx}" data-col="${colIdx}">
+                                        ${optionsHtml}
+                                    </select>
+                                    <input type="text" class="fsop-operator-other-input fsop-cell-input" data-row="${rowIdx}" data-col="${colIdx}" style="display: none;" placeholder="Initiales opérateur" />
+                                </div>
+                            `;
+                        }
+                    }
+
+                    // Header identity fields: only "Numéro lancement" gets {{LT}}.
+                    // Cordon / SILOG / Désignation stay empty (operator fills).
+                    if (isHeaderValueAfterLabel) {
+                        const launchValue = isLaunchLabelPrev
+                            ? (saved || this.formData.placeholders?.['{{LT}}'] || '')
+                            : (saved || '');
+                        const dataLaunch = isLaunchLabelPrev ? ' data-launch-number="true"' : '';
+                        return `<input
+                            type="text"
+                            class="fsop-cell-input fsop-cell-input-text"
+                            data-row="${rowIdx}"
+                            data-col="${colIdx}"${dataLaunch}
+                            value="${this.escapeHtml(launchValue)}"
+                            style="width: 100%; border: 1px solid #ccc; padding: 4px; background: white;"
+                        />`;
+                    }
+
+                    if (!isHeader && (cellText.includes('{{LT}}') || (/num[eé]ro[ \t]+lancement/i.test(cellText) && /_{3,}/.test(cellText)))) {
+                        const launchValue = saved || this.formData.placeholders?.['{{LT}}'] || '';
+                        if (/_{3,}/.test(cellText)) {
+                            const parts = cellText.split(/_{3,}/);
+                            return `
+                                <span>${this.escapeHtml(parts[0] || '')}</span>
+                                <input type="text" class="fsop-inline-input" data-row="${rowIdx}" data-col="${colIdx}" data-launch-number="true" value="${this.escapeHtml(launchValue)}" />
+                                <span>${this.escapeHtml(parts.slice(1).join('') || '')}</span>
+                            `;
+                        }
+                        return renderTextWithInputs(cellText.replaceAll('{{LT}}', launchValue));
+                    }
+                    
+                    // Special handling: Lot column should always be easy to fill (use input instead of contenteditable)
+                    if (isLotColumn(colIdx) && !isHeader) {
+                        const savedLot = String(saved || '').trim();
+                        
+                        // Check if this is a multi-voies cell (contains "Voie 940:", "Voie Ligne:", "Voie 1310:")
+                        const cellTextLower = cellText.toLowerCase();
+                        const hasVoie940 = /voie\s*940\s*:?/i.test(cellText);
+                        const hasVoieLigne = /voie\s*ligne\s*:?/i.test(cellText);
+                        const hasVoie1310 = /voie\s*1310\s*:?/i.test(cellText);
+                        const isMultiVoie = hasVoie940 || hasVoieLigne || hasVoie1310;
+                        
+                        if (isMultiVoie) {
+                            // Multi-voies: render 3 labeled fields with dropdowns if ambiguous
+                            const compText = normalizeCellText(body?.[rowIdx]?.[composantColIdx]?.text || '');
+                            const hints = extractParenHints(compText);
+                            const uniqueLotsFallback = [];
+                            
+                            // ⚡ PRIORITÉ: Pour multi-voie, utiliser la référence entre parenthèses pour chercher les lots
+                            // Ex: "Queusot (30632-10 14)" -> chercher codeRubrique = "30632-10 14" ou "306321014" ou variations
+                            const lines = Array.isArray(this.formData?.fsopLots?.lines) ? this.formData.fsopLots.lines : [];
+                            const items = Array.isArray(this.formData?.fsopLots?.items) ? this.formData.fsopLots.items : [];
+                            const lotsArray = collectLotsForVoieCell(
+                                lines,
+                                items,
+                                uniqueLotsFallback,
+                                hints,
+                                compText,
+                                currentCodeOperation
+                            );
+                            const hasUniqueLot = lotsArray.length === 1;
+                            const savedVoies = parseSavedVoies(savedLot);
+                            
+                            // ⚡ Si on a trouvé des lots via la référence entre parenthèses, pré-remplir les 3 voies
+                            // Si un seul lot trouvé, l'utiliser pour les 3 voies
+                            // Si plusieurs lots trouvés, utiliser le premier pour chaque voie (ou laisser vide si préféré)
+                            const autoFillLot = lotsArray.length > 0 ? lotsArray[0] : null;
+                            
+                            let multiVoieHtml = '<div class="fsop-multivoie-lot-cell">';
+                            
+                            if (hasVoie940) {
+                                // Priorité: valeur sauvegardée > lot auto-trouvé > vide
+                                const saved940 = savedVoies['940'] || (autoFillLot || '');
+                                if (hasUniqueLot || lotsArray.length === 0) {
+                                    multiVoieHtml += `<div class="fsop-voie-row"><label>Voie 940:</label><input type="text" class="fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-voie="940" value="${this.escapeHtml(saved940)}" /></div>`;
+                                } else {
+                                    // Si on a trouvé des lots, pré-sélectionner le premier (ou celui sauvegardé)
+                                    const selectedLot = savedVoies['940'] || autoFillLot || '';
+                                    const options = lotsArray.map(l => `<option value="${this.escapeHtml(l)}" ${selectedLot === l ? 'selected' : ''}>${this.escapeHtml(l)}</option>`).join('');
+                                    multiVoieHtml += `<div class="fsop-voie-row"><label>Voie 940:</label><select class="fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-voie="940">${options ? `<option value="">-- Choisir --</option>${options}` : '<option value="">-- Aucun lot disponible --</option>'}</select></div>`;
+                                }
+                            }
+                            
+                            if (hasVoieLigne) {
+                                const savedLigne = savedVoies['Ligne'] || (autoFillLot || '');
+                                if (hasUniqueLot || lotsArray.length === 0) {
+                                    multiVoieHtml += `<div class="fsop-voie-row"><label>Voie Ligne:</label><input type="text" class="fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-voie="Ligne" value="${this.escapeHtml(savedLigne)}" /></div>`;
+                                } else {
+                                    const selectedLot = savedVoies['Ligne'] || autoFillLot || '';
+                                    const options = lotsArray.map(l => `<option value="${this.escapeHtml(l)}" ${selectedLot === l ? 'selected' : ''}>${this.escapeHtml(l)}</option>`).join('');
+                                    multiVoieHtml += `<div class="fsop-voie-row"><label>Voie Ligne:</label><select class="fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-voie="Ligne">${options ? `<option value="">-- Choisir --</option>${options}` : '<option value="">-- Aucun lot disponible --</option>'}</select></div>`;
+                                }
+                            }
+                            
+                            if (hasVoie1310) {
+                                const saved1310 = savedVoies['1310'] || (autoFillLot || '');
+                                if (hasUniqueLot || lotsArray.length === 0) {
+                                    multiVoieHtml += `<div class="fsop-voie-row"><label>Voie 1310:</label><input type="text" class="fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-voie="1310" value="${this.escapeHtml(saved1310)}" /></div>`;
+                                } else {
+                                    const selectedLot = savedVoies['1310'] || autoFillLot || '';
+                                    const options = lotsArray.map(l => `<option value="${this.escapeHtml(l)}" ${selectedLot === l ? 'selected' : ''}>${this.escapeHtml(l)}</option>`).join('');
+                                    multiVoieHtml += `<div class="fsop-voie-row"><label>Voie 1310:</label><select class="fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-voie="1310">${options ? `<option value="">-- Choisir --</option>${options}` : '<option value="">-- Aucun lot disponible --</option>'}</select></div>`;
+                                }
+                            }
+                            
+                            multiVoieHtml += '</div>';
+                            return multiVoieHtml;
+                        }
+
+                        // Dual side lots: Coté étiquette / Côté sans étiquette (F457 Cordon OHA…)
+                        const compTextEtq = normalizeCellText(body?.[rowIdx]?.[composantColIdx]?.text || '');
+                        if (cellHasEtiquetteSplit(cellText, compTextEtq)) {
+                            const hintsEtq = extractParenHints(compTextEtq);
+                            const linesEtq = Array.isArray(this.formData?.fsopLots?.lines) ? this.formData.fsopLots.lines : [];
+                            const itemsEtq = Array.isArray(this.formData?.fsopLots?.items) ? this.formData.fsopLots.items : [];
+                            const lotsEtq = collectLotsForLotCell(
+                                linesEtq,
+                                itemsEtq,
+                                [],
+                                hintsEtq,
+                                compTextEtq,
+                                currentCodeOperation
+                            );
+                            const savedEtq = parseSavedEtiquettes(savedLot);
+                            const autoLotEtq = lotsEtq.length === 1 ? lotsEtq[0] : '';
+                            const valE = savedEtq.etiquette || autoLotEtq || '';
+                            const valS = savedEtq.sans || autoLotEtq || '';
+
+                            const renderEtqField = (key, label, value) => {
+                                if (lotsEtq.length >= 1) {
+                                    const isOther = Boolean(value && !lotsEtq.includes(value));
+                                    let optionsHtml = '<option value="">-- Choisir --</option>';
+                                    lotsEtq.forEach((lot) => {
+                                        const selected = !isOther && value === lot ? 'selected' : '';
+                                        optionsHtml += `<option value="${this.escapeHtml(lot)}" ${selected}>${this.escapeHtml(lot)}</option>`;
+                                    });
+                                    optionsHtml += `<option value="__OTHER__" ${isOther ? 'selected' : ''}>Autre…</option>`;
+                                    if (isOther) {
+                                        return `<div class="fsop-voie-row"><label>${label}</label>
+                                            <select class="fsop-lot-select" data-row="${rowIdx}" data-col="${colIdx}" data-etiquette="${key}" style="display:none;">${optionsHtml}</select>
+                                            <input type="text" class="fsop-lot-other-input fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-etiquette="${key}" value="${this.escapeHtml(value)}" placeholder="Lot" />
+                                        </div>`;
+                                    }
+                                    return `<div class="fsop-voie-row"><label>${label}</label>
+                                        <select class="fsop-lot-select fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-etiquette="${key}">${optionsHtml}</select>
+                                        <input type="text" class="fsop-lot-other-input fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-etiquette="${key}" style="display:none;" placeholder="Lot" />
+                                    </div>`;
+                                }
+                                return `<div class="fsop-voie-row"><label>${label}</label>
+                                    <input type="text" class="fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" data-etiquette="${key}" value="${this.escapeHtml(value)}" placeholder="Lot" />
+                                </div>`;
+                            };
+
+                            return `<div class="fsop-etiquette-lot-cell">
+                                ${renderEtqField('etiquette', 'Coté étiquette :', valE)}
+                                ${renderEtqField('sans', 'Côté sans étiquette :', valS)}
+                            </div>`;
+                        }
+                        
+                        // Single lot cell (normal case) — même menu déroulant que les opérateurs
+                        // Lots liés à la référence composant uniquement.
+                        // Menu déroulant seulement si ≥1 lot ERP matché pour cet article
+                        // (plusieurs références → l'opérateur choisit ; sinon pré-sélection / saisie).
+                        const compTextSingle = normalizeCellText(body?.[rowIdx]?.[composantColIdx]?.text || '');
+                        const hintsSingle = extractParenHints(compTextSingle);
+                        const linesSingle = Array.isArray(this.formData?.fsopLots?.lines) ? this.formData.fsopLots.lines : [];
+                        const itemsSingle = Array.isArray(this.formData?.fsopLots?.items) ? this.formData.fsopLots.items : [];
+                        const lotsForArticle = collectLotsForLotCell(
+                            linesSingle,
+                            itemsSingle,
+                            [],
+                            hintsSingle,
+                            compTextSingle,
+                            currentCodeOperation
+                        );
+
+                        if (lotsForArticle.length >= 1) {
+                            const autoLot = inferLotForRow(rowIdx);
+                            const selectedLot = String(
+                                savedLot || (lotsForArticle.length === 1 ? lotsForArticle[0] : '') || autoLot || ''
+                            ).trim();
+                            const isOtherValue = Boolean(selectedLot && !lotsForArticle.includes(selectedLot));
+                            let optionsHtml = '<option value="">-- Choisir --</option>';
+                            lotsForArticle.forEach((lot) => {
+                                const selected = !isOtherValue && selectedLot === lot ? 'selected' : '';
+                                optionsHtml += `<option value="${this.escapeHtml(lot)}" ${selected}>${this.escapeHtml(lot)}</option>`;
+                            });
+                            optionsHtml += `<option value="__OTHER__" ${isOtherValue ? 'selected' : ''}>Autre…</option>`;
+
+                            if (isOtherValue) {
+                                return `
+                                    <div class="fsop-lot-cell">
+                                        <select class="fsop-lot-select" data-row="${rowIdx}" data-col="${colIdx}" style="display: none;">
+                                            ${optionsHtml}
+                                        </select>
+                                        <input type="text" class="fsop-lot-other-input fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" value="${this.escapeHtml(selectedLot)}" placeholder="Code lot" />
+                                    </div>
+                                `;
+                            }
+                            return `
+                                <div class="fsop-lot-cell">
+                                    <select class="fsop-lot-select fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}">
+                                        ${optionsHtml}
+                                    </select>
+                                    <input type="text" class="fsop-lot-other-input fsop-cell-input fsop-cell-input-lot" data-row="${rowIdx}" data-col="${colIdx}" style="display: none;" placeholder="Code lot" />
+                                </div>
+                            `;
+                        }
+
+                        const autoLot = inferLotForRow(rowIdx);
+                        const finalLot = savedLot || autoLot || '';
+                        const valueAttr = finalLot ? ` value="${this.escapeHtml(String(finalLot))}"` : '';
+                        return `<input class="fsop-cell-input fsop-cell-input-text fsop-cell-input-lot" type="text" data-row="${rowIdx}" data-col="${colIdx}" placeholder="Lot" ${valueAttr} />`;
+                    }
+                    
+                    // For other columns: make empty cells editable with real inputs (better on tablets than contenteditable),
+                    // especially when the template uses highlighted (filled) cells as "zones à renseigner".
+                    const hasFill = Boolean(cell?.fill);
+                    const trimmedCell = String(cellText || '').trim();
+                    const rowCells = Array.isArray(body?.[rowIdx]) ? body[rowIdx] : [];
+                    const rowLooksLikeLabelGrid =
+                        rowCells.length >= 2 &&
+                        rowCells.every((c) => {
+                            const t = String(c?.text || '').trim();
+                            return !t || /:$/.test(t);
+                        });
+
+                    // ✅ Cas "TJR PAS ICI": certaines grilles contiennent uniquement des libellés "X :"
+                    // dans les cellules (pas de cellule vide dédiée). On rend donc label + input inline.
+                    if (!isHeader && !saved && /:$/.test(trimmedCell) && trimmedCell.length <= 80 && rowLooksLikeLabelGrid) {
+                        return `
+                            <div class="fsop-cell-label-input">
+                                <span class="fsop-cell-label">${this.escapeHtml(trimmedCell)}</span>
+                                <input class="fsop-cell-input fsop-cell-input-text"
+                                    type="text"
+                                    data-row="${rowIdx}"
+                                    data-col="${colIdx}" />
+                            </div>
+                        `;
+                    }
+
+                    // ✅ Définitif (sans couleur): si la cellule est vide et que la cellule précédente du même rang
+                    // est un libellé "X :", alors cette cellule est une zone à renseigner -> input.
+                    if (!isHeader && isBlank && !saved && rowIdx >= 0 && colIdx > 0 && body?.[rowIdx]?.[colIdx - 1]) {
+                        const prevText = String(body[rowIdx][colIdx - 1]?.text || '').trim();
+                        if (/:$/.test(prevText) && prevText.length <= 80) {
+                            return `<input class="fsop-cell-input fsop-cell-input-text" type="text" data-row="${rowIdx}" data-col="${colIdx}" />`;
+                        }
+                    }
+
+                    // ✅ Définitif: certaines zones à remplir sont des cellules colorées qui contiennent
+                    // seulement un libellé "X :" (sans underscores). On rend alors "label + input".
+                    if (!isHeader && hasFill && cellText && !saved && !cellText.includes('<input')) {
+                        const trimmed = String(cellText || '').trim();
+                        // Exemple: "Fibre 20' :" / "Lot plaquette :" / "Dymax OP-29 Lot :"
+                        if (/:$/.test(trimmed) && trimmed.length <= 80) {
+                            return `
+                                <div class="fsop-cell-label-input">
+                                    <span class="fsop-cell-label">${this.escapeHtml(trimmed)}</span>
+                                    <input class="fsop-cell-input fsop-cell-input-text"
+                                        type="text"
+                                        data-row="${rowIdx}"
+                                        data-col="${colIdx}" />
+                                </div>
+                            `;
+                        }
+                    }
+
+                    // Keep fixed template text visible. Only truly blank cells become free-text inputs here.
+                    // Template guard (generalized): some critical process rows must stay as fixed text
+                    // even when extraction yields blank cells in col 0.
+                    if (!isHeader && colIdx === 0 && isBlank) {
+                        const defaultFixedRowsByHeader = [
+                            {
+                                re: /collage de la fibre dans le tube/i,
+                                rows: {
+                                    0: '353 ND',
+                                    1: 'Polymérisation de la colle 353 ND',
+                                    2: '1h /85°C'
+                                }
+                            },
+                            {
+                                re: /collage du tube peek/i,
+                                rows: {
+                                    0: '353 ND',
+                                    1: 'Polymérisation de la colle 353 ND',
+                                    2: 'Polymérisation : Weller 330 °C Air : 18'
+                                }
+                            },
+                            {
+                                re: /collage de la gaine ltcx-?1\.8/i,
+                                rows: {
+                                    0: '353 ND',
+                                    1: 'Polymérisation de la colle 353 ND',
+                                    2: '1h /85°C'
+                                }
+                            },
+                            {
+                                re: /sertissage de pi[eè]ce d[’']encrage/i,
+                                rows: {
+                                    0: 'Pince à sertir (OPT 726 & 731-1)'
+                                }
+                            },
+                            {
+                                re: /collage du connecteur elio/i,
+                                rows: {
+                                    0: 'Colle 353 ND'
+                                }
+                            }
+                        ];
+                        // Generic fallbacks so the same behavior applies to other FSOP variants.
+                        const genericFixedRowsByHeader = [
+                            {
+                                re: /^collage de /i,
+                                rows: {
+                                    0: '353 ND'
+                                }
+                            },
+                            {
+                                re: /^sertissage de /i,
+                                rows: {
+                                    0: 'Pince à sertir (OPT 726 & 731-1)'
+                                }
+                            },
+                            {
+                                re: /connecteur/i,
+                                rows: {
+                                    0: 'Colle 353 ND'
+                                }
+                            }
+                        ];
+                        for (const cfg of defaultFixedRowsByHeader) {
+                            if (cfg.re.test(tableHeadersText) && Object.prototype.hasOwnProperty.call(cfg.rows, rowIdx)) {
+                                return this.escapeHtml(cfg.rows[rowIdx]);
+                            }
+                        }
+                        for (const cfg of genericFixedRowsByHeader) {
+                            if (cfg.re.test(tableHeadersText) && Object.prototype.hasOwnProperty.call(cfg.rows, rowIdx)) {
+                                return this.escapeHtml(cfg.rows[rowIdx]);
+                            }
+                        }
+                    }
+
+                    if (isBlank) {
+                        const initial = saved ? String(saved) : '';
+                        const valueAttr = initial ? ` value="${this.escapeHtml(initial)}"` : '';
+                        return `<input class="fsop-cell-input fsop-cell-input-text" type="text" data-row="${rowIdx}" data-col="${colIdx}"${valueAttr} />`;
+                    }
+
+                    // If we have a saved value for a non-empty cell, prefer showing it (e.g. when re-opening a saved FSOP)
+                    if (saved) {
+                        return this.escapeHtml(String(saved));
+                    }
+
+                    return renderTextWithInputs(cellText);
+                })();
+                const savedForDisplay = !isHeader ? getSavedCellValue(rowIdx, colIdx) : '';
+                const displayText = normalizeCellText(savedForDisplay || cellText);
+                const hasInteractiveField = /<(input|select|textarea)\b/i.test(content);
+                const shouldCenterShortLabel =
+                    !isHeader &&
+                    colIdx === 0 &&
+                    !hasInteractiveField &&
+                    !!displayText &&
+                    displayText.length <= 18;
+                if (shouldCenterShortLabel) {
+                    attrs.push('class="fsop-cell-short-center"');
+                }
+                return `<${tagName} ${attrs.join(' ')}>${content}</${tagName}>`;
+            };
+
+            let t = '';
+            if (banners.length > 0) {
+                banners.forEach((bannerText) => {
+                    const mo = extractMoFromText(bannerText);
+                    if (mo) currentCodeOperation = mo;
+                    const m = bannerText.match(/^(\d{1,2}(?:[a-z])?)[ \t]*[-–.][ \t]*(\S[^\n]{0,300})$/i);
+                    if (m) {
+                        bumpCounterFromExplicit(m[1]);
+                        t += renderTitleHtml(m[2], m[1]).replace('fsop-word-title', 'fsop-word-title fsop-word-title-from-table');
+                    } else {
+                        if (isMainStepTitleWithoutNumber(bannerText)) {
+                            t += renderAutoNumberedTitle(bannerText).replace('fsop-word-title', 'fsop-word-title fsop-word-title-from-table');
+                        } else {
+                            t += `<div class="fsop-word-subtitle fsop-word-subtitle-from-table">${renderTextWithInputs(bannerText)}</div>`;
+                        }
+                    }
+                });
+            }
+
+            t += `<table class="fsop-word-table" data-table-idx="${tableIdx}">`;
+            if (useThead) {
+            t += '<thead><tr>';
+            head.forEach((c, colIdx) => {
+                t += renderCell(c, 'th', -1, colIdx, true);
+            });
+            t += '</tr></thead>';
+            }
+
+            t += '<tbody>';
+            body.forEach((r, rowIdx) => {
+                t += '<tr>';
+                (r || []).forEach((c, colIdx) => {
+                    t += renderCell(c, 'td', rowIdx, colIdx, false);
+                });
+                t += '</tr>';
+            });
+            t += '</tbody></table>';
+            return t;
+        };
+
+        blocks.forEach((b) => {
+            if (b.type === 'page_break') {
+                // Ignore page breaks in single-page mode
+                return;
+            }
+            if (b.type === 'table') {
+                const tableHtml = renderTable(b.rows, b.id);
+                if (tableHtml) {
+                    html += `<div class="fsop-word-block fsop-word-block-table">${tableHtml}</div>`;
+                }
+                return;
+            }
+            if (b.type === 'paragraph') {
+                const text = (b.text || '').trim();
+                if (!text) {
+                    html += `<div class="fsop-word-block fsop-word-block-empty"></div>`;
+                    return;
+                }
+
+                // Skip Word identity header paragraphs (already shown via buildIdentityHeaderHtml)
+                if (isSkippableHeaderParagraph(text)) {
+                    return;
+                }
+                if (/^(num[eé]ro\s+de\s+cordon|n[°º]\s*cordon|r[eé]f[eé]rence\s+silog|num[eé]ro\s+lancement|d[eé]signation)\s*:?\s*$/i.test(text)) {
+                    return;
+                }
+
+                // PASS/FAIL interactive (even when followed by a report path)
+                const pfHtml = renderPassFailLine(text);
+                if (pfHtml) {
+                    html += `<div class="fsop-word-block">${pfHtml}</div>`;
+                    return;
+                }
+
+                // Checkboxes MUST be detected before MO+ind subtitle heuristic
+                // (e.g. "☐ Test de flexion ... MO 1050 ind ___")
+                const checkboxGroupHtml = renderInlineCheckboxGroup(text);
+                if (checkboxGroupHtml) {
+                    html += `<div class="fsop-word-block">${checkboxGroupHtml}</div>`;
+                    return;
+                }
+                const checkboxHtml = renderCheckboxLine(text);
+                if (checkboxHtml) {
+                    html += `<div class="fsop-word-block">${checkboxHtml}</div>`;
+                    return;
+                }
+
+                // Titles / headings with visible step numbers (when Word kept "1- …" in text)
+                const sectionTitleMatch = text.match(/^(\d{1,2}(?:[a-z])?)[ \t]*[-–.][ \t]*(\S[^\n]{0,300})$/i);
+                if (sectionTitleMatch) {
+                    const n = sectionTitleMatch[1];
+                    const title = sectionTitleMatch[2];
+                    bumpCounterFromExplicit(n);
+                    html += renderTitleHtml(title, n);
+                    return;
+                }
+
+                // Short labels like "Général :" → subtitle (no step number)
+                if (/:\s*$/.test(text) && text.length <= 60 && !/\bMO\s*\d{3,5}\b/i.test(text)) {
+                    html += `<div class="fsop-word-subtitle">${renderTextWithInputs(text)}</div>`;
+                    return;
+                }
+
+                // Main operation lines with MO + ind → numbered step title.
+                if (
+                    text.length <= 180 &&
+                    /\bMO\s*\d{3,5}\b/i.test(text) &&
+                    /\bind\b/i.test(text) &&
+                    !FULL_PATH_HINT_RE.test(text)
+                ) {
+                    html += renderAutoNumberedTitle(text);
+                    return;
+                }
+
+                html += `<div class="fsop-word-block fsop-word-paragraph">${renderTextWithInputs(text)}</div>`;
+            }
+        });
+
+        html += '</div></div>';
+        // Completeness check: numbered titles in source vs rendered step titles.
+        const renderedTitleCount = (html.match(/fsop-word-title-number/g) || []).length;
+        if (sourceTitleCount > renderedTitleCount) {
+            console.warn('⚠️ FSOP incomplet potentiel: titres numérotés manquants', {
+                sourceTitleCount,
+                renderedTitleCount,
+                missing: sourceTitleCount - renderedTitleCount
+            });
+        } else {
+            console.log('✅ FSOP complétude titres numérotés OK', { sourceTitleCount, renderedTitleCount });
+        }
+        return html;
+    }
+
+    /**
+     * Render une section du formulaire
+     */
+    renderSection(section) {
+        let html = `<div class="fsop-section" data-section-id="${section.id}">`;
+        // Use title EXACTLY as extracted from Word document (already includes number and separator)
+        // The title should already be in format like "1- Contrôle interférométrique avec enregistrement du rapport :"
+        const titleText = section.title ? section.title : '';
+        
+        // NEVER use "Section X" - always use the extracted title or construct it properly
+        let displayTitle = titleText || '';
+        
+        // Debug: log what we received
+        console.log(`🎨 Rendering section ${section.id}:`, {
+            title: section.title,
+            titleText: titleText,
+            displayTitle: displayTitle,
+            type: section.type,
+            hasFields: section.fields?.length > 0,
+            hasTable: !!section.table,
+            tablesCount: section.tables?.length || 0
+        });
+        
+        // If title is empty or missing, try to get it from section.title
+        if (!displayTitle || displayTitle.trim() === '') {
+            displayTitle = section.title || '';
+        }
+        
+        // If still empty or is a generic "Section X", use a fallback
+        if (!displayTitle || displayTitle.trim() === '' || displayTitle.match(/^Section\s+\d+$/i)) {
+            console.warn(`⚠️ Section ${section.id} has no title, using fallback`);
+            displayTitle = section.id === 0 ? 'Général : Composant' : `Section ${section.id}`;
+        } else if (section.id !== 0 && !displayTitle.match(/^\d+/)) {
+            displayTitle = `${section.id}- ${displayTitle}`;
+        }
+        
+        // Always render the title, even if it's a fallback
+        html += `<h3 class="fsop-section-title">${this.escapeHtml(displayTitle)}</h3>`;
+        
+        console.log(`  → Final title rendered: "${displayTitle}"`);
+
+        // Render PASS/FAIL fields first (if any)
+        // Also check if section has PASS/FAIL fields even if type is not 'pass_fail'
+        const hasPassFail = (section.type === 'pass_fail' || (section.fields && section.fields.length > 0));
+        if (hasPassFail && section.fields && section.fields.length > 0) {
+            console.log(`  → Rendering ${section.fields.length} PASS/FAIL fields for section ${section.id}`);
+            section.fields.forEach(field => {
+                // Clean field name (remove "FAIL" prefix if present)
+                const cleanField = field.replace(/^FAIL\s+/i, '').trim();
+                const fieldKey = `${section.id}_${cleanField}`;
+                const currentValue = this.formData.passFail[section.id]?.[cleanField] || '';
+                
+                html += `
+                    <div class="fsop-field fsop-pass-fail">
+                        <label class="fsop-pass-fail-label">${this.escapeHtml(cleanField)}:</label>
+                        <div class="fsop-radio-group">
+                            <label class="fsop-radio-label ${currentValue === 'PASS' ? 'active' : ''}">
+                                <input 
+                                    type="radio" 
+                                    name="passfail_${fieldKey}" 
+                                    value="PASS"
+                                    data-section-id="${section.id}"
+                                    data-field="${cleanField}"
+                                    ${currentValue === 'PASS' ? 'checked' : ''}
+                                />
+                                <span class="fsop-radio-text pass">PASS</span>
+                            </label>
+                            <label class="fsop-radio-label ${currentValue === 'FAIL' ? 'active' : ''}">
+                                <input 
+                                    type="radio" 
+                                    name="passfail_${fieldKey}" 
+                                    value="FAIL"
+                                    data-section-id="${section.id}"
+                                    data-field="${cleanField}"
+                                    ${currentValue === 'FAIL' ? 'checked' : ''}
+                                />
+                                <span class="fsop-radio-text fail">FAIL</span>
+                            </label>
+                        </div>
+                    </div>
+                `;
+            });
+        }
+        
+        // Render tables if any (before checkboxes)
+        // Support multiple tables per section
+        if (section.tables && section.tables.length > 0) {
+            section.tables.forEach((table, tableIdx) => {
+                html += this.renderTable(table, section.id, tableIdx);
+            });
+        } else if (section.table) {
+            // Backward compatibility: single table
+            html += this.renderTable(section.table, section.id, 0);
+        }
+        
+        // Render simple text fields if any (e.g., "Voie du cordon sur connecteur 38999 : _______")
+        if (section.textFields && section.textFields.length > 0) {
+            section.textFields.forEach((textField, idx) => {
+                const fieldKey = `textfield_${section.id}_${idx}`;
+                const currentValue = this.formData.textFields?.[section.id]?.[idx] || '';
+                
+                html += `
+                    <div class="fsop-field fsop-text-field">
+                        <label for="${fieldKey}">${this.escapeHtml(textField.label)}:</label>
+                        <input 
+                            type="text" 
+                            id="${fieldKey}"
+                            class="fsop-input"
+                            data-section-id="${section.id}"
+                            data-field-index="${idx}"
+                            value="${this.escapeHtml(currentValue)}"
+                            placeholder="${this.escapeHtml(textField.placeholder || '')}"
+                        />
+                    </div>
+                `;
+            });
+        }
+        
+        // Render checkboxes if any (after table and text fields)
+        if (section.checkboxes && section.checkboxes.length > 0) {
+            // Debug: Log checkbox order for this section
+            console.log(`  ☑️ Section ${section.id}: Rendering ${section.checkboxes.length} checkboxes in order:`, 
+                section.checkboxes.map((cb, idx) => `${idx + 1}. [paraIndex: ${cb.paragraphIndex}, pos: ${cb.position}] ${cb.label.substring(0, 50)}`));
+            
+            section.checkboxes.forEach((checkbox, idx) => {
+                const checkboxKey = `${section.id}_${checkbox.id}`;
+                const currentValue = this.formData.checkboxes?.[section.id]?.[checkbox.id] || false;
+                
+                html += `
+                    <div class="fsop-field fsop-checkbox-field">
+                        <label class="fsop-checkbox-label">
+                            <input 
+                                type="checkbox" 
+                                id="checkbox_${checkboxKey}"
+                                data-section-id="${section.id}"
+                                data-checkbox-id="${checkbox.id}"
+                                ${currentValue ? 'checked' : ''}
+                            />
+                            <span>${this.escapeHtml(checkbox.label)}</span>
+                        </label>
+                    </div>
+                `;
+            });
+        }
+
+        html += '</div>';
+        return html;
+    }
+
+    /**
+     * Render un tableau interactif
+     */
+    renderTable(table, sectionId, tableIndex = 0) {
+        let html = '<div class="fsop-table-container">';
+        const tableId = `table_${sectionId}_${tableIndex}`;
+        html += `<table class="fsop-table" data-table-id="${tableId}">`;
+        
+        // Header row
+        html += '<thead><tr>';
+        table.headers.forEach((header, idx) => {
+            html += `<th>${this.escapeHtml(header)}</th>`;
+        });
+        html += '</tr></thead>';
+        
+        // Data rows
+        html += '<tbody>';
+        
+        // Initialize table data if not exists
+        if (!this.formData.tables[tableId]) {
+            this.formData.tables[tableId] = {};
+        }
+        
+        // Render all rows from table structure
+        // If no data rows exist, create at least one empty row for data entry
+        const dataRows = table.rows && table.rows.length > 0 ? table.rows : [];
+        const rowCount = Math.max(dataRows.length, 1); // At least one row for data entry
+        
+        for (let rowIdx = 0; rowIdx < rowCount; rowIdx++) {
+            html += '<tr>';
+            
+            // Ensure we have cells for all columns
+            const rowData = dataRows[rowIdx] || { cells: [] };
+            const rowCells = rowData.cells || [];
+            
+            table.columns.forEach((column, colIdx) => {
+                // Get cell value from row data or form data
+                const cellFromRow = rowCells.find(c => c.columnIndex === colIdx);
+                let cellValue = this.formData.tables[tableId]?.[rowIdx]?.[colIdx] || 
+                                cellFromRow?.value || 
+                                '';
+                
+                // Detect if this is a fixed label (not an input field)
+                // Fixed labels are typically:
+                // - Contain descriptive text with units (e.g., "1ère polymérisation: 1h / 80°C")
+                // - Contain colons followed by specifications
+                // - Are in the first column and contain descriptive text
+                const isFixedLabel = this.isFixedLabelCell(cellValue, column, colIdx, rowIdx, table);
+                
+                const inputType = this.getInputTypeForColumn(column);
+                const placeholder = this.getPlaceholderForColumn(column);
+                
+                // For numeric columns, use text input with inputmode to allow **value** syntax
+                const finalInputType = (inputType === 'number') ? 'text' : inputType;
+                const inputMode = (inputType === 'number') ? 'inputmode="decimal"' : '';
+                
+                if (isFixedLabel) {
+                    // Render as readonly text (fixed label)
+                    html += `
+                        <td class="fsop-table-label-cell">
+                            <span class="fsop-table-label">${this.escapeHtml(cellValue)}</span>
+                        </td>
+                    `;
+                } else {
+                    // Clean cell value only for input fields: if it's a label-like text, treat as empty
+                    // But be more careful - only clear if it's clearly a label in a numeric field
+                    if (inputType === 'number' && cellValue) {
+                        const looksLikeLabel = /[a-zéèêëàâäôöùûüç]/i.test(cellValue) && 
+                            (cellValue.includes('(') || cellValue.includes('en ') || /^\d+[^\d]*[a-z]/i.test(cellValue));
+                        if (looksLikeLabel || Number.isNaN(Number.parseFloat(cellValue))) {
+                            cellValue = '';
+                        }
+                    }
+                    
+                    html += `
+                        <td>
+                            <input 
+                                type="${finalInputType}"
+                                ${inputMode}
+                                class="fsop-table-input fsop-input-${column.type}"
+                                data-table-id="${tableId}"
+                                data-row-id="${rowIdx}"
+                                data-column-idx="${colIdx}"
+                                data-column-name="${this.escapeHtml(column.name)}"
+                                ${cellValue ? `value="${this.escapeHtml(cellValue)}"` : ''}
+                                ${placeholder ? `placeholder="${this.escapeHtml(placeholder)}"` : ''}
+                            />
+                        </td>
+                    `;
+                }
+            });
+            
+            html += '</tr>';
+        }
+        
+        html += '</tbody>';
+        html += '</table>';
+        
+        // Add row button
+        html += `
+            <button type="button" class="fsop-add-row-btn" data-table-id="${tableId}">
+                <i class="fas fa-plus"></i> Ajouter une ligne
+            </button>
+        `;
+        
+        html += '</div>';
+        return html;
+    }
+
+    /**
+     * Détermine si une cellule est un label fixe (non éditable)
+     */
+    isFixedLabelCell(cellValue, column, colIdx, rowIdx, table) {
+        if (!cellValue || !cellValue.trim()) {
+            return false;
+        }
+        
+        const value = cellValue.trim();
+        
+        // Patterns for fixed labels:
+        // 1. Contains colon followed by specifications (e.g., "1ère polymérisation: 1h / 80°C")
+        if (value.includes(':') && (value.includes('/') || UNIT_SPEC_RE.test(value))) {
+            return true;
+        }
+        
+        // 2. Contains descriptive text with units in parentheses (e.g., "Colle 353 ND")
+        // But only if it's in a column that's not typically for data entry
+        if (value.match(/^[A-Za-zÀ-ÿ\s]+\([^)]+\)/) && 
+            !column.name.toLowerCase().match(/(date|heure|opérateur|lot|mesure)/i)) {
+            return true;
+        }
+        
+        // 3. First column with descriptive text that's not a header
+        if (colIdx === 0 && rowIdx > 0 && 
+            value.match(/^\d+(er|ème|e)\s+[a-zéèêëàâäôöùûüç]/i)) {
+            return true;
+        }
+        
+        // 4. Contains "MO" reference pattern (e.g., "MO 1080 ind")
+        if (value.match(/MO\s+\d+\s*ind/i)) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Détermine le type d'input selon le type de colonne
+     */
+    getInputTypeForColumn(column) {
+        switch (column.type) {
+            case 'numeric':
+                return 'number';
+            case 'date':
+                return 'date';
+            case 'time':
+                return 'time';
+            case 'operator':
+                return 'text';
+            default:
+                return 'text';
+        }
+    }
+
+    /**
+     * Obtient un placeholder pour une colonne
+     */
+    getPlaceholderForColumn(column) {
+        const headerLower = column.name.toLowerCase();
+        if (headerLower.includes('heure') || headerLower.includes('time')) {
+            return 'HH:MM';
+        } else if (headerLower.includes('date')) {
+            return 'JJ/MM/AAAA';
+        } else if (headerLower.includes('mm')) {
+            return 'mm';
+        } else if (headerLower.includes('db')) {
+            return 'dB';
+        }
+        return '';
+    }
+
+    /**
+     * Attache les event listeners aux éléments du formulaire
+     */
+    attachEventListeners() {
+        // Placeholder inputs
+        this.container.querySelectorAll('[data-placeholder]').forEach(input => {
+            input.addEventListener('input', (e) => {
+                const placeholder = e.target.dataset.placeholder;
+                this.formData.placeholders[placeholder] = e.target.value;
+            });
+        });
+
+        // Word-like PASS/FAIL
+        this.container.querySelectorAll('input[type="radio"][data-passfail-key]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                const key = e.target.dataset.passfailKey;
+                const value = e.target.value;
+                if (!this.formData.passFail.wordlike) {
+                    this.formData.passFail.wordlike = {};
+                }
+                this.formData.passFail.wordlike[key] = value;
+
+                // Update active styles
+                const wrap = e.target.closest('.fsop-word-passfail');
+                if (wrap) {
+                    wrap.querySelectorAll('.fsop-word-passfail-opt').forEach(l => l.classList.remove('active'));
+                    const label = e.target.closest('.fsop-word-passfail-opt');
+                    if (label) label.classList.add('active');
+                }
+            });
+        });
+
+        // PASS/FAIL radio buttons
+        this.container.querySelectorAll('input[type="radio"][data-section-id]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                const sectionId = e.target.dataset.sectionId;
+                const field = e.target.dataset.field;
+                const value = e.target.value;
+                
+                if (!this.formData.passFail[sectionId]) {
+                    this.formData.passFail[sectionId] = {};
+                }
+                this.formData.passFail[sectionId][field] = value;
+                
+                // Update visual state
+                const label = e.target.closest('.fsop-radio-label');
+                label.parentElement.querySelectorAll('.fsop-radio-label').forEach(l => l.classList.remove('active'));
+                label.classList.add('active');
+            });
+        });
+
+        // Table inputs
+        this.container.querySelectorAll('.fsop-table-input').forEach(input => {
+            input.addEventListener('input', (e) => {
+                const tableId = e.target.dataset.tableId;
+                const rowId = Number.parseInt(e.target.dataset.rowId, 10);
+                const colIdx = Number.parseInt(e.target.dataset.columnIdx, 10);
+                
+                if (!this.formData.tables[tableId]) {
+                    this.formData.tables[tableId] = {};
+                }
+                if (!this.formData.tables[tableId][rowId]) {
+                    this.formData.tables[tableId][rowId] = {};
+                }
+                this.formData.tables[tableId][rowId][colIdx] = e.target.value;
+            });
+        });
+
+        // Reference field
+        const referenceInput = this.container.querySelector('#fsop_reference');
+        if (referenceInput) {
+            referenceInput.addEventListener('input', (e) => {
+                this.formData.reference = e.target.value.trim();
+            });
+        }
+
+        // Text field inputs (simple text fields like "Voie du cordon")
+        this.container.querySelectorAll('.fsop-text-field input').forEach(input => {
+            input.addEventListener('input', (e) => {
+                const sectionId = e.target.dataset.sectionId;
+                const fieldIndex = Number.parseInt(e.target.dataset.fieldIndex, 10);
+                
+                if (!this.formData.textFields[sectionId]) {
+                    this.formData.textFields[sectionId] = {};
+                }
+                this.formData.textFields[sectionId][fieldIndex] = e.target.value;
+            });
+        });
+
+        // Checkbox inputs (section-based)
+        this.container.querySelectorAll('input[type="checkbox"][data-section-id]').forEach(checkbox => {
+            checkbox.addEventListener('change', (e) => {
+                const sectionId = e.target.dataset.sectionId;
+                const checkboxId = e.target.dataset.checkboxId;
+                
+                if (!this.formData.checkboxes[sectionId]) {
+                    this.formData.checkboxes[sectionId] = {};
+                }
+                this.formData.checkboxes[sectionId][checkboxId] = e.target.checked;
+            });
+        });
+
+        // Word-like checkbox lines (☐ Test de flexion …)
+        this.container.querySelectorAll('input[type="checkbox"][data-checkbox-label]').forEach(checkbox => {
+            checkbox.addEventListener('change', (e) => {
+                const label = e.target.dataset.checkboxLabel;
+                if (!label) return;
+                if (!this.formData.checkboxes.wordlike) {
+                    this.formData.checkboxes.wordlike = {};
+                }
+                this.formData.checkboxes.wordlike[label] = e.target.checked;
+            });
+        });
+
+        // Operator select/input handling
+        this.container.querySelectorAll('.fsop-operator-select').forEach(select => {
+            select.addEventListener('change', (e) => {
+                const rowIdx = Number.parseInt(e.target.dataset.row, 10);
+                const colIdx = Number.parseInt(e.target.dataset.col, 10);
+                const value = e.target.value;
+                const placeholderKey = e.target.dataset.placeholder;
+                const cell = e.target.closest('.fsop-operator-cell');
+                const otherInput = cell?.querySelector('.fsop-operator-other-input');
+                
+                if (value === '__OTHER__') {
+                    e.target.style.display = 'none';
+                    if (otherInput) {
+                        otherInput.style.display = 'block';
+                        otherInput.focus();
+                    }
+                    return;
+                }
+
+                if (otherInput) {
+                    otherInput.style.display = 'none';
+                    otherInput.value = '';
+                }
+                if (placeholderKey) {
+                    this.formData.placeholders[placeholderKey] = value;
+                }
+                const table = e.target.closest('table[data-table-idx]');
+                if (table && Number.isFinite(rowIdx) && Number.isFinite(colIdx)) {
+                    const tableIdx = table.dataset.tableIdx;
+                    if (!this.formData.wordlikeTables) this.formData.wordlikeTables = {};
+                    if (!this.formData.wordlikeTables[tableIdx]) this.formData.wordlikeTables[tableIdx] = {};
+                    if (!this.formData.wordlikeTables[tableIdx][rowIdx]) this.formData.wordlikeTables[tableIdx][rowIdx] = {};
+                    this.formData.wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                }
+            });
+        });
+
+        // Operator "other" input handling
+        this.container.querySelectorAll('.fsop-operator-other-input').forEach(input => {
+            input.addEventListener('input', (e) => {
+                const rowIdx = Number.parseInt(e.target.dataset.row, 10);
+                const colIdx = Number.parseInt(e.target.dataset.col, 10);
+                const value = e.target.value.trim().toUpperCase();
+                const placeholderKey = e.target.dataset.placeholder;
+                if (placeholderKey) {
+                    this.formData.placeholders[placeholderKey] = value;
+                }
+                
+                const table = e.target.closest('table[data-table-idx]');
+                if (table && Number.isFinite(rowIdx) && Number.isFinite(colIdx)) {
+                    const tableIdx = table.dataset.tableIdx;
+                    if (!this.formData.wordlikeTables) this.formData.wordlikeTables = {};
+                    if (!this.formData.wordlikeTables[tableIdx]) this.formData.wordlikeTables[tableIdx] = {};
+                    if (!this.formData.wordlikeTables[tableIdx][rowIdx]) this.formData.wordlikeTables[tableIdx][rowIdx] = {};
+                    this.formData.wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                }
+            });
+        });
+
+        // Lot select (2+ codes lot pour le même article) — même logique que opérateurs
+        this.container.querySelectorAll('.fsop-lot-select').forEach(select => {
+            select.addEventListener('change', (e) => {
+                const rowIdx = Number.parseInt(e.target.dataset.row, 10);
+                const colIdx = Number.parseInt(e.target.dataset.col, 10);
+                const value = e.target.value;
+                const cell = e.target.closest('.fsop-lot-cell');
+                const otherInput = cell?.querySelector('.fsop-lot-other-input');
+
+                if (value === '__OTHER__') {
+                    e.target.style.display = 'none';
+                    e.target.classList.remove('fsop-cell-input', 'fsop-cell-input-lot');
+                    if (otherInput) {
+                        otherInput.style.display = 'block';
+                        otherInput.focus();
+                    }
+                    return;
+                }
+
+                if (otherInput) {
+                    otherInput.style.display = 'none';
+                    otherInput.value = '';
+                }
+                e.target.style.display = '';
+                e.target.classList.add('fsop-cell-input', 'fsop-cell-input-lot');
+
+                const table = e.target.closest('table[data-table-idx]');
+                if (table) {
+                    const tableIdx = table.dataset.tableIdx;
+                    if (!this.formData.wordlikeTables) this.formData.wordlikeTables = {};
+                    if (!this.formData.wordlikeTables[tableIdx]) this.formData.wordlikeTables[tableIdx] = {};
+                    if (!this.formData.wordlikeTables[tableIdx][rowIdx]) this.formData.wordlikeTables[tableIdx][rowIdx] = {};
+                    this.formData.wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                    if (!this.formData.tables) this.formData.tables = {};
+                    if (!this.formData.tables[tableIdx]) this.formData.tables[tableIdx] = {};
+                    if (!this.formData.tables[tableIdx][rowIdx]) this.formData.tables[tableIdx][rowIdx] = {};
+                    this.formData.tables[tableIdx][rowIdx][colIdx] = value;
+                }
+            });
+        });
+
+        this.container.querySelectorAll('.fsop-lot-other-input').forEach(input => {
+            input.addEventListener('input', (e) => {
+                const rowIdx = Number.parseInt(e.target.dataset.row, 10);
+                const colIdx = Number.parseInt(e.target.dataset.col, 10);
+                const value = e.target.value.trim();
+                const table = e.target.closest('table[data-table-idx]');
+                if (table) {
+                    const tableIdx = table.dataset.tableIdx;
+                    if (!this.formData.wordlikeTables) this.formData.wordlikeTables = {};
+                    if (!this.formData.wordlikeTables[tableIdx]) this.formData.wordlikeTables[tableIdx] = {};
+                    if (!this.formData.wordlikeTables[tableIdx][rowIdx]) this.formData.wordlikeTables[tableIdx][rowIdx] = {};
+                    this.formData.wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                    if (!this.formData.tables) this.formData.tables = {};
+                    if (!this.formData.tables[tableIdx]) this.formData.tables[tableIdx] = {};
+                    if (!this.formData.tables[tableIdx][rowIdx]) this.formData.tables[tableIdx][rowIdx] = {};
+                    this.formData.tables[tableIdx][rowIdx][colIdx] = value;
+                }
+            });
+        });
+
+        // Add row buttons
+        this.container.querySelectorAll('.fsop-add-row-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const tableId = btn.dataset.tableId;
+                this.addTableRow(tableId);
+            });
+        });
+
+        // Word-like editable table cells (prevent line breaks)
+        this.container.querySelectorAll('.fsop-cell-edit[contenteditable="true"]').forEach((el) => {
+            el.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                }
+            });
+            // Keep plain text only
+            el.addEventListener('paste', (e) => {
+                e.preventDefault();
+                const text = (e.clipboardData || window.clipboardData)?.getData('text') || '';
+                document.execCommand('insertText', false, text);
+            });
+        });
+
+        // Word-like LOT inputs: support multi-line paste to fill down the column
+        this.container.querySelectorAll('input.fsop-cell-input-lot[data-row][data-col]').forEach((input) => {
+            input.addEventListener('paste', (e) => {
+                const text = (e.clipboardData || window.clipboardData)?.getData('text') || '';
+                const lines = text
+                    .split(/\r?\n/)
+                    .map(l => l.trim())
+                    .filter(Boolean);
+
+                // If it's a single value, let browser paste normally
+                if (lines.length <= 1) {
+                    return;
+                }
+
+                e.preventDefault();
+
+                const table = input.closest('table.fsop-word-table[data-table-idx]');
+                if (!table) return;
+                const col = Number.parseInt(input.dataset.col || '0', 10);
+                const startRow = Number.parseInt(input.dataset.row || '0', 10);
+                if (!Number.isFinite(col) || !Number.isFinite(startRow)) return;
+
+                // Fill current + next rows (same column)
+                for (let i = 0; i < lines.length; i++) {
+                    const r = startRow + i;
+                    const target = table.querySelector(`input.fsop-cell-input-lot[data-row="${r}"][data-col="${col}"]`);
+                    if (!target) break;
+                    target.value = lines[i];
+                    target.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            });
+            
+            // Save single lot input
+            input.addEventListener('input', (e) => {
+                const table = e.target.closest('table.fsop-word-table[data-table-idx]');
+                if (!table) return;
+                const tableIdx = table.dataset.tableIdx;
+                const row = e.target.dataset.row;
+                const col = e.target.dataset.col;
+                if (tableIdx !== null && row !== null && col !== null) {
+                    if (!this.formData.tables[tableIdx]) {
+                        this.formData.tables[tableIdx] = {};
+                    }
+                    if (!this.formData.tables[tableIdx][row]) {
+                        this.formData.tables[tableIdx][row] = {};
+                    }
+                    this.formData.tables[tableIdx][row][col] = e.target.value;
+                }
+            });
+        });
+        
+        // Multi-voies lot inputs/selects: serialize to multi-line format
+        this.container.querySelectorAll('.fsop-multivoie-lot-cell input.fsop-cell-input-lot, .fsop-multivoie-lot-cell select.fsop-cell-input-lot').forEach((el) => {
+            el.addEventListener('change', (e) => {
+                const table = e.target.closest('table.fsop-word-table[data-table-idx]');
+                if (!table) return;
+                const tableIdx = table.dataset.tableIdx;
+                const row = e.target.dataset.row;
+                const col = e.target.dataset.col;
+                const voie = e.target.dataset.voie;
+                if (tableIdx === null || row === null || col === null || !voie) return;
+                
+                // Collect all voies for this cell
+                const cell = e.target.closest('.fsop-multivoie-lot-cell');
+                const voies = {};
+                cell.querySelectorAll('[data-voie]').forEach(v => {
+                    const vKey = v.dataset.voie;
+                    const vVal = v.value || '';
+                    if (vVal) voies[vKey] = vVal;
+                });
+                
+                // Serialize as multi-line: "Voie 940 : lot1\nVoie Ligne : lot2\nVoie 1310 : lot3"
+                const parts = [];
+                if (voies['940']) parts.push(`Voie 940 : ${voies['940']}`);
+                if (voies['Ligne']) parts.push(`Voie Ligne : ${voies['Ligne']}`);
+                if (voies['1310']) parts.push(`Voie 1310 : ${voies['1310']}`);
+                const serialized = parts.join('\n');
+                
+                if (!this.formData.tables[tableIdx]) {
+                    this.formData.tables[tableIdx] = {};
+                }
+                if (!this.formData.tables[tableIdx][row]) {
+                    this.formData.tables[tableIdx][row] = {};
+                }
+                this.formData.tables[tableIdx][row][col] = serialized;
+            });
+        });
+
+        // Coté étiquette / sans étiquette: serialize to multi-line
+        this.container.querySelectorAll('.fsop-etiquette-lot-cell [data-etiquette]').forEach((el) => {
+            el.addEventListener('change', (e) => {
+                const table = e.target.closest('table.fsop-word-table[data-table-idx]');
+                if (!table) return;
+                const tableIdx = table.dataset.tableIdx;
+                const row = e.target.dataset.row;
+                const col = e.target.dataset.col;
+                if (tableIdx === null || row === null || col === null) return;
+
+                const cell = e.target.closest('.fsop-etiquette-lot-cell');
+                const vals = { etiquette: '', sans: '' };
+                cell.querySelectorAll('[data-etiquette]').forEach((v) => {
+                    const key = v.dataset.etiquette;
+                    let val = v.value || '';
+                    if (val === '__OTHER__') {
+                        const other = cell.querySelector(`.fsop-lot-other-input[data-etiquette="${key}"]`);
+                        val = other ? (other.value || '') : '';
+                    }
+                    if (key) vals[key] = val;
+                });
+
+                const parts = [];
+                if (vals.etiquette) parts.push(`Coté étiquette : ${vals.etiquette}`);
+                if (vals.sans) parts.push(`Côté sans étiquette : ${vals.sans}`);
+                const serialized = parts.join('\n');
+
+                if (!this.formData.tables[tableIdx]) this.formData.tables[tableIdx] = {};
+                if (!this.formData.tables[tableIdx][row]) this.formData.tables[tableIdx][row] = {};
+                this.formData.tables[tableIdx][row][col] = serialized;
+            });
+        });
+
+        // Word-like date/time inputs: normalize values (keep as-is, backend will inject string)
+        this.container.querySelectorAll('.fsop-cell-input[data-row][data-col]').forEach((el) => {
+            el.addEventListener('change', () => {
+                // no-op: value is read on save
+            });
+        });
+        
+        // ⚡ FIX: Special handling for launch number input field
+        this.container.querySelectorAll('input[data-launch-number="true"]').forEach((el) => {
+            el.addEventListener('input', (e) => {
+                const value = e.target.value;
+                // Save to placeholders
+                this.formData.placeholders['{{LT}}'] = value;
+                // Also save to table data if it's in a table
+                const row = e.target.dataset.row;
+                const col = e.target.dataset.col;
+                if (row !== null && col !== null) {
+                    const table = e.target.closest('table');
+                    if (table) {
+                        const tableIdx = table.dataset.tableIdx;
+                        if (tableIdx !== null) {
+                            if (!this.formData.tables[tableIdx]) {
+                                this.formData.tables[tableIdx] = {};
+                            }
+                            if (!this.formData.tables[tableIdx][row]) {
+                                this.formData.tables[tableIdx][row] = {};
+                            }
+                            this.formData.tables[tableIdx][row][col] = value;
+                        }
+                    }
+                }
+                console.log(`✅ Numéro lancement mis à jour: ${value}`);
+            });
+        });
+    }
+
+    /**
+     * Ajoute une nouvelle ligne à un tableau
+     */
+    addTableRow(tableId) {
+        const table = this.container.querySelector(`[data-table-id="${tableId}"]`)?.closest('table');
+        if (!table) return;
+
+        const tbody = table.querySelector('tbody');
+        const firstRow = tbody.querySelector('tr');
+        if (!firstRow) return;
+
+        const newRow = firstRow.cloneNode(true);
+        const rowCount = tbody.querySelectorAll('tr').length;
+        
+        // Update data attributes
+        newRow.querySelectorAll('input').forEach(input => {
+            input.dataset.rowId = String(rowCount);
+            input.value = '';
+            input.removeAttribute('value');
+        });
+
+        tbody.appendChild(newRow);
+        
+        // Re-attach event listeners for new inputs
+        newRow.querySelectorAll('.fsop-table-input').forEach(input => {
+            input.addEventListener('input', (e) => {
+                const rowId = Number.parseInt(e.target.dataset.rowId, 10);
+                const colIdx = Number.parseInt(e.target.dataset.columnIdx, 10);
+                
+                if (!this.formData.tables[tableId]) {
+                    this.formData.tables[tableId] = {};
+                }
+                if (!this.formData.tables[tableId][rowId]) {
+                    this.formData.tables[tableId][rowId] = {};
+                }
+                this.formData.tables[tableId][rowId][colIdx] = e.target.value;
+            });
+        });
+    }
+
+    /**
+     * Génère un nom de tag Excel à partir de l'en-tête de colonne
+     * Ex: "1er jonction (mm)" -> "JONCTION1_MM"
+     */
+    generateTagFromColumnHeader(columnHeader) {
+        if (!columnHeader) return '';
+        
+        let tag = columnHeader.trim();
+        
+        // Convert "1er" -> "1", "2ème" -> "2", etc.
+        tag = tag.replace(/(\d{1,4})(?:ème|er|e)/gi, '$1');
+        
+        // Remove parentheses and their content, but keep units
+        tag = tag.replace(/\(([^)]{0,80})\)/g, (match, content) => {
+            // Keep common units (mm, dB, etc.)
+            if (/mm|cm|db|°c|°f|°|kg|g|m/i.test(content)) {
+                return '_' + content.toUpperCase().trim();
+            }
+            return '';
+        });
+        
+        // Remove accents
+        tag = tag.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        
+        // Convert to uppercase
+        tag = tag.toUpperCase();
+        
+        // Remove punctuation except underscores
+        tag = tag.replace(/[^\w\s]/g, '');
+        
+        // Replace spaces and multiple underscores with single underscore
+        tag = tag.replace(/\s+/g, '_').replace(/_+/g, '_');
+        
+        // Remove leading/trailing underscores
+        tag = tag.replace(/^_{1,200}/, '').replace(/_{1,200}$/, '');
+        
+        return tag;
+    }
+
+    /**
+     * Nettoie une valeur en retirant les ** et normalise pour Word
+     */
+    cleanValueForWord(value) {
+        if (!value) return '';
+        
+        // Remove ** markers
+        let cleaned = value.replace(/^\*\*|\*\*$/g, '');
+        
+        // Normalize decimal separator (comma to point)
+        cleaned = cleaned.replace(',', '.');
+        
+        return cleaned.trim();
+    }
+
+    /**
+     * Vérifie si une valeur est numérique (après nettoyage)
+     */
+    isNumericValue(value) {
+        if (!value) return false;
+        const cleaned = this.cleanValueForWord(value);
+        return !Number.isNaN(Number.parseFloat(cleaned)) && Number.isFinite(cleaned);
+    }
+
+    /**
+     * Récupère les données du formulaire
+     */
+    getFormData() {
+        // If we are in Word-like mode, extract table values from editable cells
+        // and map them to backend `injectTableData` format (table index -> row -> col -> value).
+        const wordlikeTables = {};
+        if (this.container) {
+            this.container.querySelectorAll('.fsop-word-table[data-table-idx]').forEach((tableEl) => {
+                const tableIdx = Number.parseInt(tableEl.dataset.tableIdx || '0', 10);
+                if (!Number.isFinite(tableIdx)) return;
+                if (!wordlikeTables[tableIdx]) wordlikeTables[tableIdx] = {};
+
+                const tbodyRows = Array.from(tableEl.querySelectorAll('tbody tr'));
+                tbodyRows.forEach((tr, rowIdx) => {
+                    const cellEdits = Array.from(tr.querySelectorAll('.fsop-cell-edit[contenteditable="true"][data-col]'));
+                    const cellInputs = Array.from(tr.querySelectorAll('.fsop-cell-input[data-col]'));
+                    if (cellEdits.length === 0 && cellInputs.length === 0) return;
+                    if (!wordlikeTables[tableIdx][rowIdx]) wordlikeTables[tableIdx][rowIdx] = {};
+                    cellEdits.forEach((cellEl) => {
+                        const colIdx = Number.parseInt(cellEl.dataset.col || '0', 10);
+                        if (!Number.isFinite(colIdx)) return;
+                        const value = (cellEl.textContent || '').trim();
+                        if (value) {
+                            wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                        }
+                    });
+                    cellInputs.forEach((cellEl) => {
+                        const colIdx = Number.parseInt(cellEl.dataset.col || '0', 10);
+                        if (!Number.isFinite(colIdx)) return;
+                        // Skip hidden "Autre…" companions and placeholder select values
+                        if (cellEl.style.display === 'none') return;
+                        let value = String(cellEl.value || '').trim();
+                        if (value && value !== '__OTHER__') {
+                            // Normalize <input type="date"> (YYYY-MM-DD) -> DD/MM/YYYY for Word readability
+                            if (cellEl.type === 'date' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+                                const [yyyy, mm, dd] = value.split('-');
+                                value = `${dd}/${mm}/${yyyy}`;
+                            }
+                            wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                        }
+                    });
+                    // Also collect operator select/input values
+                    const operatorSelects = Array.from(tr.querySelectorAll('.fsop-operator-select[data-col]'));
+                    const operatorOtherInputs = Array.from(tr.querySelectorAll('.fsop-operator-other-input[data-col]'));
+                    operatorSelects.forEach((selectEl) => {
+                        const colIdx = Number.parseInt(selectEl.dataset.col || '0', 10);
+                        if (!Number.isFinite(colIdx)) return;
+                        const value = String(selectEl.value || '').trim();
+                        // Only save if not "__OTHER__" (that case is handled by the input)
+                        if (value && value !== '__OTHER__') {
+                            wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                        }
+                    });
+                    operatorOtherInputs.forEach((inputEl) => {
+                        const colIdx = Number.parseInt(inputEl.dataset.col || '0', 10);
+                        if (!Number.isFinite(colIdx)) return;
+                        if (inputEl.style.display === 'none') return;
+                        const value = String(inputEl.value || '').trim().toUpperCase();
+                        if (value) {
+                            wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                        }
+                    });
+                    // Lot select (2+ lots même article) + saisie libre « Autre… »
+                    const lotSelects = Array.from(tr.querySelectorAll('.fsop-lot-select[data-col]'));
+                    const lotOtherInputs = Array.from(tr.querySelectorAll('.fsop-lot-other-input[data-col]'));
+                    lotSelects.forEach((selectEl) => {
+                        const colIdx = Number.parseInt(selectEl.dataset.col || '0', 10);
+                        if (!Number.isFinite(colIdx)) return;
+                        if (selectEl.style.display === 'none') return;
+                        const value = String(selectEl.value || '').trim();
+                        if (value && value !== '__OTHER__') {
+                            wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                        }
+                    });
+                    lotOtherInputs.forEach((inputEl) => {
+                        const colIdx = Number.parseInt(inputEl.dataset.col || '0', 10);
+                        if (!Number.isFinite(colIdx)) return;
+                        if (inputEl.style.display === 'none') return;
+                        const value = String(inputEl.value || '').trim();
+                        if (value) {
+                            wordlikeTables[tableIdx][rowIdx][colIdx] = value;
+                        }
+                    });
+                });
+            });
+        }
+
+        // Extract tagged measures from **value** pattern in table cells
+        const taggedMeasures = {};
+        const cleanedTables = {};
+        
+        // Process all tables to detect **value** patterns and clean values for Word
+        if (this.container) {
+            this.container.querySelectorAll('.fsop-table').forEach(table => {
+                const tableId = table.dataset.tableId ||
+                               table.querySelector('.fsop-table-input')?.dataset.tableId;
+                
+                if (!tableId) return;
+                
+                // Get table structure to find column headers
+                const thead = table.querySelector('thead');
+                const headers = [];
+                if (thead) {
+                    thead.querySelectorAll('th').forEach(th => {
+                        headers.push(th.textContent.trim());
+                    });
+                }
+                
+                // Also try to get headers from structure if available
+                // Extract sectionId from tableId (format: "table_3" -> sectionId = 3)
+                let columnHeaders = headers;
+                const sectionIdMatch = tableId.match(/^table_(\d+)$/);
+                if (sectionIdMatch && this.structure && this.structure.sections) {
+                    const sectionId = Number.parseInt(sectionIdMatch[1], 10);
+                    const section = this.structure.sections.find(s => s.id === sectionId);
+                    if (section && section.table && section.table.headers) {
+                        columnHeaders = section.table.headers;
+                    }
+                }
+                
+                // Initialize cleaned table data
+                if (!cleanedTables[tableId]) {
+                    cleanedTables[tableId] = {};
+                }
+                
+                // Process each row
+                table.querySelectorAll('tbody tr').forEach(row => {
+                    const rowId = Number.parseInt(row.querySelector('.fsop-table-input')?.dataset.rowId || '0', 10);
+                    
+                    if (!cleanedTables[tableId][rowId]) {
+                        cleanedTables[tableId][rowId] = {};
+                    }
+                    
+                    // Process each cell in the row
+                    row.querySelectorAll('.fsop-table-input').forEach(input => {
+                        const colIdx = Number.parseInt(input.dataset.columnIdx || '0', 10);
+                        const columnName = input.dataset.columnName || columnHeaders[colIdx] || '';
+                        const rawValue = input.value || '';
+                        
+                        // Check if value matches **value** pattern
+                        const starPattern = /^\*\*(.+)\*\*$/;
+                        const match = rawValue.match(starPattern);
+                        
+                        if (match) {
+                            const valueWithStars = match[0];
+                            const valueWithoutStars = match[1];
+                            
+                            // Clean value for Word (remove **)
+                            const cleanedValue = this.cleanValueForWord(valueWithStars);
+                            
+                            // Store cleaned value for Word
+                            cleanedTables[tableId][rowId][colIdx] = cleanedValue;
+                            
+                            // If value is numeric, generate tag and add to taggedMeasures
+                            if (this.isNumericValue(valueWithoutStars)) {
+                                const generatedTag = this.generateTagFromColumnHeader(columnName);
+                
+                                if (generatedTag) {
+                                    // Last one wins if duplicate tag (as per plan)
+                                    taggedMeasures[generatedTag] = cleanedValue;
+                                }
+                            }
+                        } else {
+                            // No ** pattern, store value as-is (but still clean for Word if needed)
+                            cleanedTables[tableId][rowId][colIdx] = rawValue;
+                }
+                    });
+                });
+            });
+        }
+
+        // Merge word-like tables first (so save works in Word-like mode)
+        // Note: wordlikeTables keys are numeric table indexes; keep them as strings for JSON.
+        Object.keys(wordlikeTables).forEach((tIdx) => {
+            cleanedTables[tIdx] = wordlikeTables[tIdx];
+        });
+        
+        // Merge cleaned tables with existing table data
+        const finalTables = { ...this.formData.tables };
+        Object.keys(cleanedTables).forEach(tableId => {
+            if (!finalTables[tableId]) {
+                finalTables[tableId] = {};
+            }
+            Object.keys(cleanedTables[tableId]).forEach(rowId => {
+                finalTables[tableId][rowId] = {
+                    ...finalTables[tableId][rowId],
+                    ...cleanedTables[tableId][rowId]
+                };
+            });
+        });
+
+        return {
+            placeholders: { ...this.formData.placeholders },
+            tables: finalTables,
+            passFail: { ...this.formData.passFail },
+            checkboxes: { ...this.formData.checkboxes },
+            textFields: { ...this.formData.textFields },
+            reference: this.formData.reference || this.container?.querySelector('#fsop_reference')?.value?.trim() || '',
+            taggedMeasures: taggedMeasures
+        };
+    }
+
+    /**
+     * Valide les données du formulaire
+     */
+    validate() {
+        const errors = [];
+        
+        // Validate placeholders (required ones)
+        if (this.structure.placeholders) {
+            this.structure.placeholders.forEach(placeholder => {
+                if (placeholder === '{{LT}}' || placeholder === '{{SN}}') {
+                    if (!this.formData.placeholders[placeholder]) {
+                        errors.push(`${this.getPlaceholderLabel(placeholder.replace(/[{}]/g, ''))} est requis`);
+                    }
+                }
+            });
+        }
+        
+        return {
+            valid: errors.length === 0,
+            errors: errors
+        };
+    }
+
+    /**
+     * Obtient un label lisible pour un placeholder
+     */
+    getPlaceholderLabel(tag) {
+        const labels = {
+            'LT': 'Numéro de lancement',
+            'SN': 'Numéro de série',
+            'N_CORDON': 'Numéro de cordon',
+            'REF_SILOG': 'Référence SILOG'
+        };
+        return labels[tag] || tag;
+    }
+
+    /**
+     * Échappe le HTML pour éviter les injections XSS
+     */
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+}
+
+export default FsopForm;
+

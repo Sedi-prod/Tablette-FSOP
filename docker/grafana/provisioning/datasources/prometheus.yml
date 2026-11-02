@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Use the explicit container_name from docker-compose.monitoring.yml to avoid DNS issues
+    # when running multiple compose projects on the same external network.
+    url: http://sedi-prometheus:9090
+    isDefault: true
+    editable: true
+    uid: prometheus
+    jsonData:
+      timeInterval: "15s"
+      httpMethod: "POST"

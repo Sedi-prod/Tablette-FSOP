@@ -1,0 +1,1238 @@
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import AdminPage, {
+  getAdminStepColumnDisplay,
+  compareAdminTimelineRows,
+  getAdminRowSortTimestamp,
+  composeClockOnDay
+} from '../../components/AdminPage.js';
+
+// Mock des dépendances
+vi.mock('../../utils/TimeUtils.js', () => ({
+  default: {
+    parseDuration: vi.fn((str) => {
+      if (!str) return 0;
+      const parts = str.split(':');
+      if (parts.length === 3) {
+        return Number.parseInt(parts[0]) * 3600 + Number.parseInt(parts[1]) * 60 + Number.parseInt(parts[2]);
+      }
+      return 0;
+    }),
+    formatDuration: vi.fn((seconds) => {
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const secs = seconds % 60;
+      return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    })
+  }
+}));
+
+describe('composeClockOnDay', () => {
+  it('keeps a corrected time on yesterday even if the input date is today', () => {
+    expect(composeClockOnDay('2026-10-20', '17:25')).toBe('2026-10-20T17:25:00');
+    expect(composeClockOnDay('2026-10-20', '2026-10-21T17:25:00')).toBe('2026-10-20T17:25:00');
+  });
+});
+
+describe('getAdminStepColumnDisplay', () => {
+  it('shows Phase as step code and Fabrication as label', () => {
+    expect(getAdminStepColumnDisplay({
+      Phase: '010',
+      CodeRubrique: 'ConnectS',
+      Fabrication: 'Montage carte'
+    })).toEqual({
+      stepCode: '010',
+      stepLabel: 'Montage carte'
+    });
+  });
+
+  it('never uses CodeRubrique or operator code as step code', () => {
+    expect(getAdminStepColumnDisplay({
+      Phase: 'PRODUCTION',
+      CodeRubrique: '001',
+      OperatorCode: '001'
+    })).toEqual({
+      stepCode: '-',
+      stepLabel: '-'
+    });
+  });
+
+  it('hides Phase when it is actually the operator code', () => {
+    expect(getAdminStepColumnDisplay({
+      Phase: '001',
+      OperatorCode: '001',
+      Fabrication: 'Montage'
+    })).toEqual({
+      stepCode: '-',
+      stepLabel: 'Montage'
+    });
+  });
+
+  it('hides event-marker phases (PRODUCTION, PAUSE...) from the Phase column', () => {
+    expect(getAdminStepColumnDisplay({
+      Phase: 'PRODUCTION',
+      Fabrication: 'Montage'
+    })).toEqual({
+      stepCode: '-',
+      stepLabel: 'Montage'
+    });
+  });
+
+  it('shows Phase even without Fabrication', () => {
+    expect(getAdminStepColumnDisplay({
+      Phase: '040',
+      CodeRubrique: '',
+      fabrication: '-'
+    })).toEqual({
+      stepCode: '040',
+      stepLabel: '-'
+    });
+  });
+});
+
+describe('compareAdminTimelineRows (logique SILOG)', () => {
+  const mk = (overrides) => ({
+    OperatorCode: '922',
+    DateCreation: '2026-07-08',
+    StartTime: '08:00',
+    LancementCode: 'LT001',
+    ...overrides
+  });
+
+  it('trie par opérateur puis heure de début chronologique', () => {
+    const rows = [
+      mk({ StartTime: '13:53', LancementCode: 'LT002', TempsId: 3 }),
+      mk({ StartTime: '07:28', LancementCode: 'LT001', TempsId: 1 }),
+      mk({ StartTime: '12:00', LancementCode: 'LT002', TempsId: 2 }),
+      mk({ OperatorCode: '100', StartTime: '09:00', TempsId: 4 })
+    ];
+    const sorted = [...rows].sort(compareAdminTimelineRows);
+    expect(sorted.map((r) => r.StartTime)).toEqual(['09:00', '07:28', '12:00', '13:53']);
+  });
+
+  it('intercale les lignes de pause entre les opérations du même opérateur', () => {
+    const rows = [
+      mk({ StartTime: '12:00', LancementCode: 'LT002', _isPauseRow: false }),
+      mk({ StartTime: '10:00', LancementCode: 'LT002', _isPauseRow: true, type: 'pause' }),
+      mk({ StartTime: '07:28', LancementCode: 'LT001', _isPauseRow: false })
+    ];
+    const sorted = [...rows].sort(compareAdminTimelineRows);
+    expect(sorted.map((r) => r.StartTime)).toEqual(['07:28', '10:00', '12:00']);
+    expect(getAdminRowSortTimestamp(sorted[1])).toBeLessThan(getAdminRowSortTimestamp(sorted[2]));
+  });
+});
+
+describe('AdminPage', () => {
+  let adminPage;
+  let mockApp;
+  let mockApiService;
+  let mockNotificationManager;
+
+  beforeEach(() => {
+    // Mock de l'application
+    mockNotificationManager = {
+      success: vi.fn(),
+      error: vi.fn(),
+      warning: vi.fn(),
+      info: vi.fn(),
+      show: vi.fn()
+    };
+
+    mockApiService = {
+      getAdminData: vi.fn(),
+      getConnectedOperators: vi.fn(),
+      getAllOperators: vi.fn(),
+      getMonitoringTemps: vi.fn(),
+      validateMonitoringTemps: vi.fn(),
+      onHoldMonitoringTemps: vi.fn(),
+      validateAndTransmitMonitoringBatch: vi.fn(),
+      deleteMonitoringTemps: vi.fn(),
+      correctMonitoringTemps: vi.fn(),
+      get: vi.fn(),
+      post: vi.fn(),
+      put: vi.fn(),
+      delete: vi.fn(),
+      updateOperation: vi.fn(),
+      deleteOperation: vi.fn(),
+      validateLancementCode: vi.fn(),
+      getTablesInfo: vi.fn()
+    };
+
+    mockApp = {
+      getApiService: vi.fn(() => mockApiService),
+      getNotificationManager: vi.fn(() => mockNotificationManager)
+    };
+
+    // Setup DOM
+    document.body.innerHTML = `
+      <button id="refreshDataBtn"></button>
+      <button id="validateSelectedBtn"></button>
+      <button id="onHoldSelectedBtn"></button>
+      <button id="transmitSelectedBtn"></button>
+      <input id="selectAllRows" type="checkbox" />
+      <span id="totalOperators"></span>
+      <span id="activeLancements"></span>
+      <span id="pausedLancements"></span>
+      <span id="completedLancements"></span>
+      <div class="table-container"><table id="operationsTable"><tbody id="operationsTableBody"></tbody></table></div>
+      <select id="operatorFilter"></select>
+      <select id="statusFilter">
+        <option value=""></option>
+        <option value="EN_COURS">En cours</option>
+        <option value="EN_PAUSE">En pause</option>
+        <option value="TERMINE">Terminé</option>
+        <option value="T">Transmis SILOG</option>
+      </select>
+      <input id="searchFilter" />
+      <input id="operatorCodeSearch" />
+      <button id="clearFiltersBtn"></button>
+      <button id="transferBtn"></button>
+      <button id="addOperationBtn"></button>
+      <div id="paginationInfo"></div>
+      <div id="activeOperatorsIndicator"></div>
+      <span id="pauseCount"></span>
+      <span id="tempCount"></span>
+      <table><tbody id="pauseTableBody"></tbody></table>
+      <table><tbody id="tempTableBody"></tbody></table>
+    `;
+
+    // Mock setTimeout et setInterval
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+    if (adminPage) {
+      if (adminPage.refreshInterval) clearInterval(adminPage.refreshInterval);
+      if (adminPage.operatorsInterval) clearInterval(adminPage.operatorsInterval);
+      if (adminPage.autoSaveTimer) clearInterval(adminPage.autoSaveTimer);
+    }
+  });
+
+  describe('constructor', () => {
+    it('should initialize AdminPage', () => {
+      adminPage = new AdminPage(mockApp);
+      expect(adminPage.app).toBe(mockApp);
+      expect(adminPage.apiService).toBe(mockApiService);
+      expect(adminPage.notificationManager).toBe(mockNotificationManager);
+      expect(adminPage.operations).toEqual([]);
+      expect(adminPage.stats).toEqual({});
+      expect(adminPage.currentPage).toBe(1);
+      expect(adminPage.autoSaveEnabled).toBe(true);
+    });
+  });
+
+  describe('initializeElements', () => {
+    it('should initialize all elements', () => {
+      adminPage = new AdminPage(mockApp);
+      expect(adminPage.refreshDataBtn).toBeTruthy();
+      expect(adminPage.totalOperators).toBeTruthy();
+      expect(adminPage.operationsTableBody).toBeTruthy();
+    });
+
+    it('should create fallback for missing operationsTableBody', () => {
+      const el = document.getElementById('operationsTableBody');
+      if (el) el.remove();
+      adminPage = new AdminPage(mockApp);
+      expect(adminPage.operationsTableBody).toBeTruthy();
+    });
+  });
+
+  describe('addEventListenerSafe', () => {
+    it('should add event listener safely', () => {
+      adminPage = new AdminPage(mockApp);
+      const element = document.getElementById('refreshDataBtn');
+      const handler = vi.fn();
+      adminPage.addEventListenerSafe('refreshDataBtn', 'click', handler);
+      element.click();
+      expect(handler).toHaveBeenCalled();
+    });
+
+    it('should handle missing element', () => {
+      adminPage = new AdminPage(mockApp);
+      const handler = vi.fn();
+      adminPage.addEventListenerSafe('nonexistent', 'click', handler);
+      expect(handler).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('loadData', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should load data successfully', async () => {
+      const today = new Date().toISOString().split('T')[0];
+      mockApiService.getAdminData.mockResolvedValue({
+        operations: [{ id: 1, lancementCode: 'LT001', operatorId: 'OP001' }],
+        stats: { totalOperators: 5, activeLancements: 2 },
+        pagination: { currentPage: 1, totalPages: 1 }
+      });
+      mockApiService.getConnectedOperators.mockResolvedValue({
+        success: true,
+        operators: [{ code: 'OP001', name: 'Test' }]
+      });
+      mockApiService.getAllOperators.mockResolvedValue({
+        success: true,
+        operators: [{ code: 'OP001', name: 'Test' }]
+      });
+      mockApiService.getMonitoringTemps.mockResolvedValue({
+        success: true,
+        data: [],
+        count: 0
+      });
+
+      await adminPage.loadData();
+
+      expect(adminPage.operations.length).toBe(1);
+      expect(adminPage.stats.totalOperators).toBe(1);
+    });
+
+    it('should handle loading state', async () => {
+      adminPage.isLoading = true;
+      await adminPage.loadData();
+      expect(mockApiService.getAdminData).not.toHaveBeenCalled();
+    });
+
+    it('should handle timeout error', async () => {
+      // Désactiver les intervals automatiques pour éviter des appels loadData en arrière-plan
+      if (adminPage.refreshInterval) clearInterval(adminPage.refreshInterval);
+      if (adminPage.operatorsInterval) clearInterval(adminPage.operatorsInterval);
+      if (adminPage.autoSaveTimer) clearInterval(adminPage.autoSaveTimer);
+
+      // Utiliser de vrais timers et forcer le timeout à déclencher immédiatement
+      // (évite les faux timers qui provoquent des "Unhandled Rejection" dans Vitest)
+      vi.useRealTimers();
+      const realSetTimeout = global.setTimeout;
+      const setTimeoutSpy = vi
+        .spyOn(global, 'setTimeout')
+        .mockImplementation((fn, _ms, ...args) => realSetTimeout(fn, 0, ...args));
+
+      // Simuler des requêtes qui ne répondent pas: le timeout interne de loadData doit rejeter
+      mockApiService.getAdminData.mockImplementation(() => new Promise(() => {}));
+      mockApiService.getConnectedOperators.mockImplementation(() => new Promise(() => {}));
+      mockApiService.getAllOperators.mockImplementation(() => new Promise(() => {}));
+      mockApiService.getMonitoringTemps.mockImplementation(() => new Promise(() => {}));
+
+      const p = adminPage.loadData();
+      const pHandled = p.catch((e) => { throw e; });
+      await expect(pHandled).rejects.toThrow();
+
+      setTimeoutSpy.mockRestore();
+    });
+
+    it('should handle error and show cached data', async () => {
+      adminPage.operations = [{ id: 1 }];
+      mockApiService.getAdminData.mockRejectedValue(new Error('Network error'));
+      await adminPage.loadData().catch(() => {});
+      expect(adminPage.operations.length).toBe(1);
+    });
+
+    it('keeps existing rows while a silent refresh is in flight', async () => {
+      adminPage.operationsTableBody.innerHTML = '<tr data-operation-id="keep"><td>Myriam</td></tr>';
+      let resolveAdmin;
+      mockApiService.getAdminData.mockImplementation(() => new Promise((resolve) => {
+        resolveAdmin = resolve;
+      }));
+      mockApiService.getConnectedOperators.mockResolvedValue({ success: true, operators: [] });
+      mockApiService.getAllOperators.mockResolvedValue({ success: true, operators: [] });
+      mockApiService.getMonitoringTemps.mockResolvedValue({ success: true, data: [], count: 0 });
+
+      const pending = adminPage.loadData(true, { silent: true });
+      expect(adminPage.operationsTableBody.querySelector('tr[data-operation-id="keep"]')).toBeTruthy();
+      expect(adminPage.operationsTableBody.textContent).not.toContain('Chargement...');
+      resolveAdmin({ operations: [], stats: {}, pagination: { currentPage: 1, totalPages: 1 } });
+      await pending;
+    });
+
+    it('should increment consecutive errors', async () => {
+      mockApiService.getAdminData.mockRejectedValue(new Error('Error'));
+      await adminPage.loadData().catch(() => {});
+      expect(adminPage.consecutiveErrors).toBe(1);
+    });
+  });
+
+  describe('updateStats', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should update stats display', () => {
+      adminPage.stats = {
+        totalOperators: 10,
+        activeLancements: 5,
+        pausedLancements: 2,
+        completedLancements: 3
+      };
+      // updateStats calcule active/paused/completed depuis this.operations
+      adminPage.operations = Array.from({ length: 5 }).map((_, i) => ({
+        id: i + 1,
+        statusCode: 'EN_COURS',
+        StatusCode: 'EN_COURS',
+        operatorCode: `OP${String(i + 1).padStart(3, '0')}`,
+        LancementCode: `LT${String(i + 1).padStart(7, '0')}`
+      }));
+      // totalOperators = opérateurs distincts avec au moins une ligne en cours / pause (aligné tableau)
+      adminPage.updateStats();
+      expect(adminPage.totalOperators.textContent).toBe('5');
+      expect(adminPage.activeLancements.textContent).toBe('5');
+    });
+
+    it('should count each operation row for active (same LT, several operators)', () => {
+      adminPage.stats = { totalOperators: 0, activeLancements: 0, pausedLancements: 0, completedLancements: 0 };
+      const sharedLt = 'LT2600999';
+      adminPage.operations = Array.from({ length: 8 }).map((_, i) => ({
+        id: i + 1,
+        statusCode: 'EN_COURS',
+        StatusCode: 'EN_COURS',
+        operatorCode: `OP${String(i + 1).padStart(3, '0')}`,
+        LancementCode: sharedLt
+      }));
+      adminPage.updateStats();
+      expect(adminPage.activeLancements.textContent).toBe('8');
+    });
+  });
+
+  describe('dédoublonnage overlay consolidé/non consolidé', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('génère la même clé de créneau quand CodeRubrique/Phase sont vides (évite les doublons)', () => {
+      const consolidated = {
+        TempsId: 10,
+        OperatorCode: '922',
+        LancementCode: 'LT001',
+        Phase: null,
+        CodeRubrique: null,
+        StartTime: '08:00',
+        EndTime: '10:00'
+      };
+      const unconsolidated = {
+        OperatorCode: '922',
+        LancementCode: 'LT001',
+        Phase: null,
+        CodeRubrique: null,
+        StartTime: '08:00',
+        EndTime: '10:00',
+        _isUnconsolidated: true
+      };
+      expect(adminPage._getAdminMergeDedupSlotKey(consolidated))
+        .toBe(adminPage._getAdminMergeDedupSlotKey(unconsolidated));
+    });
+
+    it('supprime la ligne non consolidée si une ligne consolidée couvre le même créneau', () => {
+      const ops = [
+        {
+          TempsId: 10,
+          OperatorCode: '922',
+          LancementCode: 'LT001',
+          Phase: null,
+          CodeRubrique: null,
+          StartTime: '08:00',
+          EndTime: '10:00'
+        },
+        {
+          EventId: 99,
+          id: 99,
+          OperatorCode: '922',
+          LancementCode: 'LT001',
+          Phase: null,
+          CodeRubrique: null,
+          StartTime: '08:00',
+          EndTime: '10:00',
+          _isUnconsolidated: true
+        }
+      ];
+      const out = adminPage._dedupeAdminConsolidatedOverlay(ops);
+      expect(out).toHaveLength(1);
+      expect(out[0].TempsId).toBe(10);
+      expect(out[0].EventId).toBe(99);
+    });
+
+    it('masque ABTEMPS quand des segments productifs couvrent le même cycle (pas de chevauchement)', () => {
+      const ops = [
+        {
+          TempsId: 450,
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '2026-09-30T08:14:11',
+          EndTime: '2026-09-30T14:52:51'
+        },
+        {
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '08:14',
+          EndTime: '10:01',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        },
+        {
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '10:16',
+          EndTime: '12:57',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        },
+        {
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '13:49',
+          EndTime: '14:52',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        },
+        {
+          TempsId: 451,
+          OperatorCode: '865',
+          LancementCode: 'LT2600632',
+          DateCreation: '2026-09-30',
+          StartTime: '2026-09-30T14:53:17',
+          EndTime: '2026-09-30T15:38:06'
+        },
+        {
+          TempsId: 607,
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '2026-09-30T16:55:40',
+          EndTime: '2026-09-30T17:25:00'
+        }
+      ];
+      const out = adminPage._preferWorkSegmentsOverConsolidated(ops);
+      // Ligne ABTEMPS cumulée masquée ; TempsId éventuellement reporté sur le 1er segment
+      expect(out.find((o) => o.TempsId === 450 && !o._isWorkSegment)).toBeUndefined();
+      expect(out.filter((o) => o._isWorkSegment)).toHaveLength(3);
+      expect(out.find((o) => o.TempsId === 451)).toBeTruthy();
+      // Autre cycle le même jour (heure de début différente) : reste visible
+      expect(out.find((o) => o.TempsId === 607 && !o._isWorkSegment)).toBeTruthy();
+    });
+  });
+
+  describe('résolution transfert (segments SILOG)', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      mockApiService.getMonitoringTemps = vi.fn();
+      mockApiService.consolidateMonitoringBatch = vi.fn();
+    });
+
+    it('retrouve les TempsId consolidés même si seuls les segments sont affichés', async () => {
+      adminPage.operations = [
+        {
+          OperatorCode: '008',
+          LancementCode: 'LT2600401',
+          OperatorName: 'Intérimaire 8',
+          StatusCode: 'TERMINE',
+          Status: 'Terminé',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        },
+        {
+          OperatorCode: '008',
+          LancementCode: 'LT2600401',
+          OperatorName: 'Intérimaire 8',
+          StatusCode: 'TERMINE',
+          Status: 'Terminé',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        }
+      ];
+      mockApiService.getMonitoringTemps.mockResolvedValue({
+        success: true,
+        data: [{
+          TempsId: 501,
+          OperatorCode: '008',
+          LancementCode: 'LT2600401',
+          OperatorName: 'Intérimaire 8',
+          StatusCode: 'TERMINE',
+          Status: 'Terminé',
+          StatutTraitement: null
+        }]
+      });
+      mockApiService.consolidateMonitoringBatch.mockResolvedValue({
+        success: true,
+        results: { success: [], skipped: [], errors: [] }
+      });
+
+      const result = await adminPage._resolveTransferEligibleOperations();
+      // 2 segments affichés / 1 TempsId cumulé → force reconsolidation segmentaire
+      expect(mockApiService.consolidateMonitoringBatch).toHaveBeenCalled();
+      expect(result.eligible.map((o) => o.TempsId)).toContain(501);
+    });
+
+    it('attache les TempsId segmentaires aux lignes affichées', () => {
+      const out = adminPage._preferWorkSegmentsOverConsolidated([
+        {
+          TempsId: 501,
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '2026-09-30T08:14:00',
+          EndTime: '2026-09-30T10:01:00',
+          StatutTraitement: null
+        },
+        {
+          TempsId: 502,
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '2026-09-30T10:16:00',
+          EndTime: '2026-09-30T12:57:00',
+          StatutTraitement: null
+        },
+        {
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '08:14',
+          EndTime: '10:01',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        },
+        {
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '10:16',
+          EndTime: '12:57',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        }
+      ]);
+      const segs = out.filter((o) => o._isWorkSegment);
+      expect(segs).toHaveLength(2);
+      expect(segs.map((s) => s.TempsId).sort()).toEqual([501, 502]);
+      expect(out.find((o) => !o._isWorkSegment && o.TempsId)).toBeUndefined();
+    });
+
+    it('reporte les heures corrigées ABTEMPS sur le segment affiché', () => {
+      const out = adminPage._preferWorkSegmentsOverConsolidated([
+        {
+          TempsId: 501,
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '2026-09-30T08:14:00',
+          EndTime: '2026-09-30T11:30:00',
+          StatutTraitement: null
+        },
+        {
+          OperatorCode: '865',
+          LancementCode: 'LT2600636',
+          DateCreation: '2026-09-30',
+          StartTime: '08:14',
+          EndTime: '10:01',
+          _isWorkSegment: true,
+          _isUnconsolidated: true
+        }
+      ]);
+      const seg = out.find((o) => o._isWorkSegment);
+      expect(seg).toBeTruthy();
+      expect(seg.TempsId).toBe(501);
+      expect(seg.EndTime).toBe('2026-09-30T11:30:00');
+      expect(seg.StartTime).toBe('2026-09-30T08:14:00');
+    });
+
+    it('conserve tous les TempsId multi-cycles du même LT (pas un seul par lancement)', async () => {
+      adminPage.operations = [
+        {
+          TempsId: 429,
+          OperatorCode: '865',
+          LancementCode: 'LT2600401',
+          StatusCode: 'TERMINE',
+          Status: 'Terminé',
+          StartTime: '2026-09-16T09:12:30',
+          EndTime: '2026-09-16T09:15:07',
+          ProductiveDuration: 3,
+          StatutTraitement: null
+        },
+        {
+          TempsId: 434,
+          OperatorCode: '865',
+          LancementCode: 'LT2600401',
+          StatusCode: 'TERMINE',
+          Status: 'Terminé',
+          StartTime: '2026-09-16T09:15:17',
+          EndTime: '2026-09-16T09:48:23',
+          ProductiveDuration: 33,
+          StatutTraitement: null
+        }
+      ];
+      mockApiService.getMonitoringTemps.mockResolvedValue({
+        success: true,
+        data: [
+          {
+            TempsId: 429,
+            OperatorCode: '865',
+            LancementCode: 'LT2600401',
+            StatusCode: 'TERMINE',
+            Status: 'Terminé',
+            ProductiveDuration: 3,
+            StatutTraitement: null
+          },
+          {
+            TempsId: 434,
+            OperatorCode: '865',
+            LancementCode: 'LT2600401',
+            StatusCode: 'TERMINE',
+            Status: 'Terminé',
+            ProductiveDuration: 33,
+            StatutTraitement: null
+          }
+        ]
+      });
+
+      const result = await adminPage._resolveTransferEligibleOperations();
+      expect(result.eligible).toHaveLength(2);
+      expect(result.eligible.map((o) => o.TempsId).sort((a, b) => a - b)).toEqual([429, 434]);
+      expect(mockApiService.consolidateMonitoringBatch).not.toHaveBeenCalled();
+    });
+
+    it('détaille les TempsId OK/échec dans le message de transfert', () => {
+      const msg = adminPage._formatTransferResultMessage({
+        count: 2,
+        validatedIds: [429, 434],
+        invalidIds: [{ tempsId: 435, errors: ['ProductiveDuration doit être > 0'] }],
+        ediJob: { skipped: true, message: 'mode planifié' }
+      }, 3);
+      expect(msg).toContain('OK TempsId: 429, 434');
+      expect(msg).toContain('Échec: 435:');
+    });
+
+    it('utilise le TempsId renvoyé quand la consolidation répond "Déjà consolidé"', async () => {
+      adminPage.operations = [{
+        OperatorCode: '319',
+        LancementCode: 'LT2600390',
+        OperatorName: 'CHESSEBEUF Maria',
+        StatusCode: 'TERMINE',
+        Status: 'Terminé',
+        _isWorkSegment: true,
+        _isUnconsolidated: true
+      }];
+      mockApiService.getMonitoringTemps
+        .mockResolvedValueOnce({ success: true, data: [] })
+        .mockResolvedValueOnce({ success: true, data: [] });
+      mockApiService.consolidateMonitoringBatch.mockResolvedValue({
+        success: true,
+        results: {
+          success: [],
+          skipped: [{
+            OperatorCode: '319',
+            LancementCode: 'LT2600390',
+            TempsId: 902,
+            reason: 'Déjà consolidé'
+          }],
+          errors: []
+        }
+      });
+
+      const result = await adminPage._resolveTransferEligibleOperations();
+      expect(result.eligible).toHaveLength(1);
+      expect(result.eligible[0].TempsId).toBe(902);
+    });
+  });
+
+  describe('updateOperationsTable', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should display operations', () => {
+      adminPage.operations = [
+        {
+          TempsId: 1,
+          OperatorName: 'Test',
+          OperatorCode: 'OP001',
+          LancementCode: 'LT001',
+          LancementName: 'DESIGNATION',
+          StartTime: '08:00',
+          EndTime: '10:00',
+          StatutTraitement: null
+        }
+      ];
+      adminPage.updateOperationsTable();
+      expect(adminPage.operationsTableBody.children.length).toBeGreaterThan(0);
+    });
+
+    it('should filter by status', () => {
+      adminPage.operations = [
+        { TempsId: 1, LancementCode: 'LT001', StatutTraitement: null, StatusCode: 'EN_COURS' },
+        { TempsId: 2, LancementCode: 'LT002', StatutTraitement: 'T', DateCreation: new Date().toISOString().slice(0, 10) }
+      ];
+      document.getElementById('statusFilter').value = 'T';
+      adminPage.updateOperationsTable();
+      const rows = adminPage.operationsTableBody.querySelectorAll('tr');
+      expect(rows.length).toBe(1);
+      expect(rows[0].classList.contains('row-transmitted')).toBe(true);
+    });
+
+    it('should grey out transmitted SILOG rows (StatutTraitement T)', () => {
+      const today = new Date().toISOString().slice(0, 10);
+      adminPage.operations = [
+        {
+          TempsId: 10,
+          OperatorCode: '912',
+          OperatorName: 'Test',
+          LancementCode: 'LT2600001',
+          LancementName: 'ART',
+          Phase: '010',
+          Fabrication: 'Montage',
+          StartTime: '08:00',
+          EndTime: '10:00',
+          StatutTraitement: 'T',
+          DateCreation: today
+        }
+      ];
+      adminPage.updateOperationsTable();
+      const row = adminPage.operationsTableBody.querySelector('tr.row-transmitted');
+      expect(row).toBeTruthy();
+      expect(row.textContent).toContain('TRANSMIS');
+      expect(row.querySelector('.transmitted-lock')).toBeTruthy();
+    });
+
+    it('keeps a corrected unconsolidated line when another cycle the same day is transmitted', () => {
+      adminPage.operations = [
+        {
+          TempsId: 10,
+          OperatorCode: '592',
+          OperatorName: 'Madjuki',
+          LancementCode: 'LT2600001',
+          StartTime: '08:00',
+          EndTime: '16:00',
+          StatutTraitement: 'T',
+          StatusCode: 'TERMINE',
+          DateCreation: '2026-10-27'
+        },
+        {
+          EventId: 77,
+          OperatorCode: '592',
+          OperatorName: 'Madjuki',
+          LancementCode: 'LT2600001',
+          StartTime: '08:00',
+          EndTime: '15:00',
+          StatutTraitement: null,
+          StatusCode: 'TERMINE',
+          Status: 'Terminé',
+          _isUnconsolidated: true,
+          _isWorkSegment: true,
+          DateCreation: '2026-10-27'
+        }
+      ];
+      adminPage.updateOperationsTable();
+      const text = adminPage.operationsTableBody.textContent;
+      expect(text).toContain('15:00');
+      expect(text).toContain('16:00');
+    });
+
+    it('should filter by operator number', () => {
+      adminPage.operations = [
+        { TempsId: 1, OperatorCode: '754', LancementCode: 'LT2600960', StatutTraitement: null, DateCreation: '2026-10-09' },
+        { TempsId: 2, OperatorCode: '890', LancementCode: 'LT2600960', StatutTraitement: null, DateCreation: '2026-10-09' }
+      ];
+      document.getElementById('operatorCodeSearch').value = '754';
+      adminPage.updateOperationsTable();
+      const text = adminPage.operationsTableBody.textContent;
+      expect(text).toContain('754');
+      expect(text).not.toContain('890');
+    });
+
+    it('should filter by search', () => {
+      adminPage.operations = [
+        { TempsId: 1, LancementCode: 'LT001', StatutTraitement: null },
+        { TempsId: 2, LancementCode: 'LT002', StatutTraitement: 'O' }
+      ];
+      document.getElementById('searchFilter').value = 'LT001';
+      adminPage.updateOperationsTable();
+      const rows = adminPage.operationsTableBody.querySelectorAll('tr');
+      expect(rows.length).toBeGreaterThan(0);
+    });
+
+    it('should show empty message when no operations', () => {
+      adminPage.operations = [];
+      adminPage.updateOperationsTable();
+      expect(adminPage.operationsTableBody.innerHTML).toContain('Aucun enregistrement');
+    });
+  });
+
+  describe('formatDateTime', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should format time string', () => {
+      expect(adminPage.formatDateTime('08:30')).toBe('08:30');
+      expect(adminPage.formatDateTime('08:30:00')).toBe('08:30');
+    });
+
+    it('should format date object', () => {
+      const date = new Date('2024-01-15T08:30:00Z');
+      const result = adminPage.formatDateTime(date);
+      expect(result).toMatch(/\d{2}:\d{2}/);
+    });
+
+    it('should return dash for null', () => {
+      expect(adminPage.formatDateTime(null)).toBe('-');
+      expect(adminPage.formatDateTime(undefined)).toBe('-');
+    });
+  });
+
+  describe.skip('editOperation', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      adminPage.operations = [
+        {
+          id: 1,
+          lancementCode: 'LT001',
+          startTime: '08:00',
+          endTime: '10:00',
+          statusCode: 'EN_COURS',
+          status: 'En cours'
+        }
+      ];
+    });
+
+    it('should edit operation', () => {
+      adminPage.updateOperationsTable();
+      const row = adminPage.operationsTableBody.querySelector('tr');
+      if (row) {
+        row.setAttribute('data-operation-id', '1');
+        adminPage.editOperation(1);
+        const timeInputs = row.querySelectorAll('input[type="time"]');
+        expect(timeInputs.length).toBeGreaterThan(0);
+      }
+    });
+
+    it('should handle missing operation', () => {
+      adminPage.editOperation(999);
+      expect(mockNotificationManager.warning).toHaveBeenCalled();
+    });
+  });
+
+  describe.skip('saveOperation', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      adminPage.operations = [
+        {
+          id: 1,
+          lancementCode: 'LT001',
+          startTime: '08:00',
+          endTime: '10:00',
+          statusCode: 'EN_COURS',
+          status: 'En cours'
+        }
+      ];
+    });
+
+    it('should save operation successfully', async () => {
+      adminPage.updateOperationsTable();
+      const row = adminPage.operationsTableBody.querySelector('tr');
+      if (row) {
+        row.setAttribute('data-operation-id', '1');
+        adminPage.editOperation(1);
+        await vi.advanceTimersByTimeAsync(100);
+        
+        mockApiService.updateOperation.mockResolvedValue({ success: true });
+        await adminPage.saveOperation(1);
+        expect(mockApiService.updateOperation).toHaveBeenCalled();
+      }
+    });
+
+    it('should validate time consistency', async () => {
+      adminPage.updateOperationsTable();
+      const row = adminPage.operationsTableBody.querySelector('tr');
+      if (row) {
+        row.setAttribute('data-operation-id', '1');
+        adminPage.editOperation(1);
+        await vi.advanceTimersByTimeAsync(100);
+        
+        const startInput = row.querySelector('input[data-field="startTime"]');
+        const endInput = row.querySelector('input[data-field="endTime"]');
+        if (startInput && endInput) {
+          startInput.value = '10:00';
+          endInput.value = '08:00';
+          mockApiService.updateOperation.mockResolvedValue({ success: true });
+          await adminPage.saveOperation(1);
+          expect(mockNotificationManager.error).toHaveBeenCalled();
+        }
+      }
+    });
+  });
+
+  describe('deleteAdminLine', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      adminPage.loadData = vi.fn().mockResolvedValue(undefined);
+      adminPage.loadingIndicator = { show: vi.fn(), hide: vi.fn() };
+      adminPage.validator = { validateId: (id) => Number.isFinite(Number(id)) };
+      adminPage.selectedTempsIds = new Set();
+      global.confirm = vi.fn(() => true);
+    });
+
+    it('supprime ABTEMPS et historique en une seule action', async () => {
+      mockApiService.deleteMonitoringTemps.mockResolvedValue({ success: true });
+      mockApiService.deleteOperation.mockResolvedValue({ success: true });
+
+      await adminPage.deleteAdminLine({ tempsId: 10, eventId: '99' });
+
+      expect(mockApiService.deleteMonitoringTemps).toHaveBeenCalledWith(10);
+      expect(mockApiService.deleteOperation).toHaveBeenCalledWith('99');
+      expect(adminPage.loadData).toHaveBeenCalledTimes(1);
+      expect(mockNotificationManager.success).toHaveBeenCalled();
+    });
+
+    it('ne fait rien si annulé', async () => {
+      global.confirm = vi.fn(() => false);
+      await adminPage.deleteAdminLine({ tempsId: 10, eventId: '99' });
+      expect(mockApiService.deleteMonitoringTemps).not.toHaveBeenCalled();
+      expect(mockApiService.deleteOperation).not.toHaveBeenCalled();
+    });
+  });
+
+  describe.skip('handleAddOperation', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      global.prompt = vi.fn();
+      global.confirm = vi.fn();
+    });
+
+    it('should add operation', async () => {
+      global.prompt
+        .mockReturnValueOnce('OP001')
+        .mockReturnValueOnce('LT001')
+        .mockReturnValueOnce('PHASE1');
+      mockApiService.post.mockResolvedValue({ success: true });
+      adminPage.loadData = vi.fn();
+      await adminPage.handleAddOperation();
+      expect(mockApiService.post).toHaveBeenCalled();
+    });
+
+    it('should not add if cancelled', async () => {
+      global.prompt.mockReturnValueOnce(null);
+      await adminPage.handleAddOperation();
+      expect(mockApiService.post).not.toHaveBeenCalled();
+    });
+  });
+
+  describe.skip('handleTransfer', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      global.confirm = vi.fn(() => true);
+    });
+
+    it('should transfer operations', async () => {
+      mockApiService.post.mockResolvedValue({ success: true, transferredCount: 5 });
+      adminPage.loadData = vi.fn();
+      await adminPage.handleTransfer();
+      expect(mockApiService.post).toHaveBeenCalled();
+      expect(mockNotificationManager.success).toHaveBeenCalled();
+    });
+
+    it('should not transfer if cancelled', async () => {
+      global.confirm = vi.fn(() => false);
+      await adminPage.handleTransfer();
+      expect(mockApiService.post).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('autoSave', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should start auto save', () => {
+      adminPage.startAutoSave();
+      expect(adminPage.autoSaveTimer).toBeTruthy();
+    });
+
+    it('should stop auto save', () => {
+      adminPage.startAutoSave();
+      adminPage.stopAutoSave();
+      expect(adminPage.autoSaveTimer).toBeNull();
+    });
+
+    it('should add pending change', () => {
+      adminPage.addPendingChange(1, 'startTime', '08:00');
+      expect(adminPage.pendingChanges.has(1)).toBe(true);
+    });
+
+    it('should process auto save', async () => {
+      adminPage.addPendingChange(1, 'startTime', '08:00');
+      adminPage.operations = [{ id: 1 }];
+      adminPage.saveOperationChanges = vi.fn().mockResolvedValue({ success: true });
+      await adminPage.processAutoSave();
+      expect(adminPage.pendingChanges.size).toBe(0);
+    });
+  });
+
+  describe('updateOperatorSelect', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should update operator select', () => {
+      const operators = [
+        { code: 'OP001', name: 'Test 1', isActive: true, isProperlyLinked: true },
+        { code: 'OP002', name: 'Test 2', isActive: false, isProperlyLinked: false }
+      ];
+      adminPage.updateOperatorSelect(operators);
+      // 1 option default + 2 options dans optgroup
+      expect(adminPage.operatorSelect.querySelectorAll('option').length).toBe(3);
+    });
+  });
+
+  describe('releaseHoldMonitoringRecord', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      mockApiService.releaseHoldMonitoringTemps = vi.fn().mockResolvedValue({ success: true });
+      adminPage.loadData = vi.fn();
+    });
+
+    it('affiche « BLOQUÉE » pour une ligne en A', () => {
+      expect(adminPage.getMonitoringStatusText('A')).toBe('BLOQUÉE');
+    });
+
+    it('ne débloque pas sans confirmation', async () => {
+      global.confirm = vi.fn(() => false);
+      await adminPage.releaseHoldMonitoringRecord(580);
+      expect(global.confirm).toHaveBeenCalled();
+      expect(mockApiService.releaseHoldMonitoringTemps).not.toHaveBeenCalled();
+    });
+
+    it('débloque après confirmation', async () => {
+      global.confirm = vi.fn(() => true);
+      await adminPage.releaseHoldMonitoringRecord(580);
+      expect(mockApiService.releaseHoldMonitoringTemps).toHaveBeenCalledWith(580);
+    });
+  });
+
+  describe('resetConsecutiveErrors', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should reset error counter', () => {
+      adminPage.consecutiveErrors = 5;
+      adminPage.resetConsecutiveErrors();
+      expect(adminPage.consecutiveErrors).toBe(0);
+    });
+  });
+
+  describe('exportToCSV', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      global.URL.createObjectURL = vi.fn(() => 'blob:url');
+      global.URL.revokeObjectURL = vi.fn();
+    });
+
+    it('should export to CSV', () => {
+      adminPage.operations = [
+        {
+          operatorName: 'Test',
+          lancementCode: 'LT001',
+          article: 'ART001',
+          startTime: '08:00',
+          endTime: '10:00',
+          duration: '02:00:00',
+          status: 'Terminé'
+        }
+      ];
+      const link = { click: vi.fn(), setAttribute: vi.fn() };
+      document.createElement = vi.fn(() => link);
+      document.body.appendChild = vi.fn();
+      document.body.removeChild = vi.fn();
+      adminPage.exportToCSV();
+      expect(link.click).toHaveBeenCalled();
+    });
+
+    it('should warn if no data', () => {
+      adminPage.operations = [];
+      adminPage.exportToCSV();
+      expect(mockNotificationManager.warning).toHaveBeenCalled();
+    });
+  });
+
+  describe('timeToMinutes', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should convert time to minutes', () => {
+      expect(adminPage.timeToMinutes('08:30')).toBe(510);
+      expect(adminPage.timeToMinutes('00:00')).toBe(0);
+    });
+
+    it('should handle invalid time', () => {
+      expect(adminPage.timeToMinutes('')).toBe(0);
+      expect(adminPage.timeToMinutes(null)).toBe(0);
+    });
+  });
+
+  describe('validateAndFormatTime', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+    });
+
+    it('should validate and format time', () => {
+      expect(adminPage.validateAndFormatTime('08:30')).toBe('08:30');
+      expect(adminPage.validateAndFormatTime('8:30')).toBe('08:30');
+    });
+
+    it('should return null for invalid time', () => {
+      expect(adminPage.validateAndFormatTime('25:00')).toBeNull();
+      expect(adminPage.validateAndFormatTime('08:60')).toBeNull();
+    });
+  });
+
+  describe('pickCodeRubrique (menu déroulant)', () => {
+    beforeEach(() => {
+      adminPage = new AdminPage(mockApp);
+      // exportToCSV remplace document.createElement / appendChild par des mocks : on restaure.
+      delete document.createElement;
+      delete document.body.appendChild;
+      delete document.body.removeChild;
+      document.body.innerHTML = '';
+    });
+
+    it('liste les codes rubrique du lancement et renvoie le choix', async () => {
+      mockApiService.getLancementSteps = vi.fn().mockResolvedValue({
+        steps: [
+          { Phase: '010', CodeRubrique: 'R1', CodeOperation: 'MONTAGE' },
+          { Phase: '020', CodeRubrique: 'R1', CodeOperation: 'MONTAGE' },
+          { Phase: '040', CodeRubrique: 'R2', CodeOperation: 'CONTROLE' }
+        ]
+      });
+      const pending = adminPage.pickCodeRubrique('LT2500001', 'R1');
+      await vi.waitFor(() => expect(document.querySelector('.code-rubrique-select')).not.toBeNull());
+      const select = document.querySelector('.code-rubrique-select');
+      expect(Array.from(select.options).map(o => o.value)).toEqual(['R1', 'R2']);
+      expect(select.value).toBe('R1');
+      select.value = 'R2';
+      document.querySelector('.code-rubrique-ok').click();
+      await expect(pending).resolves.toBe('R2');
+      expect(document.querySelector('.code-rubrique-select')).toBeNull();
+    });
+
+    it('renvoie null si annulé', async () => {
+      mockApiService.getLancementSteps = vi.fn().mockResolvedValue({
+        steps: [{ Phase: '010', CodeRubrique: 'R1' }]
+      });
+      const pending = adminPage.pickCodeRubrique('LT2500001', 'R1');
+      await vi.waitFor(() => expect(document.querySelector('.code-rubrique-cancel')).not.toBeNull());
+      document.querySelector('.code-rubrique-cancel').click();
+      await expect(pending).resolves.toBeNull();
+    });
+
+    it('revient à la saisie libre si aucune rubrique trouvée', async () => {
+      mockApiService.getLancementSteps = vi.fn().mockResolvedValue({ steps: [] });
+      global.prompt = vi.fn(() => 'R9');
+      await expect(adminPage.pickCodeRubrique('LT2500001', 'R1')).resolves.toBe('R9');
+    });
+  });
+});
+
+

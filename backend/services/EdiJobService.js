@@ -1,0 +1,588 @@
+/**
+ * Service pour l'exécution de l'EDI_JOB de SILOG
+ * Permet de déclencher la remontée des temps de production dans les tables standard de SILOG
+ */
+
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const path = require('path');
+const fs = require('fs/promises');
+
+const execAsync = promisify(exec);
+
+class EdiJobService {
+    static _ts() {
+        return new Date().toISOString().replace('T', ' ').slice(0, 19);
+    }
+
+    static _log(level, msg, ctx = {}) {
+        const prefix = `[EDI_JOB][${this._ts()}][${level}]`;
+        const extra = Object.keys(ctx).length > 0 ? ` ${JSON.stringify(ctx)}` : '';
+        const line = `${prefix} ${msg}${extra}`;
+        if (level === 'ERROR') console.error(line);
+        else if (level === 'WARN') console.warn(line);
+        else console.log(line);
+    }
+
+    static _dailyGuardPath() {
+        return process.env.SILOG_DAILY_GUARD_PATH || '/app/logs/edi-job-last-run.json';
+    }
+
+    static _lastStatusPath() {
+        if (process.env.EDI_LAST_STATUS_PATH) return process.env.EDI_LAST_STATUS_PATH;
+        return path.join(path.dirname(this._dailyGuardPath()), 'edi-last-status.json');
+    }
+
+    static async _writeLastStatus(payload) {
+        const target = this._lastStatusPath();
+        try {
+            await fs.mkdir(path.dirname(target), { recursive: true });
+        } catch (_) {
+            // ignore
+        }
+        await fs.writeFile(
+            target,
+            JSON.stringify({ at: new Date().toISOString(), ...payload }, null, 2),
+            'utf8'
+        );
+    }
+
+    static _todayKey() {
+        return new Date().toISOString().slice(0, 10);
+    }
+
+    static async _readDailyGuard() {
+        try {
+            const raw = await fs.readFile(this._dailyGuardPath(), 'utf8');
+            return JSON.parse(raw);
+        } catch (_) {
+            return { date: null, count: 0 };
+        }
+    }
+
+    static async _writeDailyGuard(data) {
+        const target = this._dailyGuardPath();
+        try {
+            await fs.mkdir(path.dirname(target), { recursive: true });
+        } catch (_) {
+            // ignore
+        }
+        await fs.writeFile(target, JSON.stringify(data, null, 2), 'utf8');
+    }
+
+    static async _canRunToday(options = {}) {
+        const force = options.force === true || String(options.force || '').toLowerCase() === 'true';
+        if (force) return { allowed: true, reason: 'forced' };
+        const maxRunsPerDay = Number.parseInt(process.env.SILOG_MAX_RUNS_PER_DAY || '1', 10) || 1;
+        const today = this._todayKey();
+        const guard = await this._readDailyGuard();
+        const countToday = guard?.date === today ? Number(guard.count || 0) : 0;
+        if (countToday >= maxRunsPerDay) {
+            return { allowed: false, reason: `max_runs_reached_${maxRunsPerDay}` };
+        }
+        return { allowed: true, reason: 'ok' };
+    }
+
+    static async _recordRun() {
+        const today = this._todayKey();
+        const guard = await this._readDailyGuard();
+        const countToday = guard?.date === today ? Number(guard.count || 0) : 0;
+        await this._writeDailyGuard({
+            date: today,
+            count: countToday + 1,
+            updatedAt: new Date().toISOString()
+        });
+    }
+
+    static _psSingleQuote(value) {
+        // Escape single quotes for PowerShell single-quoted strings: ' => ''
+        return String(value ?? '').replaceAll("'", "''");
+    }
+
+    static _maskCommandForLogs(text) {
+        const s = String(text || '');
+        // Mask "-pXXXX" and "-p XXXX" styles (best-effort)
+        return s
+            .replace(/-p[^\s"]+/gi, '-p***')
+            .replace(/-p\s+("[^"]+"|\S+)/gi, '-p ***');
+    }
+
+    static _buildConfig(codeTache, options = {}) {
+        // Backward-compatible env var names + new explicit ones (recommended)
+        const silogExe = process.env.SILOG_EXE_PATH || process.env.SILOG_PATH || options.silogPath || 'C:\\SILOG\\SILOG.exe';
+        const workDir =
+            process.env.SILOG_WORKDIR ||
+            options.workingDirectory ||
+            (() => {
+                try { return path.dirname(silogExe); } catch (_) { return null; }
+            })();
+
+        const profil = process.env.SILOG_DB || process.env.SILOG_PROFIL || options.profil || 'SEDI_TESTS';
+        const utilisateur = process.env.SILOG_USER || options.utilisateur || 'Production8';
+        const motDePasse = process.env.SILOG_PASSWORD || options.motDePasse || '';
+        const langue = process.env.SILOG_LANG || process.env.SILOG_LANGUE || options.langue || 'fr_fr';
+        const mode = process.env.SILOG_MODE || options.mode || 'COMPACT';
+        const entrypoint = process.env.SILOG_ENTRYPOINT || options.entrypoint || 'EDI_JOB';
+        const codeTacheFinal =
+            codeTache ||
+            process.env.SILOG_TASK_CODE ||
+            process.env.SILOG_CODE_TACHE ||
+            process.env.SILOG_TASK ||
+            'SEDI_ETDIFF';
+
+        const timeoutMs = Number.parseInt(process.env.SILOG_TIMEOUT_MS || options.timeoutMs || '300000', 10) || 300000;
+        const useStartProcess =
+            String(process.env.SILOG_USE_START_PROCESS ?? options.useStartProcess ?? 'true').toLowerCase() !== 'false';
+
+        return {
+            silogExe,
+            workDir,
+            profil,
+            utilisateur,
+            motDePasse,
+            langue,
+            mode,
+            entrypoint,
+            codeTache: codeTacheFinal,
+            timeoutMs,
+            useStartProcess
+        };
+    }
+
+    /**
+     * Exécuter l'EDI_JOB de SILOG
+     * @param {string} codeTache - Code de la tâche à exécuter
+     * @param {Object} options - Options supplémentaires (profil, utilisateur, mot de passe, etc.)
+     * @returns {Promise<Object>} Résultat de l'exécution
+     */
+    static async executeEdiJob(codeTache, options = {}) {
+        const startMs = Date.now();
+        try {
+            const gate = await this._canRunToday(options);
+            if (!gate.allowed) {
+                this._log('INFO', 'Exécution ignorée (limite quotidienne atteinte)', { reason: gate.reason });
+                return {
+                    success: true,
+                    skipped: true,
+                    message: 'EDI_JOB deja execute aujourd\'hui (limite quotidienne atteinte).',
+                    reason: gate.reason,
+                    codeTache: codeTache || process.env.SILOG_TASK_CODE || process.env.SILOG_CODE_TACHE || process.env.SILOG_TASK || 'SEDI_ETDIFF'
+                };
+            }
+
+            const config = this._buildConfig(codeTache, options);
+            this._log('INFO', 'Démarrage exécution', {
+                codeTache: config.codeTache,
+                profil: config.profil,
+                utilisateur: config.utilisateur,
+                platform: process.platform,
+                timeoutMs: config.timeoutMs
+            });
+
+            // IMPORTANT: SILOG.exe ne peut pas être exécuté directement sur Linux.
+            // Dans ce cas, on doit passer par un "runner" Windows (SSH/WinRM/etc).
+            if (process.platform !== 'win32') {
+                const remoteMode = String(process.env.SILOG_REMOTE_MODE || options.remoteMode || '').trim().toLowerCase();
+                if (remoteMode === 'scheduled' || remoteMode === 'disable' || remoteMode === 'disabled' || remoteMode === 'none') {
+                    this._log('INFO', 'Mode tâche planifiée Windows (non déclenché par le backend)', {
+                        remoteMode,
+                        codeTache: config.codeTache
+                    });
+                    return {
+                        success: true,
+                        skipped: true,
+                        message:
+                            `EDI_JOB non déclenché par le backend (SILOG_REMOTE_MODE=${remoteMode}). ` +
+                            `Mode prévu: tâche planifiée Windows sur SVC_SILOG (ou poste runner défini).`,
+                        codeTache: config.codeTache
+                    };
+                }
+                if (remoteMode !== 'ssh') {
+                    this._log('ERROR', 'Plateforme non supportée pour exécution directe', {
+                        platform: process.platform,
+                        remoteMode
+                    });
+                    return {
+                        success: false,
+                        error: 'SILOG_UNSUPPORTED_PLATFORM',
+                        details:
+                            `Le backend tourne sur ${process.platform}. SILOG.exe nécessite Windows.\n` +
+                            `Solutions:\n` +
+                            `- Exécuter le backend sur une machine Windows qui voit \\\\SERVEURERP\\SILOG8\n` +
+                            `- OU configurer un runner Windows et activer SILOG_REMOTE_MODE=ssh (voir docs/SILOG_EDI_JOB.md).\n` +
+                            `- OU utiliser une tâche planifiée sur SVC_SILOG (ou runner Windows) et définir SILOG_REMOTE_MODE=scheduled.`,
+                        codeTache: config.codeTache
+                    };
+                }
+            }
+
+            // Construire la liste d'arguments SILOG (alignée sur la commande PowerShell fournie par Franck)
+            // Exemple:
+            // SILOG.exe -bSEDI_TESTS -uProduction8 -p -dfr_fr -eEDI_JOB -optcodetache=SEDI_ETDIFF -mCOMPACT
+            const passArg = config.motDePasse ? `-p${config.motDePasse}` : '-p';
+            const silogArgs = [
+                `-b${config.profil}`,
+                `-u${config.utilisateur}`,
+                passArg,
+                `-d${config.langue}`,
+                `-e${config.entrypoint}`,
+                `-optcodetache=${config.codeTache}`,
+                `-m${config.mode}`
+            ];
+
+            this._log('INFO', 'Commande SILOG préparée', {
+                command: this._maskCommandForLogs(`"${config.silogExe}" ${silogArgs.join(' ')}`),
+                workDir: config.workDir || '(défaut)'
+            });
+
+            let stdout = '';
+            let stderr = '';
+            let exitCode = null;
+
+            const runCommand = async (command, execOptions) => {
+                try {
+                    const r = await execAsync(command, execOptions);
+                    return { stdout: r.stdout || '', stderr: r.stderr || '', exitCode: 0 };
+                } catch (e) {
+                    // Timeout / killed => remonter à l'appelant (erreur réelle)
+                    if (e && (e.code === 'ETIMEDOUT' || e.killed)) throw e;
+                    // exec() rejette sur exitCode != 0. Dans ce cas, on capture stdout/stderr + code.
+                    if (typeof e?.code === 'number') {
+                        return {
+                            stdout: e.stdout || '',
+                            stderr: e.stderr || '',
+                            exitCode: e.code
+                        };
+                    }
+                    throw e;
+                }
+            };
+
+            if (process.platform === 'win32' && config.useStartProcess) {
+                // Utiliser Start-Process -Wait pour reproduire le comportement PowerShell (UNC + working directory)
+                const filePath = this._psSingleQuote(config.silogExe);
+                const workingDirectory = this._psSingleQuote(config.workDir || '');
+                const argList = this._psSingleQuote(silogArgs.join(' '));
+
+                const ps = [
+                    "$ErrorActionPreference='Stop';",
+                    `$p = Start-Process -FilePath '${filePath}' -ArgumentList '${argList}'${config.workDir ? ` -WorkingDirectory '${workingDirectory}'` : ''} -Wait -PassThru;`,
+                    'exit $p.ExitCode;'
+                ].join(' ');
+
+                const command = `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${ps}"`;
+                this._log('INFO', 'Exécution via PowerShell Start-Process', {
+                    command: this._maskCommandForLogs(command)
+                });
+
+                const r = await runCommand(command, {
+                    timeout: config.timeoutMs,
+                    maxBuffer: 10 * 1024 * 1024
+                });
+                stdout = r.stdout || '';
+                stderr = r.stderr || '';
+                exitCode = r.exitCode;
+            } else if (process.platform !== 'win32') {
+                // Runner distant (SSH) vers un hôte Windows qui exécutera PowerShell/Start-Process
+                const sshHost = String(process.env.SILOG_SSH_HOST || options.sshHost || '').trim();
+                const sshUser = String(process.env.SILOG_SSH_USER || options.sshUser || '').trim();
+                const sshPort = String(process.env.SILOG_SSH_PORT || options.sshPort || '').trim();
+                const sshKey = String(process.env.SILOG_SSH_KEY_PATH || options.sshKeyPath || '').trim();
+                const sshExtra = String(process.env.SILOG_SSH_EXTRA_ARGS || options.sshExtraArgs || '').trim();
+
+                if (!sshHost || !sshUser) {
+                    return {
+                        success: false,
+                        error: 'SILOG_REMOTE_SSH_NOT_CONFIGURED',
+                        details:
+                            `SILOG_REMOTE_MODE=ssh est activé mais SILOG_SSH_HOST/SILOG_SSH_USER ne sont pas définis.\n` +
+                            `Définir au minimum: SILOG_SSH_HOST, SILOG_SSH_USER (et optionnellement SILOG_SSH_KEY_PATH, SILOG_SSH_PORT).`,
+                        codeTache: config.codeTache
+                    };
+                }
+
+                const filePath = this._psSingleQuote(config.silogExe);
+                const workingDirectory = this._psSingleQuote(config.workDir || '');
+                const argList = this._psSingleQuote(silogArgs.join(' '));
+                const ps = [
+                    "$ErrorActionPreference='Stop';",
+                    `$p = Start-Process -FilePath '${filePath}' -ArgumentList '${argList}'${config.workDir ? ` -WorkingDirectory '${workingDirectory}'` : ''} -Wait -PassThru;`,
+                    'exit $p.ExitCode;'
+                ].join(' ');
+
+                // Commande PowerShell à exécuter sur Windows
+                const remotePs = `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${ps}"`;
+                // Construire commande SSH (BatchMode pour ne pas bloquer)
+                const parts = [
+                    'ssh',
+                    '-o', 'BatchMode=yes',
+                    ...(sshPort ? ['-p', sshPort] : []),
+                    ...(sshKey ? ['-i', `"${sshKey}"`] : []),
+                    ...(sshExtra ? [sshExtra] : []),
+                    `${sshUser}@${sshHost}`,
+                    `"${remotePs.replaceAll('"', '\\"')}"`
+                ];
+                const sshCommand = parts.join(' ');
+                this._log('INFO', 'Exécution via SSH vers hôte Windows', {
+                    sshHost,
+                    sshUser,
+                    command: this._maskCommandForLogs(sshCommand)
+                });
+
+                const r = await runCommand(sshCommand, {
+                    timeout: config.timeoutMs,
+                    maxBuffer: 10 * 1024 * 1024
+                });
+                stdout = r.stdout || '';
+                stderr = r.stderr || '';
+                exitCode = r.exitCode;
+            } else {
+                // Fallback: exécution directe (peut suffire en environnement non-Windows ou si Start-Process est désactivé)
+                const directCmd = `"${config.silogExe}" ${silogArgs.join(' ')}`;
+                const r = await runCommand(directCmd, {
+                    timeout: config.timeoutMs,
+                    maxBuffer: 10 * 1024 * 1024,
+                    cwd: config.workDir || undefined
+                });
+                stdout = r.stdout || '';
+                stderr = r.stderr || '';
+                exitCode = r.exitCode;
+            }
+            
+            const elapsedMs = Date.now() - startMs;
+            const warnings = !!(stderr && String(stderr).trim().length > 0);
+            const success = exitCode === 0;
+            
+            if (success) {
+                await this._recordRun();
+                await this._writeLastStatus({
+                    ok: true,
+                    codeTache: config.codeTache,
+                    exitCode,
+                    elapsedMs
+                }).catch(() => {});
+                this._log('INFO', 'Exécution terminée avec succès', {
+                    codeTache: config.codeTache,
+                    exitCode,
+                    elapsedMs,
+                    hasWarnings: warnings,
+                    stdoutLines: String(stdout || '').split('\n').filter(Boolean).length
+                });
+                if (warnings) {
+                    this._log('WARN', 'Avertissements détectés dans stderr', {
+                        stderr: String(stderr).trim().slice(0, 500)
+                    });
+                }
+                return {
+                    success: true,
+                    message: warnings ? 'EDI_JOB exécuté avec des avertissements' : 'EDI_JOB exécuté avec succès',
+                    codeTache: config.codeTache,
+                    stdout: stdout,
+                    stderr: warnings ? stderr : null,
+                    warnings: warnings || undefined,
+                    exitCode: exitCode,
+                    elapsedMs
+                };
+            }
+
+            this._log('ERROR', 'Exécution échouée', {
+                codeTache: config.codeTache,
+                exitCode,
+                elapsedMs,
+                stdout: String(stdout || '').trim().slice(0, 500),
+                stderr: String(stderr || '').trim().slice(0, 500)
+            });
+            await this._writeLastStatus({
+                ok: false,
+                error: 'EDI_JOB_FAILED',
+                message: `exitCode=${exitCode}`,
+                codeTache: config.codeTache,
+                exitCode,
+                elapsedMs
+            }).catch(() => {});
+            return {
+                success: false,
+                error: 'EDI_JOB_FAILED',
+                message: `EDI_JOB a échoué (exitCode=${exitCode})`,
+                codeTache: config.codeTache,
+                stdout,
+                stderr: stderr || null,
+                exitCode,
+                elapsedMs
+            };
+            
+        } catch (error) {
+            const elapsedMs = Date.now() - startMs;
+            let errorMessage = 'Erreur lors de l\'exécution de l\'EDI_JOB';
+            let errorDetails = null;
+            
+            if (error.code === 'ENOENT') {
+                errorMessage = 'Fichier SILOG.exe non trouvé';
+                errorDetails = `Chemin attendu: ${process.env.SILOG_EXE_PATH || process.env.SILOG_PATH || 'C:\\SILOG\\SILOG.exe'}`;
+            } else if (error.code === 'ETIMEDOUT' || error.killed) {
+                errorMessage = 'Timeout lors de l\'exécution de l\'EDI_JOB';
+                errorDetails = `L'exécution a dépassé ${Math.round((Date.now() - startMs) / 1000)}s`;
+            } else if (error.stderr) {
+                errorDetails = String(error.stderr).trim().slice(0, 500);
+            } else {
+                errorDetails = error.message;
+            }
+            
+            this._log('ERROR', errorMessage, {
+                codeTache: codeTache || null,
+                errorCode: error.code || null,
+                elapsedMs,
+                details: errorDetails
+            });
+
+            await this._writeLastStatus({
+                ok: false,
+                error: errorMessage,
+                details: errorDetails,
+                codeTache: codeTache || null,
+                elapsedMs
+            }).catch(() => {});
+
+            return {
+                success: false,
+                error: errorMessage,
+                details: errorDetails,
+                codeTache: codeTache || null,
+                exitCode: typeof error?.code === 'number' ? error.code : null,
+                elapsedMs
+            };
+        }
+    }
+    
+    /**
+     * Exécuter l'EDI_JOB pour un lot d'enregistrements transmis
+     * @param {Array<number>} tempsIds - Liste des IDs d'enregistrements transmis
+     * @param {string} codeTache - Code de la tâche (optionnel, généré automatiquement si non fourni)
+     * @returns {Promise<Object>} Résultat de l'exécution
+     */
+    static async executeEdiJobForTransmittedRecords(tempsIds, codeTache = null, options = {}) {
+        try {
+            const resolved = this._buildConfig(codeTache, {});
+            codeTache = resolved.codeTache;
+            // Transfert admin : toujours forcer (sinon SILOG_MAX_RUNS_PER_DAY=1 bloque le 2e clic du jour)
+            const runOptions = { force: true, ...options };
+            
+            this._log('INFO', 'Déclenchement EDI_JOB pour lot transmis', {
+                codeTache,
+                nbRecords: tempsIds.length,
+                sampleIds: tempsIds.slice(0, 5),
+                force: !!runOptions.force
+            });
+            
+            const result = await this.executeEdiJob(codeTache, runOptions);
+
+            // Statut pour le watchdog (couvre aussi les early-return success:false)
+            if (!result.skipped) {
+                await this._writeLastStatus({
+                    ok: Boolean(result.success),
+                    error: result.success ? null : (result.error || result.message || 'EDI_JOB_FAILED'),
+                    details: result.details || null,
+                    codeTache,
+                    exitCode: result.exitCode ?? null
+                }).catch(() => {});
+            }
+            
+            if (result.success && !result.skipped) {
+                this._log('INFO', 'Lot transmis traité avec succès', {
+                    codeTache,
+                    nbRecords: tempsIds.length,
+                    elapsedMs: result.elapsedMs || null
+                });
+            } else if (result.skipped) {
+                this._log('INFO', 'Lot transmis ignoré (scheduled/limite)', {
+                    codeTache,
+                    reason: result.reason || result.message
+                });
+            }
+            
+            return {
+                ...result,
+                tempsIds: tempsIds,
+                count: tempsIds.length
+            };
+            
+        } catch (error) {
+            this._log('ERROR', 'Erreur lot transmis', {
+                codeTache,
+                nbRecords: tempsIds.length,
+                error: error.message
+            });
+            return {
+                success: false,
+                error: error.message,
+                tempsIds: tempsIds
+            };
+        }
+    }
+    
+    /**
+     * Vérifier la configuration de l'EDI_JOB
+     * @returns {Promise<Object>} État de la configuration
+     */
+    static async checkConfiguration() {
+        try {
+            const config = {
+                silogExe: process.env.SILOG_EXE_PATH || process.env.SILOG_PATH || 'C:\\SILOG\\SILOG.exe',
+                workingDirectory: process.env.SILOG_WORKDIR || null,
+                profil: process.env.SILOG_DB || process.env.SILOG_PROFIL || 'SEDI_TESTS',
+                utilisateur: process.env.SILOG_USER || 'Production8',
+                langue: process.env.SILOG_LANG || process.env.SILOG_LANGUE || 'fr_fr',
+                codeTache: process.env.SILOG_TASK_CODE || process.env.SILOG_CODE_TACHE || process.env.SILOG_TASK || 'SEDI_ETDIFF',
+                mode: process.env.SILOG_MODE || 'COMPACT',
+                entrypoint: process.env.SILOG_ENTRYPOINT || 'EDI_JOB',
+                hasPassword: !!(process.env.SILOG_PASSWORD || '')
+            };
+
+            const remoteMode = String(process.env.SILOG_REMOTE_MODE || '').trim().toLowerCase();
+            const sshConfigured = !!(process.env.SILOG_SSH_HOST && process.env.SILOG_SSH_USER);
+            
+            // Vérifier si le fichier existe (si le chemin est absolu)
+            const fs = require('fs');
+            let pathExists = false;
+            let pathError = null;
+            
+            try {
+                if (path.isAbsolute(config.silogExe)) {
+                    pathExists = fs.existsSync(config.silogExe);
+                } else {
+                    // Si le chemin est relatif, on ne peut pas vérifier facilement
+                    pathExists = null;
+                    pathError = 'Chemin relatif, vérification impossible';
+                }
+            } catch (error) {
+                pathExists = false;
+                pathError = error.message;
+            }
+            
+            return {
+                success: true,
+                config: config,
+                pathExists: pathExists,
+                pathError: pathError,
+                // Password peut être vide (Franck utilise "-p" sans valeur).
+                ready:
+                    (process.platform === 'win32'
+                        ? (pathExists !== false && !!config.profil && !!config.utilisateur && !!config.codeTache)
+                        : (remoteMode === 'ssh' && sshConfigured && !!config.profil && !!config.utilisateur && !!config.codeTache)),
+                platform: process.platform,
+                remoteMode,
+                sshConfigured
+            };
+            
+        } catch (error) {
+            console.error('❌ Erreur lors de la vérification de la configuration:', error);
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
+}
+
+module.exports = EdiJobService;
+

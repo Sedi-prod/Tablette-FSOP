@@ -1,0 +1,1179 @@
+// Service pour gérer les appels API - v20251014-fixed-v3
+import { getLocalDevApiBase, resolveLocalDevBackendPort } from '../utils/DevBackendUrl.js';
+import { buildOfflineCacheKey, readOfflineCache, writeOfflineCache, shouldWriteOfflineCache, isLiveEndpoint } from '../utils/OfflineApiCache.js';
+
+class ApiService {
+    constructor() {
+        // Détection automatique de l'environnement
+        const currentPort = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+        const currentHost = window.location.hostname;
+        
+        // Détection de l'environnement - FORCER LOCALHOST EN DÉVELOPPEMENT
+        // Par défaut on passe par Nginx (Docker/prod). On ne force une connexion directe que
+        // dans les scénarios de dev (ports Vite/React) ou si l'utilisateur l'a demandé explicitement.
+        const searchParams = new URLSearchParams(window.location.search);
+        const forceLocalBackend =
+            searchParams.has('directBackend') ||
+            window.localStorage?.getItem('sedi_force_local_backend') === '1';
+        const devPorts = new Set(['5173', '4173', '3000', '5174', '8080']);
+        const isClassicDevPort = devPorts.has(currentPort);
+        const isLocalHost = currentHost === 'localhost' || currentHost === '127.0.0.1' || currentHost === '';
+        // En local (localhost/127.0.0.1) avec port de dev OU port 8080 (http-server), utiliser backend direct
+        const isLocalDev = forceLocalBackend || (isLocalHost && (isClassicDevPort || currentPort === '8080'));
+        
+        if (isLocalDev) {
+            // Environnement de développement local - connexion directe au backend (défaut 3001, cf. server.js)
+            const devPort = resolveLocalDevBackendPort();
+            this.baseUrl = getLocalDevApiBase();
+            console.log(`🔧 Mode développement local détecté - connexion directe au backend sur port ${devPort}`);
+            if (forceLocalBackend && !isClassicDevPort) {
+                console.log('⚠️ Force local backend activé via paramètre/stockage');
+            }
+        } else {
+            // Environnement de production ou Docker - utiliser le proxy Nginx
+            // Utiliser toujours le proxy pour éviter les problèmes de CORS et de connexion
+            this.baseUrl = `${window.location.protocol}//${window.location.host}/api`;
+            console.log('🌐 Mode production/Docker détecté - utilisation du proxy Nginx');
+        }
+        
+        this.defaultHeaders = {
+            'Content-Type': 'application/json'
+        };
+        
+        // Rate limiting côté client
+        this.requestQueue = [];
+        this.isProcessing = false;
+        this.lastRequestTime = 0;
+        this.minRequestInterval = 30; // limiter seulement les écritures, plus réactif sur tablette
+        
+        // Cache simple pour éviter les requêtes redondantes
+        this.cache = new Map();
+        this.cacheTimeout = 10000; // 10 secondes de cache par défaut
+        this.operatorSessionByCode = new Map();
+        this.currentOperatorContext = null;
+        this.deviceId = this.getOrCreateDeviceId();
+        this.adminToken = window.sessionStorage?.getItem('sedi_admin_token')
+            || window.localStorage?.getItem('sedi_admin_token')
+            || '';
+        this.rhToken = window.sessionStorage?.getItem('sedi_rh_token')
+            || window.localStorage?.getItem('sedi_rh_token')
+            || '';
+        
+        this._backendAvailable = true;
+        this._healPromise = null;
+
+        console.log(`🔗 ApiService configuré pour: ${this.baseUrl}`);
+        console.log(`🔍 Host détecté: ${currentHost}:${currentPort}`);
+    }
+
+    /**
+     * Une seule réparation de session à la fois (évite le spam de login
+     * qui ferme la session précédente et provoque des SESSION_MISMATCH en chaîne).
+     */
+    async healOperatorSessionOnce() {
+        if (this._healPromise) return this._healPromise;
+        this._healPromise = (async () => {
+            try {
+                this.syncOperatorContextWithLocalStorage();
+                const savedRaw = window?.localStorage?.getItem('currentOperator');
+                const saved = savedRaw ? JSON.parse(savedRaw) : null;
+                const code = String(saved?.code || saved?.id || '').trim();
+                if (!code) return null;
+
+                const relog = await this.directOperatorLogin(code);
+                const newSessionId = relog?.operator?.sessionId || relog?.operator?.SessionId || null;
+                if (!newSessionId) return null;
+
+                this.setOperatorSessionActive(code, true);
+                this.setCurrentOperatorContext(code, newSessionId);
+                try {
+                    window.localStorage?.setItem('currentOperator', JSON.stringify({
+                        ...(saved || {}),
+                        ...(relog?.operator || {}),
+                        code,
+                        sessionId: newSessionId
+                    }));
+                } catch (_) { /* ignore */ }
+                return { code, sessionId: newSessionId };
+            } catch (e) {
+                console.warn('Réparation session échouée:', e?.message || e);
+                return null;
+            } finally {
+                // Laisse les requêtes parallèles récupérer le même résultat un court instant
+                setTimeout(() => { this._healPromise = null; }, 800);
+            }
+        })();
+        return this._healPromise;
+    }
+
+    isBackendAvailable() {
+        return this._backendAvailable !== false;
+    }
+
+    _setBackendAvailable(available) {
+        const next = available !== false;
+        if (this._backendAvailable === next) return;
+        this._backendAvailable = next;
+        try {
+            const name = next ? 'sedi:backend-available' : 'sedi:backend-unavailable';
+            window.dispatchEvent(new CustomEvent(name));
+        } catch (_) {
+            // ignore
+        }
+    }
+
+    _tryOfflineFallback(endpoint, options) {
+        if (isLiveEndpoint(endpoint)) return null;
+        const method = String(options?.method || 'GET').toUpperCase();
+        if (method !== 'GET' && method !== 'HEAD') return null;
+        const key = buildOfflineCacheKey(endpoint, options);
+        const cached = readOfflineCache(key);
+        if (cached == null) return null;
+        return { ...cached, _fromOfflineCache: true, _offlineMode: true };
+    }
+
+    getOrCreateDeviceId() {
+        const key = 'sedi_device_id';
+        try {
+            const existing = window.localStorage?.getItem(key);
+            if (existing && String(existing).trim()) return String(existing).trim();
+            const randomPart = Math.random().toString(36).slice(2, 10);
+            const deviceId = `tab-${Date.now().toString(36)}-${randomPart}`;
+            window.localStorage?.setItem(key, deviceId);
+            return deviceId;
+        } catch (_) {
+            return `tab-fallback-${Date.now().toString(36)}`;
+        }
+    }
+
+    setOperatorSessionActive(operatorCode, isActive) {
+        const code = String(operatorCode || '').trim();
+        if (!code) return;
+        if (isActive) {
+            this.operatorSessionByCode.set(code, true);
+        } else {
+            this.operatorSessionByCode.delete(code);
+        }
+    }
+
+    hasOperatorSession(operatorCode) {
+        const code = String(operatorCode || '').trim();
+        if (!code) return false;
+        return this.operatorSessionByCode.get(code) === true;
+    }
+
+    clearOperatorSessions() {
+        this.operatorSessionByCode.clear();
+        this.currentOperatorContext = null;
+    }
+
+    setCurrentOperatorContext(operatorCode, sessionId) {
+        const code = String(operatorCode || '').trim();
+        const sid = String(sessionId || '').trim();
+        if (!code || !sid) {
+            this.currentOperatorContext = null;
+            return;
+        }
+        this.currentOperatorContext = { code, sessionId: sid };
+    }
+
+    /**
+     * Aligne le contexte mémoire sur localStorage (clé currentOperator).
+     * Indispensable avec plusieurs onglets : localStorage est partagé, currentOperatorContext ne l'est pas.
+     */
+    syncOperatorContextWithLocalStorage() {
+        if (typeof window === 'undefined') return;
+        try {
+            const raw = window.localStorage?.getItem('currentOperator');
+            if (!raw) return;
+            const saved = JSON.parse(raw);
+            const code = String(saved?.code || saved?.id || '').trim();
+            const sid = String(saved?.sessionId || saved?.SessionId || '').trim();
+            if (!code || !sid) return;
+            const mem = this.currentOperatorContext;
+            const memSid = mem?.code === code ? String(mem?.sessionId || '').trim() : '';
+            if (!mem || mem.code !== code || memSid !== sid) {
+                this.setCurrentOperatorContext(code, sid);
+                this.setOperatorSessionActive(code, true);
+            }
+        } catch (_) {
+            // ignore parse/storage errors
+        }
+    }
+
+    setAdminToken(token) {
+        const t = String(token || '').trim();
+        this.adminToken = t;
+        try {
+            if (t) {
+                window.sessionStorage?.setItem('sedi_admin_token', t);
+                window.localStorage?.setItem('sedi_admin_token', t);
+            } else {
+                window.sessionStorage?.removeItem('sedi_admin_token');
+                window.localStorage?.removeItem('sedi_admin_token');
+            }
+        } catch (_) {
+            // ignore storage errors
+        }
+    }
+
+    setRhToken(token) {
+        const t = String(token || '').trim();
+        this.rhToken = t;
+        try {
+            if (t) {
+                window.sessionStorage?.setItem('sedi_rh_token', t);
+                window.localStorage?.setItem('sedi_rh_token', t);
+            } else {
+                window.sessionStorage?.removeItem('sedi_rh_token');
+                window.localStorage?.removeItem('sedi_rh_token');
+            }
+        } catch (_) {
+            // ignore storage errors
+        }
+    }
+
+    clearMemoryCacheByPrefix(prefix) {
+        try {
+            const p = String(prefix || '');
+            if (!p) return;
+            for (const k of this.cache.keys()) {
+                if (String(k).startsWith(p)) this.cache.delete(k);
+            }
+        } catch (e) {
+            // Non bloquant
+        }
+    }
+
+    invalidateAfterMutation(endpoint) {
+        const ep = String(endpoint || '');
+
+        // Toute mutation opérateur / opérations peut impacter les vues admin (connectés / opérations)
+        if (
+            ep.startsWith('/operators/start') ||
+            ep.startsWith('/operators/pause') ||
+            ep.startsWith('/operators/resume') ||
+            ep.startsWith('/operators/stop') ||
+            ep.startsWith('/operators/login') ||
+            ep.startsWith('/operators/logout')
+        ) {
+            this.clearMemoryCacheByPrefix('/admin/operators');
+        }
+    }
+
+    // Méthode générique pour les requêtes avec rate limiting
+    async request(endpoint, options = {}) {
+        const method = String(options?.method || 'GET').toUpperCase();
+        // Les lectures (GET/HEAD) ne doivent pas être sérialisées: sinon l'UI devient lente
+        // (chargements en cascade sur tablette). On garde la file pour les mutations.
+        if (method === 'GET' || method === 'HEAD') {
+            return this.executeRequest(endpoint, options);
+        }
+        return new Promise((resolve, reject) => {
+            this.requestQueue.push({ endpoint, options, resolve, reject });
+            this.processQueue();
+        });
+    }
+
+    // Traitement de la file d'attente avec rate limiting
+    async processQueue() {
+        if (this.isProcessing || this.requestQueue.length === 0) {
+            return;
+        }
+
+        this.isProcessing = true;
+
+        while (this.requestQueue.length > 0) {
+            const now = Date.now();
+            const timeSinceLastRequest = now - this.lastRequestTime;
+            
+            if (timeSinceLastRequest < this.minRequestInterval) {
+                await new Promise(resolve => setTimeout(resolve, this.minRequestInterval - timeSinceLastRequest));
+            }
+
+            const { endpoint, options, resolve, reject } = this.requestQueue.shift();
+            this.lastRequestTime = Date.now();
+
+            try {
+                const result = await this.executeRequest(endpoint, options);
+                resolve(result);
+            } catch (error) {
+                reject(error);
+            }
+        }
+
+        this.isProcessing = false;
+    }
+
+    // Exécution réelle de la requête
+    async executeRequest(endpoint, options = {}) {
+        // One-shot retry guard (prevents infinite loops)
+        const hasRetried = options && options.__retried === true;
+        const { __retried, headers: optionHeaders, cache: cacheOverride, ...restFetchOptions } = options || {};
+        const url = `${this.baseUrl}${endpoint}`;
+
+        // Tokens : admin sur /admin + /auth (hors RH) ; RH sur /rh + /auth/rh
+        const adminToken = this.adminToken
+            || window.sessionStorage?.getItem('sedi_admin_token')
+            || window.localStorage?.getItem('sedi_admin_token')
+            || '';
+        const rhToken = this.rhToken
+            || window.sessionStorage?.getItem('sedi_rh_token')
+            || window.localStorage?.getItem('sedi_rh_token')
+            || '';
+        const isRhEndpoint = endpoint.startsWith('/rh') || endpoint.startsWith('/auth/rh');
+        const shouldAttachRhToken = rhToken && isRhEndpoint;
+        const shouldAttachAdminToken = adminToken && !isRhEndpoint
+            && (endpoint.startsWith('/admin') || endpoint.startsWith('/auth'));
+        const authHeaders = shouldAttachRhToken
+            ? { Authorization: `Bearer ${rhToken}` }
+            : (shouldAttachAdminToken ? { Authorization: `Bearer ${adminToken}` } : {});
+
+        const ep = String(endpoint || '');
+        const operatorHeaders = {};
+        // Routes qui nécessitent le contexte opérateur (session/device) côté backend.
+        // Avec l'isolation stricte, FSOP utilise aussi validateOperatorSession => doit recevoir x-operator-session-id.
+        const needsOperatorContext =
+            (ep.startsWith('/operators/') && !ep.startsWith('/operators/login')) ||
+            ep.startsWith('/fsop/');
+
+        if (needsOperatorContext) {
+            this.syncOperatorContextWithLocalStorage();
+            const ctx = this.currentOperatorContext;
+            if (ctx?.code && ctx?.sessionId) {
+                operatorHeaders['x-operator-code'] = ctx.code;
+                operatorHeaders['x-operator-session-id'] = ctx.sessionId;
+            }
+        }
+
+        const config = {
+            ...restFetchOptions,
+            headers: {
+                ...this.defaultHeaders,
+                ...authHeaders,
+                'x-device-id': this.deviceId,
+                ...operatorHeaders,
+                ...(optionHeaders || {})
+            },
+            cache: cacheOverride ?? 'no-store'
+        };
+
+        const method = String(options?.method || 'GET').toUpperCase();
+        const isSafeRead = method === 'GET' || method === 'HEAD';
+
+        try {
+            const response = await fetch(url, config);
+
+            if ([502, 503, 504].includes(response.status)) {
+                this._setBackendAvailable(false);
+                const offline = isSafeRead ? this._tryOfflineFallback(endpoint, options) : null;
+                if (offline) return offline;
+                const err = new Error('Service API temporairement indisponible (backend arrêté ou en redémarrage).');
+                err.errorCode = 'BACKEND_UNAVAILABLE';
+                throw err;
+            }
+            
+            if (!response.ok) {
+                // Gestion spéciale pour l'erreur 429
+                if (response.status === 429) {
+                    const method = (config.method || 'GET').toUpperCase();
+                    const retryAfterHeader = response.headers?.get?.('Retry-After');
+                    const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : null;
+                    const waitMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+                        ? Math.min(retryAfterSeconds * 1000, 30000)
+                        : 3000;
+                    
+                    console.warn(`⚠️ Rate limit atteint pour ${endpoint} (${method}), attente de ${Math.round(waitMs/1000)}s...`);
+                    
+                    // Essayer de récupérer le message d'erreur du serveur
+                    let errorMessage = 'Trop de requêtes, veuillez patienter';
+                    try {
+                        const errorData = await response.json();
+                        errorMessage = errorData.error || errorMessage;
+                    } catch (e) {
+                        // Ignorer si on ne peut pas parser le JSON
+                    }
+
+                    // ⚠️ Ne PAS retry automatiquement sur le login (évite les boucles et le spam)
+                    if (endpoint === '/auth/login') {
+                        const e = new Error(errorMessage);
+                        e.errorCode = 'RATE_LIMIT';
+                        e.retryAfterSeconds = retryAfterSeconds || Math.ceil(waitMs / 1000);
+                        throw e;
+                    }
+
+                    // Retry uniquement pour les requêtes idempotentes (GET/HEAD)
+                    if (method === 'GET' || method === 'HEAD') {
+                        await new Promise(resolve => setTimeout(resolve, waitMs));
+                        console.log(`🔄 Retry pour ${endpoint}...`);
+                        const retryResponse = await fetch(url, config);
+                        if (!retryResponse.ok) {
+                            if (retryResponse.status === 429) {
+                                const e = new Error(errorMessage);
+                                e.errorCode = 'RATE_LIMIT';
+                                e.retryAfterSeconds = retryAfterSeconds || Math.ceil(waitMs / 1000);
+                                throw e;
+                            }
+                            throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`);
+                        }
+                        return await retryResponse.json();
+                    }
+
+                    const e = new Error(errorMessage);
+                    e.errorCode = 'RATE_LIMIT';
+                    e.retryAfterSeconds = retryAfterSeconds || Math.ceil(waitMs / 1000);
+                    throw e;
+                }
+                
+                const errorData = await response.json().catch(() => ({}));
+
+                const isAuthIssue =
+                    response.status === 401 &&
+                    (
+                        errorData?.security === 'SESSION_REQUIRED' ||
+                        errorData?.error === 'SESSION_REQUIRED' ||
+                        errorData?.security === 'SESSION_CONTEXT_REQUIRED' ||
+                        errorData?.security === 'SESSION_MISMATCH' ||
+                        errorData?.security === 'DEVICE_MISMATCH'
+                    );
+
+                // Auto-resilience: une seule réparation de session, puis 1 retry.
+                // Évite le cascade SESSION_MISMATCH (chaque login ferme l'ancienne session).
+                if (!hasRetried && isAuthIssue) {
+                    const ep2 = String(endpoint || '');
+                    const shouldRetry =
+                        ep2.startsWith('/operators/') ||
+                        ep2.startsWith('/fsop/');
+                    const isLoginOrLogout =
+                        ep2.startsWith('/operators/login') ||
+                        ep2.startsWith('/operators/logout');
+
+                    if (shouldRetry && !isLoginOrLogout) {
+                        const healed = await this.healOperatorSessionOnce();
+                        if (healed?.sessionId) {
+                            return await this.executeRequest(endpoint, { ...options, __retried: true });
+                        }
+                    }
+                }
+
+                // Session vraiment expirée (pas réparable) -> retour écran login
+                if (response.status === 401 && errorData && (errorData.security === 'SESSION_REQUIRED' || errorData.error === 'SESSION_REQUIRED')) {
+                    try {
+                        const body = options?.body ? JSON.parse(options.body) : null;
+                        const maybeOperatorId = body?.operatorId || body?.code || null;
+                        if (maybeOperatorId) this.setOperatorSessionActive(maybeOperatorId, false);
+                        window.dispatchEvent(new CustomEvent('sedi:session-expired', { detail: { endpoint, errorData } }));
+                    } catch (_) {
+                        // ignore
+                    }
+                }
+                // MISMATCH après échec de réparation seulement
+                if (response.status === 401 && (
+                    errorData?.security === 'SESSION_CONTEXT_REQUIRED' ||
+                    errorData?.security === 'SESSION_MISMATCH' ||
+                    errorData?.security === 'DEVICE_MISMATCH'
+                ) && hasRetried) {
+                    this.currentOperatorContext = null;
+                    try {
+                        window.dispatchEvent(new CustomEvent('sedi:session-expired', { detail: { endpoint, errorData } }));
+                    } catch (_) {
+                        // ignore
+                    }
+                }
+                
+                // Build a comprehensive error message
+                let errorMessage = errorData.error || `HTTP ${response.status}: ${response.statusText}`;
+                
+                // Add message if available
+                if (errorData.message) {
+                    errorMessage += `: ${errorData.message}`;
+                } else if (errorData.hint) {
+                    errorMessage += `: ${errorData.hint}`;
+                } else if (errorData.details) {
+                    // Beaucoup de routes backend renvoient "details" (ex: erreurs SQL)
+                    errorMessage += `: ${errorData.details}`;
+                }
+                
+                // For specific errors, include additional context
+                if (errorData.error === 'LT_DIR_NOT_FOUND' && errorData.launchNumber) {
+                    errorMessage = `LT_DIR_NOT_FOUND: Le répertoire pour le lancement ${errorData.launchNumber} est introuvable`;
+                    if (errorData.traceRoot) {
+                        errorMessage += ` dans ${errorData.traceRoot}`;
+                    }
+                }
+                
+                const error = new Error(errorMessage);
+                // Attach the full error data for detailed error handling
+                error.errorCode = errorData.error;
+                error.errorData = errorData;
+                throw error;
+            }
+
+            const data = await response.json();
+            this._setBackendAvailable(true);
+            if (isSafeRead && shouldWriteOfflineCache(endpoint)) {
+                writeOfflineCache(buildOfflineCacheKey(endpoint, options), data);
+            }
+            // Invalider les caches mémoire qui deviennent faux après mutation
+            if (method !== 'GET' && method !== 'HEAD') {
+                this.invalidateAfterMutation(endpoint);
+            }
+            return data;
+        } catch (error) {
+            const isNetworkError =
+                error?.name === 'TypeError' ||
+                String(error?.message || '').includes('Failed to fetch') ||
+                String(error?.message || '').includes('NetworkError');
+
+            if (isNetworkError) {
+                this._setBackendAvailable(false);
+                const offline = isSafeRead ? this._tryOfflineFallback(endpoint, options) : null;
+                if (offline) return offline;
+            }
+
+            // Ne pas logger les erreurs de réseau pour les health checks (évite le spam)
+            if (endpoint === '/health' && (error.name === 'TypeError' || error.message.includes('Failed to fetch'))) {
+                // Erreur silencieuse pour le health check - c'est normal si le serveur n'est pas accessible
+                console.debug(`Health check échoué (serveur non accessible): ${url}`);
+                throw new Error('SERVER_NOT_ACCESSIBLE');
+            }
+
+            if (isNetworkError) {
+                console.error(`Erreur API ${endpoint}:`, error);
+                const netErr = new Error('Connexion au serveur impossible. Vérifiez le Wi‑Fi puis réessayez.');
+                netErr.errorCode = 'NETWORK_UNAVAILABLE';
+                netErr.cause = error;
+                throw netErr;
+            }
+            
+            console.error(`Erreur API ${endpoint}:`, error);
+            throw error;
+        }
+    }
+
+    // Direct login call outside request queue (used only for silent recovery).
+    async directOperatorLogin(code) {
+        const url = `${this.baseUrl}/operators/login`;
+        const response = await fetch(url, {
+            method: 'POST',
+            cache: 'no-store',
+            headers: {
+                ...this.defaultHeaders,
+                'x-device-id': this.deviceId
+            },
+            body: JSON.stringify({ code })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const msg = data?.error || `HTTP ${response.status}: ${response.statusText}`;
+            const err = new Error(msg);
+            err.errorCode = data?.error || 'LOGIN_FAILED';
+            err.errorData = data;
+            throw err;
+        }
+        return data;
+    }
+
+    // GET request
+    async get(endpoint, params = {}) {
+        const queryString = new URLSearchParams(params).toString();
+        const url = queryString ? `${endpoint}?${queryString}` : endpoint;
+        return this.request(url);
+    }
+
+    // POST request
+    async post(endpoint, data = {}) {
+        return this.request(endpoint, {
+            method: 'POST',
+            body: JSON.stringify(data)
+        });
+    }
+
+    // PUT request
+    async put(endpoint, data = {}) {
+        return this.request(endpoint, {
+            method: 'PUT',
+            body: JSON.stringify(data)
+        });
+    }
+
+    // DELETE request
+    async delete(endpoint, options = {}) {
+        return this.request(endpoint, {
+            method: 'DELETE',
+            ...options
+        });
+    }
+
+    // Vérifier la santé du serveur
+    async healthCheck() {
+        try {
+            return await this.get('/health');
+        } catch (error) {
+            // Si c'est une erreur de connexion, retourner un objet indiquant que le serveur n'est pas accessible
+            if (error.message === 'SERVER_NOT_ACCESSIBLE' || error.name === 'TypeError') {
+                return {
+                    status: 'error',
+                    message: 'Serveur non accessible',
+                    accessible: false
+                };
+            }
+            throw error;
+        }
+    }
+
+    // Authentification admin
+    async adminLogin(username, password) {
+        return this.post('/auth/login', { username, password });
+    }
+
+    async adminLogout() {
+        const result = await this.post('/auth/logout');
+        this.setAdminToken('');
+        return result;
+    }
+
+    async verifyAdmin() {
+        return this.get('/auth/verify');
+    }
+
+    // Authentification RH (accès séparé)
+    async isRhEnabled() {
+        try {
+            const res = await this.get('/auth/rh/status');
+            return res?.enabled === true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    async rhLogin(username, password) {
+        return this.post('/auth/rh/login', { username, password });
+    }
+
+    async rhLogout() {
+        try {
+            return await this.post('/auth/rh/logout');
+        } finally {
+            this.setRhToken('');
+        }
+    }
+
+    async getRhWeek(weekStart, operatorCode = null) {
+        const params = { weekStart };
+        if (operatorCode) params.operatorCode = operatorCode;
+        return this.get('/rh/week', params);
+    }
+
+    async getRhOperators(weekStart) {
+        return this.get('/rh/operators', { weekStart });
+    }
+
+    async getRhMonth(yearMonth, operatorCode = null) {
+        const params = { yearMonth };
+        if (operatorCode) params.operatorCode = operatorCode;
+        return this.get('/rh/month', params);
+    }
+
+    async createRhCorrection(payload) {
+        return this.post('/rh/corrections', payload);
+    }
+
+    async setRhDayPresence(payload) {
+        return this.post('/rh/days/presence', payload);
+    }
+
+    async setRhCorrectionStatus(id, status) {
+        return this.post(`/rh/corrections/${id}/status`, { status });
+    }
+
+    async downloadRhExportExcel(yearMonth, operatorCode = null) {
+        const qs = new URLSearchParams({ yearMonth: yearMonth || '' });
+        if (operatorCode) qs.set('operatorCode', operatorCode);
+        const endpoint = `/rh/export.xlsx?${qs.toString()}`;
+        const url = `${this.baseUrl}${endpoint}`;
+        const rhToken = this.rhToken
+            || window.sessionStorage?.getItem('sedi_rh_token')
+            || window.localStorage?.getItem('sedi_rh_token')
+            || '';
+        const response = await fetch(url, {
+            headers: {
+                ...(rhToken ? { Authorization: `Bearer ${rhToken}` } : {}),
+                'x-device-id': this.deviceId
+            }
+        });
+        if (!response.ok) {
+            let msg = `Export HTTP ${response.status}`;
+            try {
+                const err = await response.json();
+                msg = err.error || err.message || msg;
+            } catch (_) { /* ignore */ }
+            throw new Error(msg);
+        }
+        const blob = await response.blob();
+        const a = document.createElement('a');
+        const objectUrl = URL.createObjectURL(blob);
+        a.href = objectUrl;
+        a.download = `rh-temps-${yearMonth || 'mois'}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(objectUrl);
+        return true;
+    }
+
+    // Sessions opérateurs (pour cohérence et sécurité côté backend)
+    async operatorLogin(code) {
+        const result = await this.post('/operators/login', { code });
+        const operatorCode = result?.operator?.code || result?.operator?.id || code;
+        const sessionId = result?.operator?.sessionId || result?.operator?.SessionId || null;
+        this.setOperatorSessionActive(operatorCode, true);
+        this.setCurrentOperatorContext(operatorCode, sessionId);
+        return result;
+    }
+
+    async operatorLogout(code) {
+        const result = await this.post('/operators/logout', { code });
+        this.setOperatorSessionActive(code, false);
+        this.currentOperatorContext = null;
+        return result;
+    }
+
+    // Opérateurs
+    async getOperator(code) {
+        return this.get(`/operators/${code}`);
+    }
+
+    async createOperator(operatorData) {
+        return this.post('/operators', operatorData);
+    }
+
+    async updateOperator(code, operatorData) {
+        return this.put(`/operators/${code}`, operatorData);
+    }
+
+    async deleteOperator(code) {
+        return this.delete(`/operators/${code}`);
+    }
+
+    // Lancements
+    async getLancements(search = '', limit = 100) {
+        return this.get('/lancements', { search, limit });
+    }
+
+    async getLancement(code) {
+        return this.get(`/operators/lancement/${code}`);
+    }
+
+    async getActiveLancements() {
+        return this.get('/lancements/active');
+    }
+
+    async getLancementsByOperator(operatorId, date = null) {
+        return this.get(`/lancements/by-operator/${operatorId}`, { date });
+    }
+
+    async createLancement(lancementData) {
+        return this.post('/lancements', lancementData);
+    }
+
+    async updateLancement(code, lancementData) {
+        return this.put(`/lancements/${code}`, lancementData);
+    }
+
+    // Opérations
+    async getLancementSteps(lancementCode) {
+        return this.get(`/operators/steps/${encodeURIComponent(lancementCode)}`);
+    }
+
+    async directCheckOperatorContext(code, sessionId) {
+        const url = `${this.baseUrl}/operators/current/${encodeURIComponent(code)}`;
+        try {
+            const response = await fetch(url, {
+                method: 'GET',
+                cache: 'no-store',
+                headers: {
+                    ...this.defaultHeaders,
+                    'x-device-id': this.deviceId,
+                    'x-operator-code': code,
+                    'x-operator-session-id': sessionId
+                }
+            });
+            // 401/403 -> contexte invalide (session expirée/mismatch)
+            if (response.status === 401 || response.status === 403) return false;
+            // Toute réponse 2xx signifie que le contexte est accepté par le backend.
+            if (response.ok) return true;
+            // Pour les autres codes (5xx, etc.), ne pas bloquer l'opérateur:
+            // on considère la validation "inconnue" et on laisse la route métier trancher.
+            return null;
+        } catch (error) {
+            // Erreur réseau/infra sur endpoint de check -> ne pas bloquer l'action opérateur.
+            console.warn('⚠️ Context check indisponible, fallback sur action métier:', error?.message || error);
+            return null;
+        }
+    }
+
+    async ensureOperatorContext(operatorId) {
+        const code = String(operatorId || '').trim();
+        if (!code) {
+            const err = new Error('Code opérateur manquant');
+            err.errorCode = 'OPERATOR_REQUIRED';
+            throw err;
+        }
+
+        this.syncOperatorContextWithLocalStorage();
+
+        // Candidate #1: context in memory
+        let candidateSessionId = '';
+        if (this.currentOperatorContext?.code === code && this.currentOperatorContext?.sessionId) {
+            candidateSessionId = String(this.currentOperatorContext.sessionId || '').trim();
+        }
+
+        // Candidate #2: restore from localStorage
+        if (!candidateSessionId) {
+            try {
+                const raw = window?.localStorage?.getItem('currentOperator');
+                const saved = raw ? JSON.parse(raw) : null;
+                const savedCode = String(saved?.code || saved?.id || '').trim();
+                const savedSessionId = String(saved?.sessionId || saved?.SessionId || '').trim();
+                if (savedCode === code && savedSessionId) {
+                    candidateSessionId = savedSessionId;
+                }
+            } catch (_) {
+                // ignore parse/storage errors
+            }
+        }
+
+        // Validate candidate against backend before mutating requests.
+        if (candidateSessionId) {
+            this.setCurrentOperatorContext(code, candidateSessionId);
+            this.setOperatorSessionActive(code, true);
+            const isValid = await this.directCheckOperatorContext(code, candidateSessionId);
+            if (isValid === true) return;
+            if (isValid === null) return;
+            // contexte rejeté, on retente via relogin silencieux
+        }
+
+        // Last fallback: recreate server session silently
+        try {
+            const relog = await this.directOperatorLogin(code);
+            const newSessionId = relog?.operator?.sessionId || relog?.operator?.SessionId || null;
+            this.setOperatorSessionActive(code, true);
+            if (newSessionId) this.setCurrentOperatorContext(code, newSessionId);
+            try {
+                const raw = window?.localStorage?.getItem('currentOperator');
+                const saved = raw ? JSON.parse(raw) : {};
+                window.localStorage?.setItem('currentOperator', JSON.stringify({
+                    ...saved,
+                    ...(relog?.operator || {}),
+                    code
+                }));
+            } catch (_) {
+                // ignore
+            }
+        } catch (e) {
+            const isNetwork =
+                e?.name === 'TypeError' ||
+                String(e?.message || '').includes('Failed to fetch') ||
+                String(e?.message || '').includes('NetworkError');
+            // Si on a encore une session locale, laisser l'action métier trancher
+            // (évite un "Failed to fetch" sur Pause alors que le POST pourrait passer).
+            if (candidateSessionId && isNetwork) {
+                this.setCurrentOperatorContext(code, candidateSessionId);
+                this.setOperatorSessionActive(code, true);
+                console.warn('⚠️ Relogin silencieux indisponible, tentative avec session locale');
+                return;
+            }
+            if (isNetwork) {
+                const err = new Error('Connexion au serveur impossible. Vérifiez le Wi‑Fi puis réessayez.');
+                err.errorCode = 'NETWORK_UNAVAILABLE';
+                throw err;
+            }
+            throw e;
+        }
+    }
+
+    async startOperation(operatorId, lancementCode, { codeOperation } = {}) {
+        await this.ensureOperatorContext(operatorId);
+        return this.post('/operators/start', { operatorId, lancementCode, codeOperation });
+    }
+
+    async pauseOperation(operatorId, lancementCode, { codeOperation, pauseTypeCode } = {}) {
+        await this.ensureOperatorContext(operatorId);
+        return this.post('/operators/pause', { operatorId, lancementCode, codeOperation, pauseTypeCode });
+    }
+
+    async getPauseTypes({ operatorCode, operatorName } = {}) {
+        const params = {};
+        if (operatorCode) params.operatorCode = operatorCode;
+        if (operatorName) params.operatorName = operatorName;
+        return this.get('/operators/pause-types', params);
+    }
+
+    async getOperatorCounters(operatorCode, weekStart = null) {
+        const params = {};
+        if (weekStart) params.weekStart = weekStart;
+        return this.get(`/operators/${encodeURIComponent(operatorCode)}/counters`, params);
+    }
+
+    async resumeOperation(operatorId, lancementCode, { codeOperation } = {}) {
+        await this.ensureOperatorContext(operatorId);
+        return this.post('/operators/resume', { operatorId, lancementCode, codeOperation });
+    }
+
+    async stopOperation(operatorId, lancementCode, { codeOperation } = {}) {
+        await this.ensureOperatorContext(operatorId);
+        return this.post('/operators/stop', { operatorId, lancementCode, codeOperation });
+    }
+
+    async getCurrentOperation(operatorId) {
+        return this.get(`/operators/current/${operatorId}`);
+    }
+
+    async getOperationHistory(operatorId, date = null, limit = 50) {
+        return this.get(`/operations/history/${operatorId}`, { date, limit });
+    }
+
+    // Admin
+    async getAdminData(date, dateStart = null, dateEnd = null) {
+        const params = { date };
+        if (dateStart) params.dateStart = dateStart;
+        if (dateEnd) params.dateEnd = dateEnd;
+        return this.get('/admin', params);
+    }
+
+    async getAdminStats(date) {
+        return this.get('/admin/stats', { date });
+    }
+
+    // Modifier une opération (admin)
+    async updateOperation(id, data) {
+        return this.put(`/admin/operations/${id}`, data);
+    }
+
+    // Supprimer une opération (admin)
+    async deleteOperation(id) {
+        return this.delete(`/admin/operations/${id}`);
+    }
+
+    // Ajouter une nouvelle opération (admin)
+    async addOperation(data) {
+        return this.post('/admin/operations', data);
+    }
+
+    // Récupérer les informations des tables abetemps
+    async getTablesInfo() {
+        return this.get('/admin/tables-info');
+    }
+
+    // Récupérer la liste des opérateurs connectés (avec cache pour éviter le rate limiting)
+    async getConnectedOperators(forceRefresh = false) {
+        const cacheKey = '/admin/operators';
+        const cached = this.cache.get(cacheKey);
+        
+        // Utiliser le cache si disponible et récent (< 10 secondes) et qu'on ne force pas le refresh
+        if (!forceRefresh && cached && (Date.now() - cached.timestamp) < 10000) {
+            console.log('📦 Utilisation du cache pour /admin/operators');
+            return cached.data;
+        }
+        
+        // Faire la requête
+        const data = await this.get('/admin/operators');
+        
+        // Mettre en cache
+        this.cache.set(cacheKey, {
+            data: data,
+            timestamp: Date.now()
+        });
+        
+        return data;
+    }
+
+    // Récupérer tous les opérateurs (liste globale depuis RESSOURC)
+    async getAllOperators(forceRefresh = false) {
+        const cacheKey = '/admin/operators/all';
+        const cached = this.cache.get(cacheKey);
+        
+        // Utiliser le cache si disponible et récent (< 10 minutes) car cette liste change rarement
+        if (!forceRefresh && cached && (Date.now() - cached.timestamp) < 10 * 60 * 1000) {
+            console.log('📦 Utilisation du cache pour /admin/operators/all');
+            return cached.data;
+        }
+        
+        // Faire la requête
+        const data = await this.get('/admin/operators/all');
+        
+        // Mettre en cache
+        this.cache.set(cacheKey, {
+            data: data,
+            timestamp: Date.now()
+        });
+        
+        return data;
+    }
+
+    // Récupérer les lancements d'un opérateur spécifique
+    async getOperatorOperations(operatorCode) {
+        return this.get(`/admin/operators/${operatorCode}/operations`);
+    }
+
+    async getAdminOperations(date, filters = {}) {
+        return this.get('/admin/operations', { date, ...filters });
+    }
+
+    // ===== Monitoring (ABTEMPS_OPERATEURS) =====
+    async getMonitoringTemps(filters = {}) {
+        return this.get('/admin/monitoring', filters);
+    }
+
+    async correctMonitoringTemps(tempsId, corrections = {}) {
+        return this.put(`/admin/monitoring/${tempsId}`, corrections);
+    }
+
+    async deleteMonitoringTemps(tempsId) {
+        return this.delete(`/admin/monitoring/${tempsId}`);
+    }
+
+    async validateMonitoringTemps(tempsId) {
+        return this.post(`/admin/monitoring/${tempsId}/validate`, {});
+    }
+
+    async getAiAssistStatus() {
+        return this.get('/admin/ai/status');
+    }
+
+    async analyzeMonitoringLineAi(line, { context = 'monitoring' } = {}) {
+        return this.post('/admin/ai/analyze-line', { line, context });
+    }
+
+    async summarizeSupportTechAi(payload) {
+        return this.post('/admin/ai/summarize-support-tech', payload || {});
+    }
+
+    async diagnoseOpsAi({ symptoms = '', logs = '', context = '' } = {}) {
+        return this.post('/admin/ai/ops-diagnose', { symptoms, logs, context });
+    }
+
+    async onHoldMonitoringTemps(tempsId) {
+        return this.post(`/admin/monitoring/${tempsId}/on-hold`, {});
+    }
+
+    async releaseHoldMonitoringTemps(tempsId) {
+        return this.post(`/admin/monitoring/${tempsId}/release-hold`, {});
+    }
+
+    async onHoldMonitoringBatch(tempsIds) {
+        return this.post('/admin/monitoring/on-hold-batch', { tempsIds });
+    }
+
+    async releaseHoldMonitoringBatch(tempsIds) {
+        return this.post('/admin/monitoring/release-hold-batch', { tempsIds });
+    }
+
+    async transmitMonitoringTemps(tempsId, { triggerEdiJob = false, codeTache = null } = {}) {
+        return this.post(`/admin/monitoring/${tempsId}/transmit`, { triggerEdiJob, codeTache });
+    }
+
+    async consolidateMonitoringBatch(operations) {
+        return this.post('/admin/monitoring/consolidate-batch', { operations });
+    }
+
+    async validateAndTransmitMonitoringBatch(tempsIds, { triggerEdiJob = true, codeTache = null, adminMarkTransmitted = false } = {}) {
+        return this.post('/admin/monitoring/validate-and-transmit-batch', {
+            tempsIds,
+            triggerEdiJob,
+            codeTache,
+            adminMarkTransmitted
+        });
+    }
+
+    // ===== FSOP =====
+    async getFsopLots(launchNumber) {
+        return this.get(`/fsop/lots/${encodeURIComponent(launchNumber)}`);
+    }
+
+    // Export
+    async exportOperations(date, format = 'csv') {
+        return this.get(`/admin/export/${format}`, { date });
+    }
+    
+    // Commentaires
+    async addComment(operatorCode, operatorName, lancementCode, comment) {
+        return this.post('/comments', {
+            operatorCode,
+            operatorName,
+            lancementCode,
+            comment
+        });
+    }
+
+    async getCommentsByOperator(operatorCode, limit = 50) {
+        return this.get(`/comments/operator/${operatorCode}`, { limit });
+    }
+
+    async getCommentsByLancement(lancementCode, limit = 50) {
+        return this.get(`/comments/lancement/${lancementCode}`, { limit });
+    }
+
+    async getAllComments(limit = 100) {
+        return this.get('/comments', { limit });
+    }
+
+    async deleteComment(commentId, operatorCode) {
+        return this.delete(`/comments/${commentId}`, {
+            body: JSON.stringify({ operatorCode })
+        });
+    }
+
+    async testEmail() {
+        return this.post('/comments/test-email');
+    }
+
+    async getCommentStats(period = 'today') {
+        return this.get('/comments/stats', { period });
+    }
+    
+    // Validation automatique d'un code de lancement
+    async validateLancementCode(code) {
+        try {
+            console.log(`🔍 Validation du code: ${code}`);
+            
+            const response = await fetch(`${this.baseUrl}/admin/validate-lancement/${encodeURIComponent(code)}`, {
+                method: 'GET',
+                cache: 'no-store',
+                headers: {
+                    ...this.defaultHeaders,
+                    ...(this.adminToken ? { Authorization: `Bearer ${this.adminToken}` } : {})
+                }
+            });
+            
+            if (!response.ok) {
+                throw new Error(`Erreur HTTP: ${response.status}`);
+            }
+            
+            const result = await response.json();
+            console.log(`✅ Résultat validation:`, result);
+            
+            return result;
+            
+        } catch (error) {
+            console.error('❌ Erreur validation code lancement:', error);
+            return {
+                success: false,
+                valid: false,
+                error: 'Erreur de connexion lors de la validation'
+            };
+        }
+    }
+
+    async loadFsopData(launchNumber, templateCode, serialNumber, operatorId = null) {
+        return this.post('/fsop/load-data', {
+            launchNumber,
+            templateCode,
+            serialNumber,
+            ...(operatorId ? { operatorId } : {})
+        });
+    }
+}
+
+export default ApiService;

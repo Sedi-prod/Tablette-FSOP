@@ -1,0 +1,519 @@
+const sql = require('mssql');
+
+function resolveConfigSource(productionConfig) {
+    if (productionConfig?.__source) {
+        return `config-production.js (${productionConfig.__source})`;
+    }
+    if (productionConfig) {
+        return 'config-production.js';
+    }
+    return 'variables d\'environnement';
+}
+
+function readTimeoutMs(envKey, fallback) {
+    const raw = process.env[envKey];
+    const parsed = Number.parseInt(raw || '', 10);
+    return Number.isFinite(parsed) && parsed >= 1000 ? parsed : fallback;
+}
+
+const DB_REQUEST_TIMEOUT_MS = readTimeoutMs('DB_REQUEST_TIMEOUT_MS', 60000);
+const DB_CONNECTION_TIMEOUT_MS = readTimeoutMs('DB_CONNECTION_TIMEOUT_MS', 60000);
+const DB_QUERY_RETRIES = Number.isFinite(Number.parseInt(process.env.DB_QUERY_RETRIES || '', 10))
+    ? Math.max(1, Number.parseInt(process.env.DB_QUERY_RETRIES, 10))
+    : 1;
+
+// Charger la configuration de production si disponible
+let productionConfig = null;
+try {
+    productionConfig = require('../config-production');
+    console.log('✅ Configuration de production chargée:', {
+        DB_SERVER: productionConfig?.DB_SERVER,
+        DB_DATABASE: productionConfig?.DB_DATABASE
+    });
+} catch (error) {
+    if (error.code !== 'MODULE_NOT_FOUND') {
+        throw error;
+    }
+    console.log('📝 Configuration de production non trouvée (optionnel), utilisation des variables d\'environnement.');
+}
+
+// Configuration de la base de données SQL Server
+// Priorité : config-production.js > variables d'environnement
+// Login SQL "QUALITE" = compte métier SEDI (pas un secret). Les mots de passe restent hors repo (docker/.env).
+const DEFAULT_DB_USER = 'QUALITE';
+const config = {
+    server: productionConfig?.DB_SERVER || process.env.DB_SERVER,
+    database: productionConfig?.DB_DATABASE || process.env.DB_DATABASE || 'SEDI_APP_INDEPENDANTE',
+    user: productionConfig?.DB_USER || process.env.DB_USER || DEFAULT_DB_USER,
+    password: productionConfig?.DB_PASSWORD || process.env.DB_PASSWORD,
+    options: {
+        encrypt: productionConfig?.DB_ENCRYPT || process.env.DB_ENCRYPT === 'true' || false,
+        trustServerCertificate: productionConfig?.DB_TRUST_CERT || process.env.DB_TRUST_CERT === 'true' || true,
+        enableArithAbort: true,
+        requestTimeout: DB_REQUEST_TIMEOUT_MS,
+        connectionTimeout: DB_CONNECTION_TIMEOUT_MS
+    },
+    pool: {
+        max: 30,  // 20 opérateurs + 5 admin + 5 marge pour FSOP/autres
+        min: 10,  // Minimum de connexions actives pour réactivité
+        idleTimeoutMillis: 30000,
+        acquireTimeoutMillis: 60000,  // Timeout pour acquérir une connexion
+        createTimeoutMillis: 30000,   // Timeout pour créer une connexion
+        destroyTimeoutMillis: 5000,   // Timeout pour détruire une connexion
+        reapIntervalMillis: 1000,     // Intervalle de nettoyage
+        createRetryIntervalMillis: 200, // Intervalle de retry
+        // Note: evictionRunIntervalMillis n'est pas supporté par cette version de tarn
+    }
+};
+
+/** Nom de base applicative (sans crochets). */
+const SHARED_APP_DATABASE = 'SEDI_APP_INDEPENDANTE';
+const appDatabaseName = String(config.database || SHARED_APP_DATABASE).replace(/[\[\]]/g, '');
+/** Qualifier SQL [NomBase] pour les requêtes 3-parties. */
+const appDb = `[${appDatabaseName}]`;
+
+function isSharedAppDatabase() {
+    return appDatabaseName.toUpperCase() === SHARED_APP_DATABASE;
+}
+
+function isSandboxMode() {
+    return String(process.env.DB_SANDBOX || '').toLowerCase() === 'true';
+}
+
+/**
+ * Bloque les écritures RH sur la base partagée en DEV/test.
+ * Prod OK. Contournement explicite : ALLOW_RH_WRITES_ON_SHARED_DB=true
+ */
+function assertRhWritesAllowed() {
+    if (!isSharedAppDatabase()) return;
+    if (isSandboxMode()) return;
+    if (String(process.env.ALLOW_RH_WRITES_ON_SHARED_DB || '').toLowerCase() === 'true') return;
+    const env = String(process.env.NODE_ENV || 'development').toLowerCase();
+    if (env === 'production') return;
+    throw new Error(
+        'RH_SHARED_DB_WRITE_BLOCKED: refus d\'écrire dans SEDI_APP_INDEPENDANTE depuis le DEV. '
+        + 'Utilisez DB_DATABASE=SEDI_APP_DEV (voir backend/.env.dev.example) '
+        + 'ou ALLOW_RH_WRITES_ON_SHARED_DB=true si vous assumez le risque.'
+    );
+}
+
+// En production : exiger les mots de passe / JWT (jamais de secret en dur dans le code)
+if (process.env.NODE_ENV === 'production') {
+    const missing = [];
+    if (!process.env.DB_PASSWORD && !productionConfig?.DB_PASSWORD) missing.push('DB_PASSWORD');
+    if (!process.env.DB_ERP_PASSWORD && !productionConfig?.DB_ERP_PASSWORD) missing.push('DB_ERP_PASSWORD');
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'change-me-in-production') missing.push('JWT_SECRET');
+    if (missing.length) {
+        throw new Error(`Configuration manquante en production: ${missing.join(', ')} (définir dans docker/.env)`);
+    }
+}
+
+// Log de la configuration finale utilisée
+console.log('🔧 Configuration finale de la base de données:', {
+    server: config.server,
+    database: config.database,
+    appDb,
+    user: config.user,
+    source: resolveConfigSource(productionConfig),
+    rhWritesOnSharedBlocked: isSharedAppDatabase()
+        && !isSandboxMode()
+        && String(process.env.ALLOW_RH_WRITES_ON_SHARED_DB || '').toLowerCase() !== 'true'
+        && String(process.env.NODE_ENV || 'development').toLowerCase() !== 'production'
+});
+
+// Configuration de la base ERP
+const erpConfig = {
+    server: productionConfig?.DB_ERP_SERVER || process.env.DB_ERP_SERVER,
+    database: productionConfig?.DB_ERP_DATABASE || process.env.DB_ERP_DATABASE || 'SEDI_ERP',
+    user: productionConfig?.DB_ERP_USER || process.env.DB_ERP_USER || DEFAULT_DB_USER,
+    password: productionConfig?.DB_ERP_PASSWORD || process.env.DB_ERP_PASSWORD,
+    options: {
+        encrypt: productionConfig?.DB_ERP_ENCRYPT || process.env.DB_ERP_ENCRYPT === 'true' || false,
+        trustServerCertificate: productionConfig?.DB_ERP_TRUST_CERT || process.env.DB_ERP_TRUST_CERT === 'true' || true,
+        enableArithAbort: true,
+        requestTimeout: DB_REQUEST_TIMEOUT_MS,
+        connectionTimeout: DB_CONNECTION_TIMEOUT_MS
+    },
+    pool: {
+        max: 30,  // 20 opérateurs + 5 admin + 5 marge pour FSOP/autres
+        min: 10,  // Minimum de connexions actives pour réactivité
+        idleTimeoutMillis: 30000,
+        acquireTimeoutMillis: 60000,  // Timeout pour acquérir une connexion
+        createTimeoutMillis: 30000,   // Timeout pour créer une connexion
+        destroyTimeoutMillis: 5000,   // Timeout pour détruire une connexion
+        reapIntervalMillis: 1000,     // Intervalle de nettoyage
+        createRetryIntervalMillis: 200, // Intervalle de retry
+        // Note: evictionRunIntervalMillis n'est pas supporté par cette version de tarn
+    }
+};
+
+const appDbPort = Number.parseInt(process.env.DB_PORT || '', 10);
+if (Number.isFinite(appDbPort)) config.port = appDbPort;
+const erpDbPort = Number.parseInt(process.env.DB_ERP_PORT || process.env.DB_PORT || '', 10);
+if (Number.isFinite(erpDbPort)) erpConfig.port = erpDbPort;
+
+// DB_SANDBOX=true : SQL Server local jetable (docker/docker-compose.localdb.yml).
+// Refus de démarrer si l'une des connexions sort de la machine.
+if (isSandboxMode()) {
+    const LOCAL_HOSTS = ['127.0.0.1', 'localhost', '::1'];
+    const offenders = [['DB_SERVER', config.server], ['DB_ERP_SERVER', erpConfig.server]]
+        .filter(([, host]) => !LOCAL_HOSTS.includes(String(host || '').toLowerCase()));
+    if (productionConfig || offenders.length) {
+        throw new Error(
+            'DB_SANDBOX=true mais connexion non locale: '
+            + (productionConfig ? 'config-production.js présent ' : '')
+            + offenders.map(([k, v]) => `${k}=${v}`).join(', ')
+        );
+    }
+    console.log(`🧪 MODE SANDBOX : base locale ${config.server}:${config.port || 1433} (aucune écriture sur SERVEURERP)`);
+}
+
+// Pool de connexions
+let pool = null;
+let erpPool = null;
+let poolConnectPromise = null;
+let erpPoolConnectPromise = null;
+
+// Fonction pour obtenir une connexion
+async function getConnection() {
+    try {
+        if (!pool) {
+            // En mode test, simuler une connexion réussie
+            if (process.env.NODE_ENV === 'test') {
+                console.log('🧪 Mode test - Connexion simulée');
+                return null; // Retourner null pour les tests
+            }
+            pool = new sql.ConnectionPool(config);
+            pool.on('error', (err) => {
+                console.error('❌ Erreur pool SQL app:', err);
+            });
+            poolConnectPromise = pool.connect();
+        }
+        if (poolConnectPromise) {
+            await poolConnectPromise;
+            poolConnectPromise = null;
+            console.log('🔗 Connexion à la base de données établie');
+        }
+        return pool;
+    } catch (error) {
+        console.error('❌ Erreur de connexion à la base de données:', error);
+        pool = null;
+        poolConnectPromise = null;
+        throw error;
+    }
+}
+
+// Fonction pour obtenir une connexion ERP
+async function getErpConnection() {
+    try {
+        if (!erpPool) {
+            // En mode test, simuler une connexion réussie
+            if (process.env.NODE_ENV === 'test') {
+                console.log('🧪 Mode test - Connexion ERP simulée');
+                return null; // Retourner null pour les tests
+            }
+            erpPool = new sql.ConnectionPool(erpConfig);
+            erpPool.on('error', (err) => {
+                console.error('❌ Erreur pool SQL ERP:', err);
+            });
+            erpPoolConnectPromise = erpPool.connect();
+        }
+        if (erpPoolConnectPromise) {
+            await erpPoolConnectPromise;
+            erpPoolConnectPromise = null;
+            console.log('🔗 Connexion à la base ERP établie');
+        }
+        return erpPool;
+    } catch (error) {
+        console.error('❌ Erreur de connexion à la base ERP:', error);
+        erpPool = null;
+        erpPoolConnectPromise = null;
+        throw error;
+    }
+}
+
+// Fonction pour exécuter une requête avec retry et gestion de concurrence
+async function executeQuery(query, params = {}, retries = DB_QUERY_RETRIES) {
+    // En mode test, retourner des données simulées
+    if (process.env.NODE_ENV === 'test') {
+        console.log('🧪 Mode test - Données simulées retournées');
+        return []; // Retourner un tableau vide pour les tests
+    }
+    
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const pool = await getConnection();
+            
+            // Utiliser un timeout pour éviter les blocages
+            const request = pool.request();
+            request.timeout = DB_REQUEST_TIMEOUT_MS; // configurable via DB_REQUEST_TIMEOUT_MS
+            
+            // Ajouter les paramètres
+            Object.keys(params).forEach(key => {
+                request.input(key, params[key]);
+            });
+            
+            const result = await request.query(query);
+            return result.recordset;
+        } catch (error) {
+            // Erreurs de deadlock ou timeout - retry
+            const isRetryable = error.code === 'ETIMEOUT' || 
+                              error.code === 'EREQUEST' && 
+                              (error.originalError?.number === 1205 || // Deadlock
+                               error.originalError?.number === -2);    // Timeout
+            
+            if (isRetryable && attempt < retries) {
+                const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // Exponential backoff
+                console.warn(`⚠️ Erreur récupérable (tentative ${attempt}/${retries}), retry dans ${delay}ms:`, error.message);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+            
+            console.error('❌ Erreur lors de l\'exécution de la requête:', error);
+            throw error;
+        }
+    }
+}
+
+// Fonction pour exécuter une requête sur la base ERP
+async function executeErpQuery(query, params = {}) {
+    // Vérifier le mode test avant tout appel réseau
+    if (process.env.NODE_ENV === 'test') {
+        console.log('🧪 Mode test - Données ERP simulées retournées');
+        return [];
+    }
+    
+    const pool = await getErpConnection();
+    
+    try {
+        const request = pool.request();
+        request.timeout = DB_REQUEST_TIMEOUT_MS;
+        
+        // Ajouter les paramètres
+        Object.keys(params).forEach(key => {
+            request.input(key, params[key]);
+        });
+        
+        const result = await request.query(query);
+        return result.recordset;
+    } catch (error) {
+        console.error('❌ Erreur lors de l\'exécution de la requête ERP:', error);
+        throw error;
+    }
+}
+
+// Fonction pour exécuter une procédure stockée
+async function executeProcedure(procedureName, params = {}) {
+    const pool = await getConnection();
+    
+    // En mode test, retourner des données simulées
+    if (process.env.NODE_ENV === 'test') {
+        console.log('🧪 Mode test - Procédure simulée:', procedureName);
+        return []; // Retourner un tableau vide pour les tests
+    }
+    
+    try {
+        const request = pool.request();
+        
+        // Ajouter les paramètres
+        Object.keys(params).forEach(key => {
+            request.input(key, params[key]);
+        });
+        
+        const result = await request.execute(procedureName);
+        return result.recordset;
+    } catch (error) {
+        // SQL Server error 2812 = "Could not find stored procedure"
+        // In some environments (e.g., VM without mapping scripts applied), these procedures may be missing.
+        // We treat this as non-fatal to avoid blocking the API for pure "audit/consultation" side effects.
+        const sqlNumber = error?.number ?? error?.originalError?.info?.number;
+        if (sqlNumber === 2812) {
+            console.warn(`⚠️ Procédure stockée introuvable (ignorée): ${procedureName}`);
+            return [];
+        }
+        console.error(' Erreur lors de l\'exécution de la procédure:', error);
+        throw error;
+    }
+}
+
+// Exécuter une commande non séléctive (INSERT/UPDATE/DELETE) avec gestion de concurrence
+async function executeNonQuery(query, params = {}, retries = DB_QUERY_RETRIES) {
+    // En mode test, retourner un résultat simulé
+    if (process.env.NODE_ENV === 'test') {
+        console.log('🧪 Mode test - Commande simulée:', query.substring(0, 50) + '...');
+        return { rowsAffected: 1 }; // Simuler une ligne affectée
+    }
+    
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const pool = await getConnection();
+            const request = pool.request();
+            request.timeout = DB_REQUEST_TIMEOUT_MS; // configurable via DB_REQUEST_TIMEOUT_MS
+            
+            Object.keys(params).forEach(key => {
+                request.input(key, params[key]);
+            });
+            
+            const result = await request.query(query);
+            // mssql retourne un tableau rowsAffected par commande
+            const affected = Array.isArray(result.rowsAffected) ? result.rowsAffected.reduce((a, b) => a + b, 0) : (result.rowsAffected || 0);
+            return {
+                rowsAffected: affected
+            };
+        } catch (error) {
+            // Erreurs de deadlock ou timeout - retry
+            const isRetryable = error.code === 'ETIMEOUT' || 
+                              error.code === 'EREQUEST' && 
+                              (error.originalError?.number === 1205 || // Deadlock
+                               error.originalError?.number === -2 ||   // Timeout
+                               error.originalError?.number === 1222);  // Lock request timeout
+            
+            if (isRetryable && attempt < retries) {
+                const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // Exponential backoff
+                console.warn(`⚠️ Erreur récupérable (tentative ${attempt}/${retries}), retry dans ${delay}ms:`, error.message);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+            
+            console.error('❌ Erreur lors de l\'exécution de la commande:', error);
+            throw error;
+        }
+    }
+}
+
+// Fonction pour exécuter des opérations en transaction
+async function executeInTransaction(callback) {
+    // En mode test, exécuter sans transaction
+    if (process.env.NODE_ENV === 'test') {
+        console.log('🧪 Mode test - Transaction simulée');
+        return await callback({
+            request: () => ({
+                input: () => {},
+                query: async () => ({ recordset: [] }),
+                execute: async () => ({ recordset: [] })
+            })
+        });
+    }
+    
+    const connection = await getConnection();
+    const transaction = new sql.Transaction(connection);
+    
+    try {
+        await transaction.begin();
+        console.log('🔄 Transaction démarrée');
+        
+        // Wrapper pour exécuter des requêtes dans la transaction
+        const transactionContext = {
+            request: () => new sql.Request(transaction),
+            executeQuery: async (query, params = {}) => {
+                const req = new sql.Request(transaction);
+                Object.keys(params).forEach(key => {
+                    req.input(key, params[key]);
+                });
+                const result = await req.query(query);
+                return result.recordset;
+            },
+            executeNonQuery: async (query, params = {}) => {
+                const req = new sql.Request(transaction);
+                Object.keys(params).forEach(key => {
+                    req.input(key, params[key]);
+                });
+                const result = await req.query(query);
+                const affected = Array.isArray(result.rowsAffected) 
+                    ? result.rowsAffected.reduce((a, b) => a + b, 0) 
+                    : (result.rowsAffected || 0);
+                return { rowsAffected: affected };
+            }
+        };
+        
+        const result = await callback(transactionContext);
+        
+        await transaction.commit();
+        console.log('✅ Transaction commitée');
+        return result;
+        
+    } catch (error) {
+        try {
+            await transaction.rollback();
+            console.log('🔄 Transaction rollback effectué');
+        } catch (rollbackError) {
+            console.error('❌ Erreur lors du rollback:', rollbackError);
+        }
+        throw error;
+    }
+}
+
+// Fonction pour fermer la connexion
+async function closeConnection() {
+    if (pool) {
+        await pool.close();
+        pool = null;
+        poolConnectPromise = null;
+        console.log('🔌 Connexion à la base de données fermée');
+    }
+    if (erpPool) {
+        await erpPool.close();
+        erpPool = null;
+        erpPoolConnectPromise = null;
+        console.log('🔌 Connexion à la base ERP fermée');
+    }
+}
+
+// Gestion des erreurs de connexion avec reconnexion automatique
+sql.on('error', async (err) => {
+    console.error('❌ Erreur SQL Server:', err);
+    
+    // Si la connexion est perdue, réinitialiser le pool
+    if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT' || err.code === 'ESOCKET') {
+        console.log('🔄 Reconnexion automatique au pool SQL...');
+        try {
+            if (pool) {
+                await pool.close();
+                pool = null;
+                poolConnectPromise = null;
+            }
+            if (erpPool) {
+                await erpPool.close();
+                erpPool = null;
+                erpPoolConnectPromise = null;
+            }
+            // Les prochaines requêtes recréeront automatiquement les pools
+        } catch (closeError) {
+            console.error('❌ Erreur lors de la fermeture du pool:', closeError);
+        }
+    }
+});
+
+// Monitoring du pool de connexions
+setInterval(() => {
+    if (pool) {
+        const poolInfo = {
+            total: pool.totalCount || 0,
+            idle: pool.idleCount || 0,
+            waiting: pool.waitingCount || 0
+        };
+        // Ne journaliser que si des requêtes attendent une connexion (sinon une ligne par minute pour rien)
+        if (poolInfo.waiting > 0) {
+            console.log(`📊 Pool SQL: ${poolInfo.total} connexions (${poolInfo.idle} idle, ${poolInfo.waiting} en attente)`);
+        }
+    }
+}, 60000); // Toutes les minutes
+
+module.exports = {
+    config,
+    erpConfig,
+    appDatabaseName,
+    appDb,
+    SHARED_APP_DATABASE,
+    isSharedAppDatabase,
+    assertRhWritesAllowed,
+    getConnection,
+    getErpConnection,
+    executeQuery,
+    executeErpQuery,
+    executeProcedure,
+    executeNonQuery,
+    executeInTransaction,
+    closeConnection,
+    sql
+};

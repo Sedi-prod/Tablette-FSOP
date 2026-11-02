@@ -1,0 +1,5162 @@
+// Page d'administration - v20251014-fixed-v4-refactored
+import TimeUtils from '../utils/TimeUtils.js';
+import Logger from '../utils/Logger.js';
+import DOMCache from '../utils/DOMCache.js';
+import ErrorHandler from '../utils/ErrorHandler.js';
+import Validator from '../utils/Validator.js';
+import LoadingIndicator from '../utils/LoadingIndicator.js';
+import { debounce } from '../utils/debounce.js';
+import { createElement, createTableCell, createButton, createBadge, clearElement } from '../utils/DOMHelper.js';
+import { ADMIN_CONFIG, STATUS_CODES, STATUS_LABELS } from '../utils/Constants.js';
+
+/**
+ * Recolle une heure corrigée sur le jour de la ligne.
+ * "17:25" ou "2026-10-21T17:25:00" restent sur dayYmd (la veille), pas sur aujourd'hui.
+ */
+function composeClockOnDay(dayYmd, timeInput) {
+    const day = String(dayYmd || '').match(/^(\d{4}-\d{2}-\d{2})/)?.[1];
+    const hm = String(timeInput || '').trim().match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (!day || !hm) return timeInput || '';
+    const hh = hm[1].padStart(2, '0');
+    const mm = hm[2];
+    const ss = String(hm[3] || '00').padStart(2, '0');
+    return `${day}T${hh}:${mm}:${ss}`;
+}
+
+/** Date locale YYYY-MM-DD (alignée avec loadData / SQL jour civil). */
+function toLocalDateOnlyString(d) {
+    const x = new Date(d);
+    if (Number.isNaN(x.getTime())) return null;
+    const y = x.getFullYear();
+    const m = String(x.getMonth() + 1).padStart(2, '0');
+    const day = String(x.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+}
+
+/**
+ * Colonnes « étape » du tableau admin :
+ * - Phase = Phase ERP du lancement (010, 040…) — jamais le code opérateur
+ * - Libellé = LCTC.CodeOperation (Fabrication)
+ */
+function getAdminStepColumnDisplay(operation) {
+    const EVENT_MARKERS = new Set(['PRODUCTION', 'PAUSE', 'REPRISE', 'TERMINE', 'TERMINÉE', 'ADMIN', '']);
+    const phase = String(operation?.Phase ?? operation?.phase ?? '').trim();
+    const operatorCode = String(
+        operation?.OperatorCode ?? operation?.operatorId ?? operation?.operatorCode ?? ''
+    ).trim();
+    const fabrication = String(operation?.Fabrication ?? operation?.fabrication ?? '').trim();
+    const erpLabel = fabrication && fabrication !== '-' ? fabrication : '';
+
+    const isOperatorCode = operatorCode && phase === operatorCode;
+    const stepCode = (EVENT_MARKERS.has(phase.toUpperCase()) || isOperatorCode) ? '-' : phase;
+    const stepLabel = erpLabel || '-';
+    return { stepCode: stepCode || '-', stepLabel };
+}
+
+/** DateCreation → YYYY-MM-DD (jour civil). */
+function parseAdminRowDateYmd(op) {
+    const raw = op?.DateCreation ?? op?.dateCreation;
+    if (!raw) return null;
+    if (typeof raw === 'string') {
+        const m = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+        if (m) return m[1];
+    }
+    if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+        return toLocalDateOnlyString(raw);
+    }
+    return null;
+}
+
+/** Affichage date type SILOG (JJ/MM/AAAA). */
+function formatAdminRowDate(op) {
+    const ymd = parseAdminRowDateYmd(op);
+    if (!ymd) return '-';
+    const [y, m, d] = ymd.split('-');
+    return `${d}/${m}/${y}`;
+}
+
+/** Extrait HH:mm pour le tri chronologique. */
+function parseAdminRowTimeHm(raw) {
+    if (!raw) return null;
+    if (typeof raw === 'string') {
+        const m = raw.match(/(\d{1,2}):(\d{2})/);
+        if (m) return `${m[1].padStart(2, '0')}:${m[2]}`;
+    }
+    if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+        return raw.toLocaleTimeString('fr-FR', {
+            timeZone: 'Europe/Paris',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+    }
+    return null;
+}
+
+/** Timestamp de tri : opérateur puis ordre chronologique (timeline SILOG). */
+function getAdminRowSortTimestamp(op) {
+    const isoStart = op?.StartTime ?? op?.startTime;
+    if (typeof isoStart === 'string' && isoStart.includes('T')) {
+        const t = new Date(isoStart).getTime();
+        if (!Number.isNaN(t)) return t;
+    }
+    const ymd = parseAdminRowDateYmd(op);
+    const hm = parseAdminRowTimeHm(isoStart);
+    if (ymd && hm) {
+        const t = new Date(`${ymd}T${hm}:00`).getTime();
+        if (!Number.isNaN(t)) return t;
+    }
+    if (ymd) {
+        const t = new Date(`${ymd}T00:00:00`).getTime();
+        if (!Number.isNaN(t)) return t;
+    }
+    return Number.MAX_SAFE_INTEGER;
+}
+
+function compareAdminTimelineRows(a, b) {
+    const opA = String(a?.OperatorCode || a?.operatorCode || a?.operatorId || '').trim();
+    const opB = String(b?.OperatorCode || b?.operatorCode || b?.operatorId || '').trim();
+    if (opA !== opB) return opA.localeCompare(opB, 'fr');
+    const tsA = getAdminRowSortTimestamp(a);
+    const tsB = getAdminRowSortTimestamp(b);
+    if (tsA !== tsB) return tsA - tsB;
+    // Même minute : créneau productif avant la pause
+    const rank = (x) => {
+        if (x?._isPauseRow || x?.type === 'pause') return 1;
+        if (x?._isWorkSegment) return 0;
+        return 2;
+    };
+    const r = rank(a) - rank(b);
+    if (r !== 0) return r;
+    const idA = Number(a?.TempsId ?? a?.EventId ?? a?.id ?? 0) || 0;
+    const idB = Number(b?.TempsId ?? b?.EventId ?? b?.id ?? 0) || 0;
+    return idA - idB;
+}
+
+class AdminPage {
+    constructor(app) {
+        this.app = app;
+        this.apiService = app.getApiService();
+        this.notificationManager = app.getNotificationManager();
+        
+        // Initialiser les utilitaires
+        this.logger = new Logger(false);
+        this.domCache = new DOMCache();
+        this.errorHandler = new ErrorHandler(this.notificationManager, this.logger);
+        this.validator = new Validator();
+        this.loadingIndicator = new LoadingIndicator();
+        
+        // Données
+        this.operations = [];
+        this.stats = {};
+        this.pagination = null;
+        this.currentPage = 1;
+        this.pageSize = 25;
+        this._loadSeq = 0; // protège contre les réponses "en retard" (stale render)
+        this.selectedOperatorCode = ''; // persiste le filtre opérateur entre refresh
+        this.transferSelectionIds = new Set(); // sélection dans la modale de transfert (TempsId)
+        this.selectedTempsIds = new Set(); // sélection de lignes dans le tableau principal (TempsId)
+        this.aiAssistEnabled = false;
+        this._aiAssistLoading = false;
+        
+        // Flags pour éviter les appels simultanés
+        this._isTransferring = false;
+        this._isConsolidating = false;
+        this.isLoading = false;
+        
+        // Système de sauvegarde automatique
+        this.autoSaveEnabled = true;
+        this.autoSaveInterval = ADMIN_CONFIG.AUTO_SAVE_INTERVAL;
+        this.pendingChanges = new Map(); // Map des modifications en attente
+        this.autoSaveTimer = null;
+        
+        // Gestion des erreurs et refresh
+        this.lastEditTime = 0;
+        this.consecutiveErrors = 0;
+        this.maxConsecutiveErrors = ADMIN_CONFIG.MAX_CONSECUTIVE_ERRORS;
+        this.refreshInterval = null;
+        this.operatorsInterval = null;
+        this.lastOperatorsUpdate = 0;
+        this.timeoutId = null;
+        
+        // Cache des opérateurs
+        this._allOperatorsCache = [];
+        this._allOperatorsCacheAt = 0;
+        
+        // Initialisation immédiate (le DOM devrait être prêt maintenant)
+        this.initializeElements();
+        this.setupEventListeners();
+        this.startAutoSave();
+        this.refreshAiAssistStatus();
+    }
+
+    async refreshAiAssistStatus() {
+        try {
+            const res = await this.apiService.getAiAssistStatus();
+            this.aiAssistEnabled = Boolean(res?.data?.enabled && res?.data?.hasApiKey);
+        } catch {
+            this.aiAssistEnabled = false;
+        }
+    }
+
+    /**
+     * DateCreation d’une ligne (ABTEMPS ou fusion) → YYYY-MM-DD fuseau navigateur.
+     */
+    _parseOpDateCreationLocalYmd(raw) {
+        if (raw == null || raw === '') return null;
+        if (typeof raw === 'string') {
+            const m = String(raw).trim().match(/^(\d{4}-\d{2}-\d{2})/);
+            if (m) return m[1];
+        }
+        if (raw instanceof Date) return toLocalDateOnlyString(raw);
+        return null;
+    }
+
+    /** Période multi-jours : préfixer la date dans les colonnes horaires (timeline SILOG, intitulés inchangés). */
+    _isAdminMultiDayPeriod() {
+        const period = document.getElementById('periodFilter')?.value || 'month';
+        return period === 'month' || period === 'week';
+    }
+
+    formatAdminTimelineTime(op, timeValue) {
+        const time = this.formatDateTime(timeValue);
+        if (time === '-' || !this._isAdminMultiDayPeriod()) return time;
+        const date = formatAdminRowDate(op);
+        return date === '-' ? time : `${date} ${time}`;
+    }
+
+    /**
+     * Lignes transmises à SILOG (StatutTraitement='T') : visibles et grisées
+     * pendant TRANSMITTED_VISIBLE_DAYS, pour savoir ce qui a déjà basculé.
+     */
+    shouldShowAdminDashboardRow(op) {
+        const st = String(op?.StatutTraitement ?? '').toUpperCase().trim();
+        if (st !== 'T') return true;
+
+        const days = Number(ADMIN_CONFIG.TRANSMITTED_VISIBLE_DAYS ?? 30);
+        if (!Number.isFinite(days) || days <= 0) return true;
+
+        const ymd = this._parseOpDateCreationLocalYmd(op?.DateCreation);
+        if (!ymd) return true;
+        const created = new Date(`${ymd}T00:00:00`);
+        if (Number.isNaN(created.getTime())) return true;
+        const cutoff = new Date();
+        cutoff.setHours(0, 0, 0, 0);
+        cutoff.setDate(cutoff.getDate() - days);
+        return created >= cutoff;
+    }
+
+    /**
+     * Clé alignée entre ligne ABTEMPS (consolidée) et agrégat ABHISTORIQUE (non consolidé),
+     * pour retirer l’overlay doublon quand les deux représentent la même opération.
+     */
+    _getAdminMergeDedupSlotKey(op) {
+        const opC = (op?.OperatorCode ?? op?.operatorId ?? '').toString().trim();
+        const lc = (op?.LancementCode ?? op?.lancementCode ?? '').toString().trim().toUpperCase();
+        const { stepCode, stepLabel } = getAdminStepColumnDisplay(op);
+        const step = `${String(stepCode).toUpperCase()}|${String(stepLabel).toUpperCase()}`;
+        const st = this.formatDateTime(op?.StartTime ?? op?.startTime);
+        const et = this.formatDateTime(op?.EndTime ?? op?.endTime);
+        const startNorm = st === '-' ? '' : st;
+        const endNorm = et === '-' ? '' : et;
+        return `${opC}|${lc}|${step}|${startNorm}|${endNorm}`;
+    }
+
+    /**
+     * Après fusion Map, ABHISTORIQUE peut encore apparaître en parallèle d’ABTEMPS (clés T: vs E:).
+     * On garde la ligne consolidée et on supprime l’overlay non consolidé si le créneau métier coïncide.
+     */
+    _dedupeAdminConsolidatedOverlay(ops) {
+        if (!ops?.length) return ops;
+        const consolidatedBySlot = new Map();
+        const consolidatedCountBySlot = new Map();
+        for (const op of ops) {
+            const tid = op?.TempsId ?? op?.tempsId;
+            if (tid == null || String(tid).trim() === '') continue;
+            const slot = this._getAdminMergeDedupSlotKey(op);
+            consolidatedCountBySlot.set(slot, (consolidatedCountBySlot.get(slot) || 0) + 1);
+            if (!consolidatedBySlot.has(slot)) consolidatedBySlot.set(slot, op);
+        }
+        // Une ligne affichée peut masquer l'historique : rattacher EventId pour tout supprimer d'un coup.
+        for (const op of ops) {
+            if (!op?._isUnconsolidated || op?._isPauseRow) continue;
+            const tid = op?.TempsId ?? op?.tempsId;
+            if (tid != null && String(tid).trim() !== '') continue;
+            const eid = op.EventId ?? op.id;
+            if (eid == null || String(eid).trim() === '') continue;
+            const cons = consolidatedBySlot.get(this._getAdminMergeDedupSlotKey(op));
+            if (!cons) continue;
+            if (cons.EventId == null || String(cons.EventId).trim() === '') {
+                cons.EventId = eid;
+            }
+        }
+        const out = [];
+        for (const op of ops) {
+            if (op?._isPauseRow) {
+                out.push(op);
+                continue;
+            }
+            if (op?._isUnconsolidated) {
+                const tid = op?.TempsId ?? op?.tempsId;
+                if (tid == null || String(tid).trim() === '') {
+                    const slot = this._getAdminMergeDedupSlotKey(op);
+                    if ((consolidatedCountBySlot.get(slot) || 0) > 0) {
+                        continue;
+                    }
+                }
+            }
+            out.push(op);
+        }
+        return out;
+    }
+
+    /**
+     * Clé créneau (opérateur + LT + jour + heure début) pour aligner
+     * une ligne ABTEMPS et un segment historique du même cycle.
+     */
+    _getAdminStartSlotKey(op) {
+        const oc = String(op?.OperatorCode || op?.operatorCode || op?.operatorId || '').trim();
+        const lc = String(op?.LancementCode || op?.lancementCode || '').trim().toUpperCase();
+        const ymd = this._parseOpDateCreationLocalYmd(op?.DateCreation) || '';
+        const st = this.formatDateTime(op?.StartTime ?? op?.startTime);
+        const startNorm = st === '-' ? '' : st;
+        return `${oc}|${lc}|${ymd}|${startNorm}`;
+    }
+
+    /**
+     * Si un segment productif couvre le même créneau (opérateur+LT+jour+heure de début),
+     * masquer la ligne ABTEMPS de ce cycle — sinon on voit le cumul et le détail.
+     * Un autre cycle du même jour (autre heure de début) reste visible.
+     * La pause n'est pas une ligne : fin d'une ligne = pause, début suivante = reprise.
+     */
+    _preferWorkSegmentsOverConsolidated(ops) {
+        if (!ops?.length) return ops;
+        const segments = ops.filter((op) => op?._isWorkSegment);
+        if (segments.length === 0) {
+            const consolidatedSlots = new Set();
+            for (const op of ops) {
+                if (op?.TempsId == null || String(op.TempsId).trim() === '') continue;
+                if (op?._isPauseRow) continue;
+                consolidatedSlots.add(this._getAdminStartSlotKey(op));
+            }
+            if (consolidatedSlots.size === 0) return ops;
+            return ops.filter((op) => {
+                if (op?._isPauseRow) return true;
+                if (op?.TempsId != null && String(op.TempsId).trim() !== '') return true;
+                if (!op?._isUnconsolidated) return true;
+                return !consolidatedSlots.has(this._getAdminStartSlotKey(op));
+            });
+        }
+
+        const dayKey = (op) => {
+            const oc = String(op?.OperatorCode || op?.operatorCode || op?.operatorId || '').trim();
+            const lc = String(op?.LancementCode || op?.lancementCode || '').trim().toUpperCase();
+            const ymd = this._parseOpDateCreationLocalYmd(op?.DateCreation) || '';
+            return `${oc}|${lc}|${ymd}`;
+        };
+
+        const segmentDays = new Set(segments.map(dayKey));
+        const segmentSlots = new Set(
+            segments.map((op) => this._getAdminStartSlotKey(op)).filter(Boolean)
+        );
+
+        // Attacher les TempsId consolidés aux segments (même créneau) pour le transfert / sélection.
+        const consolidatedBySlot = new Map();
+        for (const op of ops) {
+            if (op?._isWorkSegment || op?._isPauseRow) continue;
+            const tid = op?.TempsId ?? op?.tempsId;
+            if (tid == null || String(tid).trim() === '') continue;
+            if (!segmentDays.has(dayKey(op))) continue;
+            const slot = this._getAdminStartSlotKey(op);
+            if (!slot || consolidatedBySlot.has(slot)) continue;
+            consolidatedBySlot.set(slot, op);
+        }
+        for (const seg of segments) {
+            const match = consolidatedBySlot.get(this._getAdminStartSlotKey(seg));
+            if (!match) continue;
+            seg.TempsId = match.TempsId ?? match.tempsId;
+            if (match.StatutTraitement != null) seg.StatutTraitement = match.StatutTraitement;
+            if (match.TotalDuration != null) seg.TotalDuration = match.TotalDuration;
+            if (match.PauseDuration != null) seg.PauseDuration = match.PauseDuration;
+            if (match.ProductiveDuration != null) seg.ProductiveDuration = match.ProductiveDuration;
+            // Afficher les heures / LT corrigés dans ABTEMPS (sinon reload → anciennes heures historiques)
+            if (match.StartTime != null) {
+                seg.StartTime = match.StartTime;
+                seg.startTime = match.StartTime;
+            }
+            if (match.EndTime != null) {
+                seg.EndTime = match.EndTime;
+                seg.endTime = match.EndTime;
+            }
+            if (match.LancementCode != null) seg.LancementCode = match.LancementCode;
+            if (match.Phase != null) seg.Phase = match.Phase;
+            if (match.CodeRubrique != null) seg.CodeRubrique = match.CodeRubrique;
+            seg._isUnconsolidated = false;
+        }
+
+        return ops.filter((op) => {
+            if (op?._isPauseRow) return true;
+            if (op?._isWorkSegment) return true;
+            const tid = op?.TempsId ?? op?.tempsId;
+            if (tid != null && String(tid).trim() !== '' && segmentSlots.has(this._getAdminStartSlotKey(op))) {
+                return false;
+            }
+            return true;
+        });
+    }
+
+    /**
+     * Quand plusieurs lignes partagent exactement le même créneau (souvent deux TempsId pour la même plage),
+     * on n’en garde qu’une pour éviter les doublons visuels identiques.
+     */
+    _pickBestAdminSlotDuplicate(a, b) {
+        const hasTid = (x) => x?.TempsId != null && String(x.TempsId).trim() !== '';
+        const tidA = hasTid(a);
+        const tidB = hasTid(b);
+        if (tidA !== tidB) return tidA ? a : b;
+        if (tidA && tidB) {
+            const na = Number.parseInt(String(a.TempsId).replace(/\D/g, ''), 10) || 0;
+            const nb = Number.parseInt(String(b.TempsId).replace(/\D/g, ''), 10) || 0;
+            if (na !== nb) return na > nb ? a : b;
+        }
+        if (Boolean(a?._isUnconsolidated) !== Boolean(b?._isUnconsolidated)) {
+            return a?._isUnconsolidated ? b : a;
+        }
+        return a;
+    }
+
+    _dedupeAdminIdenticalSlotRows(ops) {
+        if (!ops?.length) return ops;
+        const winnerBySlot = new Map();
+        const pauseRows = [];
+        for (const op of ops) {
+            if (op?._isPauseRow) {
+                pauseRows.push(op);
+                continue;
+            }
+            const slot = this._getAdminMergeDedupSlotKey(op);
+            const prev = winnerBySlot.get(slot);
+            winnerBySlot.set(slot, prev ? this._pickBestAdminSlotDuplicate(prev, op) : op);
+        }
+        const out = [];
+        const seen = new Set();
+        for (const op of ops) {
+            if (op?._isPauseRow) continue;
+            const slot = this._getAdminMergeDedupSlotKey(op);
+            if (seen.has(slot)) continue;
+            seen.add(slot);
+            out.push(winnerBySlot.get(slot));
+        }
+        return [...out, ...pauseRows];
+    }
+
+    initializeElements() {
+        // Initialiser le cache DOM
+        this.domCache.initialize();
+
+        // Réinitialiser le bouton Transfert au cas où la page aurait été rechargée pendant un transfert
+        const transferBtnInit = document.getElementById('transferBtn');
+        if (transferBtnInit) {
+            transferBtnInit.disabled = false;
+            transferBtnInit.innerHTML = '<i class="fas fa-exchange-alt"></i> Transfert';
+        }
+        
+        // Mapper les éléments du cache vers les propriétés de la classe
+        const elementMap = {
+            refreshDataBtn: 'refreshDataBtn',
+            totalOperators: 'totalOperators',
+            activeLancements: 'activeLancements',
+            pausedLancements: 'pausedLancements',
+            completedLancements: 'completedLancements',
+            operationsTableBody: 'operationsTableBody',
+            operatorSelect: 'operatorFilter',
+            transferSelectionModal: 'transferSelectionModal',
+            transferModalTableBody: 'transferModalTableBody',
+            closeTransferModalBtn: 'closeTransferModalBtn',
+            transferSelectedConfirmBtn: 'transferSelectedConfirmBtn',
+            transferHoldSelectedBtn: 'transferHoldSelectedBtn',
+            transferSelectAll: 'transferSelectAll'
+        };
+        
+        // Initialiser les éléments avec vérification
+        Object.keys(elementMap).forEach(key => {
+            const elementId = elementMap[key];
+            this[key] = this.domCache.get(elementId);
+            
+            if (!this[key]) {
+                this.logger.warn(`⚠️ Élément non trouvé: ${elementId}`);
+                // Créer un élément de fallback pour éviter les erreurs
+                if (key === 'operationsTableBody') {
+                    this[key] = createElement('tbody', { id: elementId });
+                    this.domCache.set(elementId, this[key]);
+                }
+            }
+        });
+    }
+
+    addEventListenerSafe(elementId, eventType, handler) {
+        try {
+            const element = this.domCache.get(elementId);
+            if (element && typeof element.addEventListener === 'function') {
+                element.addEventListener(eventType, handler);
+                this.logger.log(`Listener ajouté: ${elementId} (${eventType})`);
+            } else {
+                this.logger.warn(`Élément non trouvé ou invalide: ${elementId}`);
+            }
+        } catch (error) {
+            this.errorHandler.handle(error, 'addEventListenerSafe', `Erreur lors de l'ajout du listener ${elementId}`);
+        }
+    }
+
+    setupEventListeners() {
+        // Attendre un peu que le DOM soit complètement prêt
+        setTimeout(() => {
+            try {
+                // Bouton Actualiser
+                const refreshBtn = this.domCache.get('refreshDataBtn');
+                if (refreshBtn) {
+                    refreshBtn.addEventListener('click', () => {
+                        this.resetConsecutiveErrors();
+                        this.loadData();
+                    });
+                }
+
+                // Modale transfert
+                const closeTransferModalBtn = this.domCache.get('closeTransferModalBtn');
+                if (closeTransferModalBtn) {
+                    closeTransferModalBtn.addEventListener('click', () => this.hideTransferModal());
+                }
+
+                const transferSelectedConfirmBtn = this.domCache.get('transferSelectedConfirmBtn');
+                if (transferSelectedConfirmBtn) {
+                    transferSelectedConfirmBtn.addEventListener('click', () => this.confirmTransferFromModal());
+                }
+
+                const transferHoldSelectedBtn = this.domCache.get('transferHoldSelectedBtn');
+                if (transferHoldSelectedBtn) {
+                    transferHoldSelectedBtn.addEventListener('click', () => this.holdSelectedFromTransferModal());
+                }
+
+                const transferSelectAll = this.domCache.get('transferSelectAll');
+                if (transferSelectAll) {
+                    transferSelectAll.addEventListener('change', () => this.toggleTransferSelectAll(transferSelectAll.checked));
+                }
+                
+                // Menu déroulant opérateurs
+                const operatorSelect = this.domCache.get('operatorFilter');
+                if (operatorSelect) {
+                    operatorSelect.addEventListener('change', () => this.handleOperatorChange());
+                }
+                
+                // Filtre de statut
+                const statusFilter = this.domCache.get('statusFilter');
+                if (statusFilter) {
+                    statusFilter.addEventListener('change', () => {
+                        // Statut opération: filtrage local
+                        this.updateOperationsTable();
+                        this.updateStats();
+                    });
+                }
+
+
+                // Filtre de période
+                const periodFilter = this.domCache.get('periodFilter');
+                if (periodFilter) {
+                    periodFilter.addEventListener('change', () => {
+                        this.syncAdminDatePickerUI();
+                        this.loadData();
+                    });
+                }
+
+                const adminDatePicker = this.domCache.get('adminDatePicker');
+                if (adminDatePicker) {
+                    adminDatePicker.addEventListener('change', () => {
+                        if ((this.domCache.get('periodFilter')?.value || '') === 'custom') {
+                            this.loadData();
+                        }
+                    });
+                }
+                
+                // Filtre de recherche : filtrage local immédiat, API en silence (sans vider le tableau)
+                const searchFilter = this.domCache.get('searchFilter');
+                if (searchFilter) {
+                    const debouncedSearchReload = debounce(() => {
+                        this.loadData(true, { silent: true });
+                    }, ADMIN_CONFIG.SEARCH_DEBOUNCE_DELAY);
+                    searchFilter.addEventListener('input', () => {
+                        this.currentPage = 1;
+                        this.updateOperationsTable();
+                        this.updatePaginationInfo();
+                        debouncedSearchReload();
+                    });
+                }
+
+                const operatorCodeSearch = this.domCache.get('operatorCodeSearch');
+                if (operatorCodeSearch) {
+                    const debouncedOperatorCodeFilter = debounce(() => {
+                        this.updateOperationsTable();
+                        this.updatePaginationInfo();
+                    }, 150);
+                    operatorCodeSearch.addEventListener('input', () => {
+                        this.currentPage = 1;
+                        const term = operatorCodeSearch.value.trim();
+                        const hadFetchedOperator = Boolean(this._fetchedOperatorCode);
+                        if (term && (hadFetchedOperator || this.selectedOperatorCode || this.operatorSelect?.value)) {
+                            this.selectedOperatorCode = '';
+                            if (this.operatorSelect) this.operatorSelect.value = '';
+                            if (hadFetchedOperator) {
+                                this.loadData(true, { silent: true });
+                                return;
+                            }
+                        }
+                        debouncedOperatorCodeFilter();
+                    });
+                }
+                
+                // Bouton effacer filtres
+                const clearFiltersBtn = this.domCache.get('clearFiltersBtn');
+                if (clearFiltersBtn) {
+                    clearFiltersBtn.addEventListener('click', () => {
+                        if (operatorSelect) operatorSelect.value = '';
+                        this.selectedOperatorCode = '';
+                        if (statusFilter) statusFilter.value = '';
+                        if (periodFilter) periodFilter.value = 'today';
+                        const pg = this.domCache.get('adminDatePickerGroup');
+                        const adp = this.domCache.get('adminDatePicker');
+                        if (adp) adp.value = '';
+                        if (pg) pg.style.display = 'none';
+                        if (searchFilter) searchFilter.value = '';
+                        const operatorCodeSearch = this.domCache.get('operatorCodeSearch');
+                        if (operatorCodeSearch) operatorCodeSearch.value = '';
+                        this.loadData();
+                    });
+                }
+                
+                   // Bouton Transfert
+                   const transferBtn = this.domCache.get('transferBtn');
+                   if (transferBtn) {
+                       transferBtn.addEventListener('click', () => this.handleTransfer());
+                   }
+                   
+                   // Bouton Ajouter une ligne
+                   const addOperationBtn = this.domCache.get('addOperationBtn');
+                   if (addOperationBtn) {
+                       addOperationBtn.addEventListener('click', () => this.handleAddOperation());
+                   }
+                
+                // Tableau des opérations
+                const tableBody = this.domCache.get('operationsTableBody');
+                if (tableBody) {
+                    tableBody.addEventListener('click', async (e) => {
+                        if (e.target.closest('.btn-delete')) {
+                            const btn = e.target.closest('.btn-delete');
+                            const tempsId = btn.dataset.tempsId ? Number.parseInt(btn.dataset.tempsId, 10) : null;
+                            const eventId = btn.dataset.eventId ? btn.dataset.eventId : null;
+                            const id = btn.dataset.id || btn.dataset.operationId;
+                            await this.deleteAdminLine({
+                                tempsId: Number.isFinite(tempsId) && !Number.isNaN(tempsId) ? tempsId : null,
+                                eventId: eventId || null,
+                                fallbackId: id || null
+                            });
+                        } else if (e.target.closest('.btn-hold')) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const btn = e.target.closest('.btn-hold');
+                            const tempsId = btn.dataset.tempsId ? Number.parseInt(btn.dataset.tempsId, 10) : null;
+                            if (tempsId) await this.holdMonitoringRecord(tempsId);
+                        } else if (e.target.closest('.btn-release-hold')) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const btn = e.target.closest('.btn-release-hold');
+                            const tempsId = btn.dataset.tempsId ? Number.parseInt(btn.dataset.tempsId, 10) : null;
+                            if (tempsId) await this.releaseHoldMonitoringRecord(tempsId);
+                        } else if (e.target.closest('.btn-transmit-one')) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const btn = e.target.closest('.btn-transmit-one');
+                            const tempsId = btn.dataset.tempsId ? Number.parseInt(btn.dataset.tempsId, 10) : null;
+                            const wasHold = btn.dataset.onHold === 'true';
+                            if (tempsId) await this.transmitSingleMonitoringRecord(tempsId, { wasHold });
+                        } else if (e.target.closest('.btn-ai-assist')) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const btn = e.target.closest('.btn-ai-assist');
+                            const rowId = btn.dataset.id || btn.dataset.operationId;
+                            if (rowId) await this.analyzeLineWithAi(rowId);
+                        } else if (e.target.closest('.btn-edit')) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const btn = e.target.closest('.btn-edit');
+                            const tempsId = btn.dataset.tempsId ? Number.parseInt(btn.dataset.tempsId, 10) : null;
+                            const eventId = btn.dataset.eventId ? btn.dataset.eventId : null;
+                            const id = btn.dataset.id || btn.dataset.operationId;
+                            const isUnconsolidated = (btn.dataset.unconsolidated === 'true') || !tempsId;
+                            
+                            if (!id) {
+                                this.errorHandler.handle(
+                                    new Error('ID manquant sur le bouton'),
+                                    'setupEventListeners',
+                                    'Erreur: ID manquant sur le bouton d\'édition'
+                                );
+                                return;
+                            }
+                            
+                            try {
+                                if (isUnconsolidated) {
+                                    await this.editOperation(eventId || id);
+                                } else {
+                                    await this.editMonitoringRecord(tempsId || id);
+                                }
+                            } catch (error) {
+                                this.errorHandler.handle(error, 'setupEventListeners', 'Erreur lors de l\'édition');
+                            }
+                        }
+                    });
+                }
+                
+            } catch (error) {
+                this.errorHandler.handle(error, 'setupEventListeners', 'Erreur lors de l\'ajout des listeners');
+            }
+        }, 300);
+        
+        // Actualisation automatique avec retry en cas d'erreur
+        this.refreshInterval = setInterval(() => {
+            // Ne pas recharger si trop d'erreurs consécutives
+            if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+                this.logger.log(`⏸️ Refresh automatique désactivé (${this.consecutiveErrors} erreurs consécutives)`);
+                return;
+            }
+            
+            // Ne pas recharger si une édition vient d'être effectuée (dans les 5 dernières secondes)
+            const timeSinceLastEdit = Date.now() - this.lastEditTime;
+            if (!this.isLoading && timeSinceLastEdit > ADMIN_CONFIG.EDIT_COOLDOWN) {
+                this.loadDataWithRetry();
+            } else if (timeSinceLastEdit <= ADMIN_CONFIG.EDIT_COOLDOWN) {
+                this.logger.log(`⏸️ Rechargement automatique ignoré (édition récente il y a ${Math.round(timeSinceLastEdit/1000)}s)`);
+            }
+        }, ADMIN_CONFIG.REFRESH_INTERVAL);
+
+        // Mise à jour temps réel des opérateurs connectés
+        this.operatorsInterval = setInterval(() => {
+            // Ne pas mettre à jour si trop d'erreurs
+            if (this.consecutiveErrors < this.maxConsecutiveErrors) {
+                if (this.isLoading) {
+                    // Éviter d'empiler des requêtes pendant un loadData en cours
+                    return;
+                }
+                // Vérifier si on a des données récentes pour éviter les requêtes redondantes
+                const timeSinceLastUpdate = Date.now() - this.lastOperatorsUpdate;
+                if (timeSinceLastUpdate < ADMIN_CONFIG.MIN_UPDATE_INTERVAL) {
+                    this.logger.log(`⏸️ Mise à jour opérateurs ignorée (données récentes il y a ${Math.round(timeSinceLastUpdate/1000)}s)`);
+                    return;
+                }
+                this.updateOperatorsStatus();
+            }
+        }, ADMIN_CONFIG.OPERATORS_UPDATE_INTERVAL);
+
+    }
+
+    /**
+     * Calendrier + heures pour poser une ligne sur un jour choisi (y compris hier).
+     * @returns {Promise<{workDate: string, startHm: string, endHm: string}|null>}
+     */
+    _pickAddSchedule(defaultDate) {
+        const today = toLocalDateOnlyString(new Date());
+        return new Promise((resolve) => {
+            const modal = createElement('div', {
+                className: 'ai-assist-modal',
+                role: 'dialog',
+                'aria-modal': 'true'
+            });
+            modal.innerHTML = `
+                <div class="ai-assist-modal-card">
+                    <div class="ai-assist-modal-header">
+                        <strong>Jour et heures</strong>
+                        <button type="button" class="ai-assist-close" aria-label="Fermer">&times;</button>
+                    </div>
+                    <label class="add-op-field">Date
+                        <input type="date" class="add-op-date" value="${defaultDate || today}" max="${today}" required>
+                    </label>
+                    <label class="add-op-field">Heure de début
+                        <input type="time" class="add-op-start" required>
+                    </label>
+                    <label class="add-op-field">Heure de fin
+                        <input type="time" class="add-op-end">
+                    </label>
+                    <p class="ai-assist-motif">Laisser la fin vide si la ligne est encore en cours.</p>
+                    <p class="add-op-error" hidden></p>
+                    <div class="ai-assist-actions">
+                        <button type="button" class="btn-secondary add-op-cancel">Annuler</button>
+                        <button type="button" class="btn-primary add-op-ok">Ajouter</button>
+                    </div>
+                </div>`;
+            const close = (value) => {
+                modal.remove();
+                resolve(value);
+            };
+            const showError = (message) => {
+                const el = modal.querySelector('.add-op-error');
+                if (!el) return;
+                el.hidden = !message;
+                el.textContent = message || '';
+            };
+            modal.querySelector('.ai-assist-close')?.addEventListener('click', () => close(null));
+            modal.querySelector('.add-op-cancel')?.addEventListener('click', () => close(null));
+            modal.addEventListener('click', (event) => {
+                if (event.target === modal) close(null);
+            });
+            modal.querySelector('.add-op-ok')?.addEventListener('click', () => {
+                const workDate = String(modal.querySelector('.add-op-date')?.value || '').trim();
+                const startHm = String(modal.querySelector('.add-op-start')?.value || '').trim();
+                const endHm = String(modal.querySelector('.add-op-end')?.value || '').trim();
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate) || workDate > today) {
+                    showError('Choisis une date, aujourd’hui ou dans le passé.');
+                    return;
+                }
+                if (!/^\d{2}:\d{2}$/.test(startHm)) {
+                    showError('Choisis une heure de début.');
+                    return;
+                }
+                if (endHm && (!/^\d{2}:\d{2}$/.test(endHm) || endHm <= startHm)) {
+                    showError('L’heure de fin doit être après l’heure de début.');
+                    return;
+                }
+                close({ workDate, startHm, endHm });
+            });
+            document.body.appendChild(modal);
+            modal.querySelector('.add-op-date')?.focus();
+        });
+    }
+
+    /** Jour proposé à l'ajout : le jour affiché, ou aujourd'hui en vue semaine / mois. */
+    _defaultAdminAddDate() {
+        const periodFilter = this.domCache.get('periodFilter') || document.getElementById('periodFilter');
+        const period = periodFilter?.value || 'month';
+        const today = toLocalDateOnlyString(new Date());
+        if (period === 'today') return today;
+        if (period === 'yesterday') {
+            const y = new Date();
+            y.setDate(y.getDate() - 1);
+            return toLocalDateOnlyString(y);
+        }
+        if (period === 'custom') {
+            const pick = (this.domCache.get('adminDatePicker') || document.getElementById('adminDatePicker'))?.value?.trim();
+            if (pick) return pick;
+        }
+        return today;
+    }
+
+    /**
+     * Si le filtre affiche un seul jour (aujourd'hui, hier, calendrier) qui n'est pas
+     * celui de la ligne, basculer sur le jour de la ligne. Mois / semaine inchangés.
+     */
+    _keepAdminPeriodOnRecordDay(recordDay) {
+        if (!recordDay) return;
+        const periodFilter = this.domCache.get('periodFilter') || document.getElementById('periodFilter');
+        const period = periodFilter?.value || 'month';
+        if (period === 'month' || period === 'week') return;
+
+        const today = toLocalDateOnlyString(new Date());
+        const yesterdayDate = new Date();
+        yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+        const yesterday = toLocalDateOnlyString(yesterdayDate);
+        const picker = this.domCache.get('adminDatePicker');
+        const shown = period === 'today'
+            ? today
+            : period === 'yesterday'
+                ? yesterday
+                : (picker?.value || today);
+        if (shown === recordDay) return;
+
+        if (periodFilter) periodFilter.value = 'custom';
+        if (picker) picker.value = recordDay;
+        this.syncAdminDatePickerUI();
+    }
+
+    /**
+     * Affiche le sélecteur de date lorsque la période « Un jour » est choisie.
+     */
+    syncAdminDatePickerUI() {
+        const periodFilter = this.domCache.get('periodFilter');
+        const group = this.domCache.get('adminDatePickerGroup');
+        const picker = this.domCache.get('adminDatePicker');
+        if (!group || !picker) return;
+        const period = periodFilter?.value || 'today';
+        if (period === 'custom') {
+            group.style.display = '';
+            if (!picker.value) {
+                const n = new Date();
+                const y = n.getFullYear();
+                const m = String(n.getMonth() + 1).padStart(2, '0');
+                const d = String(n.getDate()).padStart(2, '0');
+                picker.value = `${y}-${m}-${d}`;
+            }
+        } else {
+            group.style.display = 'none';
+        }
+    }
+
+    _setOperationsTableRefreshing(isRefreshing) {
+        const container = this.operationsTableBody?.closest('.table-container')
+            || document.getElementById('operationsTable')?.closest('.table-container');
+        if (container) container.classList.toggle('is-refreshing', Boolean(isRefreshing));
+    }
+
+    _hasVisibleOperationRows() {
+        if (!this.operationsTableBody) return false;
+        return Boolean(this.operationsTableBody.querySelector('tr:not(.empty-state-row)'));
+    }
+
+    async loadData(enableAutoConsolidate = true, options = {}) {
+        if (this.isLoading) {
+            this.logger.log('Chargement déjà en cours, ignorer...');
+            return;
+        }
+        
+        try {
+            this.isLoading = true;
+            const seq = ++this._loadSeq;
+            const silent = options?.silent === true || this._isAutoRefresh === true;
+            const keepExistingRows = silent || this._hasVisibleOperationRows();
+
+            this._setOperationsTableRefreshing(keepExistingRows);
+            if (!keepExistingRows && this.operationsTableBody) {
+                clearElement(this.operationsTableBody);
+                const row = createElement('tr', { className: 'empty-state-row' });
+                const cell = createTableCell('', { colspan: '9', className: 'empty-state' });
+                cell.appendChild(
+                    createElement(
+                        'div',
+                        { style: { textAlign: 'center', padding: '1.5rem', color: '#666' } },
+                        'Chargement...'
+                    )
+                );
+                row.appendChild(cell);
+                this.operationsTableBody.appendChild(row);
+            }
+            
+            // Charger les opérateurs connectés et les données admin en parallèle avec timeout
+            // Appliquer la période sélectionnée pour la partie monitoring (ABTEMPS_OPERATEURS)
+            const now = new Date();
+            // IMPORTANT: utiliser une date LOCALE (pas UTC) pour correspondre à CAST(DateCreation AS DATE) côté SQL.
+            // toISOString() utilise UTC et peut décaler d'un jour (dashboard vide alors que l'opérateur voit des opérations).
+            const toLocalDateOnly = (d) => {
+                const x = new Date(d);
+                const y = x.getFullYear();
+                const m = String(x.getMonth() + 1).padStart(2, '0');
+                const day = String(x.getDate()).padStart(2, '0');
+                return `${y}-${m}-${day}`;
+            };
+            const today = toLocalDateOnly(now);
+            const periodFilter = this.domCache.get('periodFilter');
+            const period = periodFilter?.value || 'today';
+            this.syncAdminDatePickerUI();
+
+            const toDateOnly = toLocalDateOnly;
+            const startOfWeekMonday = (d) => {
+                const x = new Date(d);
+                x.setHours(0, 0, 0, 0);
+                const day = x.getDay(); // 0=dim, 1=lun...
+                const diff = (day === 0 ? -6 : 1) - day; // revenir au lundi
+                x.setDate(x.getDate() + diff);
+                return x;
+            };
+            const startOfMonth = (d) => {
+                const x = new Date(d.getFullYear(), d.getMonth(), 1);
+                x.setHours(0, 0, 0, 0);
+                return x;
+            };
+
+            const periodRange = (() => {
+                if (period === 'yesterday') {
+                    const y = new Date(now);
+                    y.setDate(y.getDate() - 1);
+                    return { date: toDateOnly(y) };
+                }
+                if (period === 'week') {
+                    const start = startOfWeekMonday(now);
+                    return { dateStart: toDateOnly(start), dateEnd: today };
+                }
+                if (period === 'month') {
+                    const start = startOfMonth(now);
+                    return { dateStart: toDateOnly(start), dateEnd: today };
+                }
+                if (period === 'custom') {
+                    const pick = this.domCache.get('adminDatePicker')?.value?.trim();
+                    if (pick) return { date: pick };
+                    return { date: today };
+                }
+                // today: une seule journée
+                return { date: today };
+            })();
+            
+            // Créer une promesse avec timeout (⚠️ toujours clearTimeout sinon rejection non gérée plus tard)
+            this.timeoutId = null;
+            const timeoutPromise = new Promise((_, reject) => {
+                this.timeoutId = setTimeout(() => reject(new Error('Timeout: La requête a pris trop de temps')), ADMIN_CONFIG.TIMEOUT_DURATION);
+            });
+            // Important: attacher un handler immédiatement pour éviter les "Unhandled Rejection"
+            // même si le timeout se déclenche après coup (ou dans des environnements de test).
+            const timeoutPromiseHandled = timeoutPromise.catch((e) => { throw e; });
+            
+            // Charger le minimum en parallèle (⚡ éviter de bloquer loadData sur /operators/all qui peut être lent)
+            // Pour les périodes multi-jours (semaine, mois), passer la plage dateStart/dateEnd au backend
+            const adminDateStart = periodRange.dateStart || null;
+            const adminDateEnd = periodRange.dateEnd || null;
+            const adminDate = periodRange.date || today;
+            const dataPromises = Promise.all([
+                this.apiService.getAdminData(adminDate, adminDateStart, adminDateEnd),
+                this.apiService.getConnectedOperators()
+            ]);
+            
+            let adminData, operatorsData;
+            try {
+                [adminData, operatorsData] = await Promise.race([
+                    dataPromises,
+                    timeoutPromiseHandled
+                ]);
+            } finally {
+                if (this.timeoutId) {
+                    clearTimeout(this.timeoutId);
+                    this.timeoutId = null;
+                }
+            }
+            
+            // Les données sont déjà parsées par ApiService
+            const data = adminData;
+
+            // Si une autre requête a été lancée entre-temps, ignorer cette réponse
+            if (seq !== this._loadSeq) return;
+            
+            // Charger les opérations consolidées depuis ABTEMPS_OPERATEURS
+            const operatorFilter = this.domCache.get('operatorFilter');
+            const searchFilter = this.domCache.get('searchFilter');
+            const operatorCode = this.selectedOperatorCode || operatorFilter?.value || undefined;
+            const lancementCode = searchFilter?.value?.trim() || undefined;
+            this._fetchedOperatorCode = operatorCode || '';
+
+            const filters = { ...periodRange, includeAllStatuses: true };
+            if (operatorCode) filters.operatorCode = operatorCode;
+            if (lancementCode) filters.lancementCode = lancementCode;
+
+            // Charger les enregistrements consolidés depuis ABTEMPS_OPERATEURS
+            const monitoringResult = await this.apiService.getMonitoringTemps(filters);
+            let consolidatedOps = [];
+            if (monitoringResult && monitoringResult.success) {
+                consolidatedOps = monitoringResult.data || [];
+            }
+            // Conservé pour le transfert : les lignes consolidées peuvent être masquées à l'affichage
+            // quand des segments SILOG existent pour le même opérateur/LT/jour.
+            this._consolidatedOpsRaw = consolidatedOps;
+
+            if (seq !== this._loadSeq) return;
+            
+            // Convertir les opérations de getAdminData au format monitoring (non consolidées)
+            let adminOps = [];
+            if (data && data.operations && data.operations.length > 0) {
+                adminOps = data.operations.map(op => {
+                    const isPauseRow = op.type === 'pause' || op._isPauseRow === true;
+                    return {
+                    // IMPORTANT:
+                    // - TempsId = identifiant de ABTEMPS_OPERATEURS (consolidé)
+                    // - EventId / id = identifiant de ABHISTORIQUE_OPERATEURS (non consolidé)
+                    // Ne JAMAIS surcharger TempsId avec un NoEnreg, sinon les routes /admin/monitoring/:tempsId feront 404.
+                    TempsId: null,
+                    EventId: op.id,
+                    id: op.id,
+                    OperatorCode: op.operatorId,
+                    OperatorName: op.operatorName,
+                    LancementCode: op.lancementCode,
+                    LancementName: op.article,
+                    StartTime: op.startTime,
+                    EndTime: op.endTime,
+                    startTime: op.startTime,
+                    endTime: op.endTime,
+                    TotalDuration: op.duration ? Number.parseInt(op.duration.replace(/[^0-9]/g, '')) : null,
+                    PauseDuration: op.pauseDuration ? Number.parseInt(op.pauseDuration.replace(/[^0-9]/g, '')) : 0,
+                    ProductiveDuration: null,
+                    EventsCount: op.events || 0,
+                    // Ne PAS fabriquer de valeurs: sinon la clé de dédoublonnage diverge de la ligne
+                    // consolidée (ABTEMPS) et l'on obtient des doublons + le code opérateur affiché
+                    // à tort dans la colonne étape.
+                    Phase: op.phase || null,
+                    CodeRubrique: op.codeRubrique || null,
+                    // Libellé ERP de l'étape (LCTC.CodeOperation) résolu côté backend
+                    Fabrication: op.Fabrication || op.fabrication || null,
+                    StatutTraitement: null,
+                    Status: op.status || 'En cours',
+                    StatusCode: op.statusCode || 'EN_COURS',
+                    status: op.status || 'En cours',
+                    statusCode: op.statusCode || 'EN_COURS',
+                    type: op.type || 'lancement',
+                    _isPauseRow: isPauseRow,
+                    _isWorkSegment: op._isWorkSegment === true,
+                    DateCreation: op.dateCreation || op.DateCreation || today,
+                    CalculatedAt: null,
+                    CalculationMethod: null,
+                    _isUnconsolidated: isPauseRow ? false : true
+                };
+                });
+            }
+            
+            // Appliquer les filtres sur les opérations non consolidées
+            let filteredAdminOps = adminOps;
+            if (operatorCode) {
+                filteredAdminOps = filteredAdminOps.filter(op => op.OperatorCode === operatorCode);
+            }
+            if (lancementCode) {
+                filteredAdminOps = filteredAdminOps.filter(op => 
+                    op.LancementCode.toLowerCase().includes(lancementCode.toLowerCase())
+                );
+            }
+            
+            // Fusionner les opérations SANS doublons logiques:
+            // - Chaque ligne ABTEMPS (TempsId) reste distincte même si même LT / phase / rubrique
+            // - Les événements non consolidés sont distingués par EventId / id
+            // - Sinon on dédoublonne par (opérateur, lancement, phase, rubrique, heure début) pour l'overlay historique
+            const mergedMap = new Map();
+
+            const normalizeKey = (op) => {
+                const tid = op?.TempsId ?? op?.tempsId;
+                if (tid != null && String(tid).trim() !== '') {
+                    return `T:${String(tid).trim()}`;
+                }
+                const eid = op?.EventId ?? (op?._isUnconsolidated ? op?.id : null);
+                if (eid != null && String(eid).trim() !== '') {
+                    return `E:${String(eid).trim()}`;
+                }
+                const operator = (op?.OperatorCode ?? op?.operatorId ?? op?.OperatorId ?? '').toString().trim();
+                const lancement = (op?.LancementCode ?? op?.lancementCode ?? '').toString().trim().toUpperCase();
+                const phase = (op?.Phase ?? op?.phase ?? '').toString().trim().toUpperCase();
+                const rubrique = (op?.CodeRubrique ?? op?.codeRubrique ?? '').toString().trim().toUpperCase();
+                const startRaw = op?.StartTime ?? op?.startTime ?? '';
+                const startKey = (typeof startRaw === 'string' ? startRaw : (startRaw && startRaw.toISOString ? startRaw.toISOString() : String(startRaw))).trim();
+                return `${operator}_${lancement}_${phase}_${rubrique}_S:${startKey}`;
+            };
+
+            const toHHmm = (dt) => {
+                const f = this.formatDateTime(dt);
+                return (f && f !== '-') ? f : '';
+            };
+
+            const isMidnight = (dt) => toHHmm(dt) === '00:00';
+
+            const scoreOp = (op) => {
+                // Score plus élevé = on garde cet enregistrement
+                let score = 0;
+                if (op?.TempsId) score += 100; // consolidé
+                if (op?._isUnconsolidated) score -= 1;
+
+                const st = op?.StartTime ?? op?.startTime;
+                const et = op?.EndTime ?? op?.endTime;
+
+                if (st) score += isMidnight(st) ? -20 : 10;
+                if (et) score += isMidnight(et) ? -20 : 10;
+
+                // Bonus si opération réellement terminée
+                if (this.isOperationTerminated(op)) score += 5;
+                return score;
+            };
+
+            const chooseBest = (a, b) => {
+                const sa = scoreOp(a);
+                const sb = scoreOp(b);
+                if (sa !== sb) return sa > sb ? a : b;
+
+                // Tie-break: TempsId le plus récent si présent
+                const ta = a?.TempsId ? Number.parseInt(a.TempsId, 10) : 0;
+                const tb = b?.TempsId ? Number.parseInt(b.TempsId, 10) : 0;
+                if (ta !== tb) return ta > tb ? a : b;
+
+                return a; // stable
+            };
+            
+            // D'abord ajouter les opérations de monitoring (consolidées)
+            consolidatedOps.forEach(op => {
+                const key = normalizeKey(op);
+                const existing = mergedMap.get(key);
+                mergedMap.set(key, existing ? chooseBest(existing, op) : op);
+            });
+            
+            // Ensuite ajouter les opérations admin (non consolidées)
+            filteredAdminOps.forEach(op => {
+                const key = normalizeKey(op);
+                const existing = mergedMap.get(key);
+                mergedMap.set(key, existing ? chooseBest(existing, op) : op);
+            });
+            
+            this.operations = this._dedupeAdminIdenticalSlotRows(
+                this._dedupeAdminConsolidatedOverlay(
+                    this._preferWorkSegmentsOverConsolidated(Array.from(mergedMap.values()))
+                )
+            );
+            
+            // Consolidation automatique des opérations terminées sans TempsId (éviter les "lancement non consolidé")
+            if (enableAutoConsolidate && !this._isConsolidating) {
+                const terminatedWithoutTempsId = this.operations.filter(op =>
+                    !op._isPauseRow &&
+                    this.isOperationTerminated(op) && !op.TempsId && (op._isUnconsolidated === true || op.OperatorCode)
+                );
+                // Une ligne qui ne se consolide pas n'est retentée qu'après 10 min
+                // (sinon un POST + un rechargement complet toutes les 30s, indéfiniment)
+                const attempts = this._autoConsolidateAttempts || (this._autoConsolidateAttempts = new Map());
+                const nowMs = Date.now();
+                const seen = new Set();
+                const toConsolidate = terminatedWithoutTempsId
+                    .map(op => ({ OperatorCode: op.OperatorCode, LancementCode: op.LancementCode }))
+                    .filter(({ OperatorCode, LancementCode }) => {
+                        const key = `${OperatorCode}|${LancementCode}`;
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        const last = attempts.get(key);
+                        if (last && nowMs - last < 10 * 60 * 1000) return false;
+                        attempts.set(key, nowMs);
+                        return true;
+                    });
+                if (toConsolidate.length > 0) {
+                    this._isConsolidating = true;
+                    this.apiService.consolidateMonitoringBatch(toConsolidate)
+                        .then(async (consolidateResult) => {
+                            const ok = consolidateResult?.results?.success || [];
+                            if (ok.length > 0) {
+                                this.logger.log(`Consolidation auto: ${ok.length} opération(s) consolidée(s)`);
+                                await this.loadData(false);
+                            }
+                        })
+                        .catch((err) => {
+                            this.logger.warn('Consolidation auto (arrière-plan) échouée:', err?.message || err);
+                        })
+                        .finally(() => {
+                            this._isConsolidating = false;
+                        });
+                }
+            }
+            
+            // Réinitialiser le compteur d'erreurs en cas de succès
+            this.consecutiveErrors = 0;
+            
+            // Stats/pagination: proviennent de /api/admin
+            this.pagination = data?.pagination || null;
+            
+            if (data && data.stats) {
+                this.stats = data.stats;
+            } else {
+                this.stats = {
+                    totalOperators: 0,
+                    activeLancements: 0,
+                    pausedLancements: 0,
+                    completedLancements: 0
+                };
+            }
+            
+            // Mettre à jour le menu déroulant des opérateurs avec les deux listes
+            const connectedOps = operatorsData?.operators || [];
+            // Utiliser une cache locale pour la liste complète (évite de re-télécharger pendant les refresh)
+            const cachedAll = this._allOperatorsCache || [];
+            if (connectedOps.length > 0 || cachedAll.length > 0) {
+                this.updateOperatorSelect(connectedOps, cachedAll);
+                this.lastOperatorsUpdate = Date.now();
+            }
+
+            // Charger "tous les opérateurs" en arrière-plan (rarement), sans bloquer loadData
+            const allCacheAge = Date.now() - (this._allOperatorsCacheAt || 0);
+            const shouldRefreshAll = !this._allOperatorsCacheAt || allCacheAge > 10 * 60 * 1000; // 10 minutes
+            if (shouldRefreshAll) {
+                this.apiService.getAllOperators()
+                    .then((allOperatorsData) => {
+                        const allOps = allOperatorsData?.operators || [];
+                        this._allOperatorsCache = allOps;
+                        this._allOperatorsCacheAt = Date.now();
+                        if (connectedOps.length > 0 || allOps.length > 0) {
+                            this.updateOperatorSelect(connectedOps, allOps);
+                            this.lastOperatorsUpdate = Date.now();
+                        }
+                    })
+                    .catch((e) => {
+                        this.logger.warn('⚠️ Impossible de charger la liste globale des opérateurs (non bloquant):', e?.message || e);
+                    });
+            }
+            
+            // Mettre à jour l'affichage des opérateurs connectés (toujours, même si vide)
+            this.updateActiveOperatorsDisplay(connectedOps);
+            
+            // updateStats() est appelé depuis updateOperationsTable() avec les mêmes filtres que le tableau
+            // (évite un KPI calculé sur l’ancien _lastFilteredOperationsForStats ou des données incohérentes)
+            this.updateOperationsTable();
+            this.updatePaginationInfo();
+        } catch (error) {
+            // Masquer l'indicateur de chargement en cas d'erreur
+            this.loadingIndicator.hide('loadData');
+            const isRateLimitError = this.errorHandler.isRateLimitError(error);
+            
+            if (isRateLimitError) {
+                // Pour les erreurs 429, augmenter significativement le compteur d'erreurs
+                this.consecutiveErrors += 3; // Équivalent à 3 erreurs normales
+                
+                // Augmenter l'intervalle de refresh temporairement
+                if (this.refreshInterval) {
+                    clearInterval(this.refreshInterval);
+                    this.refreshInterval = setInterval(() => {
+                        if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+                            this.logger.log(`⏸️ Refresh automatique désactivé (${this.consecutiveErrors} erreurs consécutives)`);
+                            return;
+                        }
+                        const timeSinceLastEdit = Date.now() - this.lastEditTime;
+                        if (!this.isLoading && timeSinceLastEdit > ADMIN_CONFIG.EDIT_COOLDOWN) {
+                            this.loadDataWithRetry();
+                        }
+                    }, ADMIN_CONFIG.OPERATORS_UPDATE_INTERVAL);
+                }
+                
+                // Afficher un message spécifique pour le rate limiting
+                if (this.consecutiveErrors <= 3) {
+                    this.notificationManager.warning('Trop de requêtes. Le rafraîchissement automatique est ralenti. Veuillez patienter...');
+                }
+            } else {
+                // Pour les autres erreurs, incrémenter normalement
+                this.consecutiveErrors++;
+                
+                // Ne pas spammer les notifications si trop d'erreurs
+                if (this.consecutiveErrors <= 2) {
+                    this.errorHandler.handle(error, 'loadData');
+                } else if (this.consecutiveErrors === this.maxConsecutiveErrors) {
+                    this.notificationManager.warning('Chargement automatique désactivé après plusieurs erreurs. Cliquez sur "Actualiser" pour réessayer.');
+                }
+            }
+            
+            // Mettre à jour l'indicateur des opérateurs même en cas d'erreur
+            this.updateActiveOperatorsDisplay([]);
+            
+            // Afficher les données en cache si disponibles
+            if (this.operations.length > 0) {
+                if (this.consecutiveErrors <= 2 && !isRateLimitError) {
+                    this.notificationManager.info('Affichage des données en cache');
+                }
+                this.updateOperationsTable();
+            } else {
+                // Afficher un message dans le tableau
+                this.showNoDataMessage();
+            }
+            
+            // Relancer l'erreur pour que loadDataWithRetry puisse la gérer
+            throw error;
+        } finally {
+            this.isLoading = false;
+            this._setOperationsTableRefreshing(false);
+            this.loadingIndicator.hide('loadData');
+        }
+    }
+
+    async loadDataWithRetry(maxRetries = 1) {
+        // Réduire les tentatives pour éviter les boucles infinies
+        // Le setInterval se chargera de réessayer plus tard
+        try {
+            this._isAutoRefresh = true; // Marquer comme auto-refresh pour ne pas afficher le loader
+            await this.loadData();
+        } catch (error) {
+            this.logger.warn(`Échec du chargement:`, error.message);
+            // Ne pas réessayer immédiatement, laisser le setInterval gérer
+            // Cela évite les boucles infinies
+        } finally {
+            this._isAutoRefresh = false;
+        }
+    }
+    
+    // Méthode pour réactiver le refresh automatique
+    resetConsecutiveErrors() {
+        this.consecutiveErrors = 0;
+        
+        // Réinitialiser l'intervalle de refresh
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+            this.refreshInterval = setInterval(() => {
+                if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+                    this.logger.log(`⏸️ Refresh automatique désactivé (${this.consecutiveErrors} erreurs consécutives)`);
+                    return;
+                }
+                const timeSinceLastEdit = Date.now() - this.lastEditTime;
+                if (!this.isLoading && timeSinceLastEdit > ADMIN_CONFIG.EDIT_COOLDOWN) {
+                    this.loadDataWithRetry();
+                }
+            }, ADMIN_CONFIG.REFRESH_INTERVAL);
+        }
+        
+        this.logger.log('✅ Compteur d\'erreurs réinitialisé, refresh automatique réactivé');
+    }
+    
+    /**
+     * Nettoie tous les timers et ressources
+     * À appeler lors de la destruction du composant
+     */
+    destroy() {
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+            this.refreshInterval = null;
+        }
+        if (this.operatorsInterval) {
+            clearInterval(this.operatorsInterval);
+            this.operatorsInterval = null;
+        }
+        if (this.autoSaveTimer) {
+            clearInterval(this.autoSaveTimer);
+            this.autoSaveTimer = null;
+        }
+        if (this.timeoutId) {
+            clearTimeout(this.timeoutId);
+            this.timeoutId = null;
+        }
+        this.domCache.clear();
+        this.logger.log('✅ AdminPage détruit, toutes les ressources nettoyées');
+    }
+
+    // ===== Monitoring (ABTEMPS_OPERATEURS) =====
+    // NOTE: Cette fonction est maintenant principalement utilisée pour le rechargement après modifications
+    // Le chargement principal est fait dans loadData() pour éviter les doubles appels API
+    async loadMonitoringRecords(date) {
+        try {
+            const operatorCode = document.getElementById('operatorFilter')?.value || undefined;
+            const lancementCode = document.getElementById('searchFilter')?.value?.trim() || undefined;
+
+            const filters = { date, includeAllStatuses: true };
+            if (operatorCode) filters.operatorCode = operatorCode;
+            if (lancementCode) filters.lancementCode = lancementCode;
+
+            // Charger uniquement les enregistrements consolidés depuis ABTEMPS_OPERATEURS
+            const result = await this.apiService.getMonitoringTemps(filters);
+            if (result && result.success) {
+                this.operations = result.data || [];
+            } else {
+                this.operations = [];
+            }
+        } catch (error) {
+            this.logger.error('❌ Erreur loadMonitoringRecords:', error);
+            this.operations = [];
+        }
+    }
+
+    /**
+     * Heure de fin « réelle » : exclut minuit / 00:00 souvent renvoyé par SQL comme placeholder pour une opération encore ouverte.
+     */
+    hasMeaningfulEndTime(op) {
+        const raw = op?.EndTime ?? op?.endTime;
+        if (raw == null) return false;
+        if (typeof raw === 'string') {
+            const s = raw.trim();
+            if (!s || s === '-' || s.toUpperCase() === 'N/A') return false;
+        }
+        const formatted = this.formatDateTime(raw);
+        if (!formatted || formatted === '-' || formatted === 'N/A') return false;
+        if (formatted === '00:00' || formatted.startsWith('00:00')) return false;
+        return true;
+    }
+
+    /**
+     * Statut métier pour filtres / KPI : le statut explicite l’emporte sur une heure de fin parasite (ex. 00:00).
+     */
+    normalizeOperationStatus(op) {
+        const status = (op?.StatusCode || op?.statusCode || '').toString().toUpperCase();
+        const statusLabel = (op?.Status || op?.status || '').toString().toUpperCase();
+        if (status === 'PAUSE_TERMINEE' || statusLabel.includes('PAUSE TERMIN')) return 'PAUSE_TERMINEE';
+        if (status.includes('EN_COURS') || statusLabel.includes('EN COURS') || statusLabel.includes('ENCOURS')) return 'EN_COURS';
+        if (status === 'EN_PAUSE' || statusLabel.includes('EN PAUSE')) return 'EN_PAUSE';
+        if (status.includes('PAUSE') || statusLabel.includes('PAUSE')) return 'EN_PAUSE';
+        if (status.includes('TERMINE') || statusLabel.includes('TERMIN')) return 'TERMINE';
+        if (this.hasMeaningfulEndTime(op)) return 'TERMINE';
+        return 'EN_COURS';
+    }
+
+    updateStats(opsOverride = null) {
+        // Calculer les statistiques depuis les opérations affichées dans le tableau
+        // Cela garantit la cohérence entre le tableau et les statistiques
+        const allOps = (Array.isArray(opsOverride) ? opsOverride : (this._lastFilteredOperationsForStats || this.operations || []))
+            .filter(op => !op?._isPauseRow);
+
+        const getOperatorCode = (op) => {
+            // Best-effort selon les différentes sources (admin ops vs monitoring)
+            const raw =
+                op?.operatorCode ??
+                op?.OperatorCode ??
+                op?.CodeOperateur ??
+                op?.code ??
+                op?.CodeRessource ??
+                '';
+            return String(raw || '').trim();
+        };
+
+        const getLancementCode = (op) => {
+            const raw = op?.LancementCode ?? op?.lancementCode ?? op?.CodeLancement ?? '';
+            return String(raw || '').trim().toUpperCase();
+        };
+        
+        // Compter les opérations par statut depuis les données réelles
+        const activeOps = allOps.filter(op => this.normalizeOperationStatus(op) === 'EN_COURS');
+
+        const pausedOps = allOps.filter(op => this.normalizeOperationStatus(op) === 'EN_PAUSE');
+
+        const completedOps = allOps.filter(op => this.normalizeOperationStatus(op) === 'TERMINE');
+
+        const completedLt = new Set(completedOps.map(getLancementCode).filter(Boolean));
+
+        // KPI « en cours / pause » : nombre de LIGNES d’opération (plusieurs opérateurs sur le même LT
+        // comptent chacun une fois). L’ancien comptage par Set(LT) sous-estimait ce cas (ex. 8 opérateurs → 5 LT).
+        const activeLancementsCount = activeOps.length;
+        const pausedLancementsCount = pausedOps.length;
+
+        // Opérateurs "actifs" = ont au moins une opération EN_COURS / EN_PAUSE affichée
+        const activeOperatorCodes = new Set(
+            [...activeOps, ...pausedOps]
+                .map(getOperatorCode)
+                .filter(Boolean)
+        );
+        
+        // Opérateurs « actifs » = alignés sur les lignes du tableau (évite ex. 10 au bandeau et 9 dans la liste)
+        const stats = {
+            totalOperators: activeOperatorCodes.size,
+            activeLancements: activeLancementsCount,
+            pausedLancements: pausedLancementsCount,
+            // Terminés : rester sur des LT distincts (évite de gonfler l’affichage avec toutes les lignes historiques)
+            completedLancements: completedLt.size
+        };
+        
+        // Mettre à jour les éléments DOM
+        if (this.totalOperators) {
+            this.totalOperators.textContent = stats.totalOperators;
+        }
+        if (this.activeLancements) {
+            this.activeLancements.textContent = stats.activeLancements;
+        }
+        if (this.pausedLancements) {
+            this.pausedLancements.textContent = stats.pausedLancements;
+        }
+        if (this.completedLancements) {
+            this.completedLancements.textContent = stats.completedLancements;
+        }
+        
+        // Mettre à jour this.stats pour la cohérence
+        this.stats = stats;
+        
+        // Log pour debug
+        this.logger.log('📊 Statistiques mises à jour depuis les données du tableau:', stats);
+    }
+
+    showNoDataMessage() {
+        if (!this.operationsTableBody) return;
+        
+        clearElement(this.operationsTableBody);
+        
+        const row = createElement('tr');
+        const cell = createTableCell('', { colspan: '9', style: { textAlign: 'center', padding: '2rem', color: '#dc3545' } });
+        
+        const icon = createElement('i', { className: 'fas fa-exclamation-triangle', style: { fontSize: '2rem', marginBottom: '1rem', display: 'block' } });
+        cell.appendChild(icon);
+        
+        const br1 = createElement('br');
+        cell.appendChild(br1);
+        
+        const strong = createElement('strong', {}, 'Erreur de chargement des données');
+        cell.appendChild(strong);
+        
+        const br2 = createElement('br');
+        cell.appendChild(br2);
+        
+        const small = createElement('small', {}, 'Vérifiez la connexion au serveur et réessayez');
+        cell.appendChild(small);
+        
+        const br3 = createElement('br');
+        cell.appendChild(br3);
+        
+        const retryBtn = createButton({
+            icon: 'fas fa-refresh',
+            className: 'btn btn-sm btn-outline-primary mt-2',
+            onClick: () => this.loadData()
+        });
+        retryBtn.appendChild(document.createTextNode(' Réessayer'));
+        cell.appendChild(retryBtn);
+        
+        row.appendChild(cell);
+        this.operationsTableBody.appendChild(row);
+    }
+
+    showRateLimitWarning() {
+        this.logger.warn('⚠️ Rate limit atteint - affichage du message d\'avertissement');
+        
+        // Afficher un message d'erreur dans l'interface
+        const errorDiv = createElement('div', { className: 'rate-limit-warning' });
+        
+        const innerDiv = createElement('div', {
+            style: {
+                background: 'linear-gradient(135deg, #ff6b6b, #ee5a52)',
+                color: 'white',
+                padding: '16px 20px',
+                borderRadius: '12px',
+                margin: '20px',
+                textAlign: 'center',
+                boxShadow: '0 4px 12px rgba(255, 107, 107, 0.3)',
+                animation: 'slideIn 0.3s ease-out'
+            }
+        });
+        
+        const icon = createElement('i', { 
+            className: 'fas fa-exclamation-triangle',
+            style: { fontSize: '24px', marginBottom: '8px', display: 'block' }
+        });
+        innerDiv.appendChild(icon);
+        
+        const h3 = createElement('h3', { style: { margin: '0 0 8px 0', fontSize: '18px' } }, 'Trop de requêtes');
+        innerDiv.appendChild(h3);
+        
+        const p = createElement('p', { style: { margin: '0', opacity: '0.9' } }, 
+            'Le serveur est temporairement surchargé. Veuillez patienter quelques secondes avant de recharger.');
+        innerDiv.appendChild(p);
+        
+        const retryBtn = createButton({
+            icon: 'fas fa-refresh',
+            className: '',
+            onClick: () => {
+                errorDiv.remove();
+                this.loadData();
+            }
+        });
+        retryBtn.style.cssText = 'background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); color: white; padding: 8px 16px; border-radius: 6px; margin-top: 12px; cursor: pointer; transition: all 0.2s ease;';
+        retryBtn.appendChild(document.createTextNode(' Réessayer'));
+        retryBtn.addEventListener('mouseover', () => retryBtn.style.background = 'rgba(255,255,255,0.3)');
+        retryBtn.addEventListener('mouseout', () => retryBtn.style.background = 'rgba(255,255,255,0.2)');
+        innerDiv.appendChild(retryBtn);
+        
+        errorDiv.appendChild(innerDiv);
+        
+        // Insérer le message au début du contenu principal
+        const mainContent = document.querySelector('.admin-content') || document.querySelector('main');
+        if (mainContent) {
+            mainContent.insertBefore(errorDiv, mainContent.firstChild);
+        }
+        
+        // Auto-supprimer après 10 secondes
+        setTimeout(() => {
+            if (errorDiv.parentElement) {
+                errorDiv.remove();
+            }
+        }, 10000);
+    }
+
+    updateOperatorSelect(connectedOperators = [], allOperators = []) {
+        this.logger.log('🔄 Mise à jour du menu déroulant des opérateurs:', {
+            connectés: connectedOperators.length,
+            globaux: allOperators.length
+        });
+
+        const previousSelected =
+            this.selectedOperatorCode ||
+            this.operatorSelect?.value ||
+            '';
+
+        // Liste identique au dernier rafraîchissement : ne pas reconstruire le menu
+        // (sinon il se referme / clignote toutes les 30s pendant que l'admin l'utilise)
+        const signature = JSON.stringify([
+            connectedOperators.map(op => [op.code, op.name, op.isProperlyLinked, op.isActive, op.resourceCode, op.currentStatus]),
+            allOperators.map(op => [op.code, op.name, op.isConnected, op.type])
+        ]);
+        if (signature === this._operatorSelectSignature && this.operatorSelect?.options?.length > 0) {
+            return;
+        }
+        this._operatorSelectSignature = signature;
+        
+        // Vider le select et ajouter l'option par défaut
+        clearElement(this.operatorSelect);
+        const defaultOption = createElement('option', { value: '' }, 'Tous les opérateurs');
+        this.operatorSelect.appendChild(defaultOption);
+        
+        // Trier les opérateurs par ordre alphabétique (nom, puis code)
+        const byName = (a, b) =>
+            String(a?.name || a?.code || '').localeCompare(String(b?.name || b?.code || ''), 'fr', { sensitivity: 'base' }) ||
+            String(a?.code || '').localeCompare(String(b?.code || ''), 'fr', { numeric: true });
+        connectedOperators = [...connectedOperators].sort(byName);
+        allOperators = [...allOperators].sort(byName);
+
+        // Créer un Set des codes d'opérateurs connectés pour vérification rapide
+        const connectedCodes = new Set(connectedOperators.map(op => op.code));
+        
+        // Section 1: Opérateurs connectés (en opération)
+        if (connectedOperators.length > 0) {
+            const optgroupConnected = document.createElement('optgroup');
+            optgroupConnected.label = `🟢 Opérateurs connectés (${connectedOperators.length})`;
+            
+            connectedOperators.forEach(operator => {
+            const option = document.createElement('option');
+            option.value = operator.code;
+            
+            // Indicateur visuel pour les opérateurs mal associés et actifs
+            let statusIcon = '';
+            if (operator.isProperlyLinked === false) {
+                statusIcon = ' ⚠️';
+            } else if (operator.isProperlyLinked === true) {
+                statusIcon = ' ✅';
+            }
+            
+            // Indicateur d'activité
+            if (operator.isActive) {
+                    statusIcon = ' 🔴' + statusIcon;
+                option.style.fontWeight = 'bold';
+                    option.style.color = '#dc3545';
+                } else {
+                    statusIcon = ' 🟢' + statusIcon;
+            }
+            
+            option.textContent = `${operator.name} (${operator.code})${statusIcon}`;
+            option.title = `Code: ${operator.code} | Ressource: ${operator.resourceCode || 'N/A'} | Statut: ${operator.currentStatus || 'N/A'}`;
+            
+                optgroupConnected.appendChild(option);
+            });
+            
+            this.operatorSelect.appendChild(optgroupConnected);
+        }
+        
+        // Section 2: Tous les opérateurs (globale)
+        if (allOperators.length > 0) {
+            const optgroupAll = document.createElement('optgroup');
+            optgroupAll.label = `📋 Tous les opérateurs (${allOperators.length})`;
+            
+            allOperators.forEach(operator => {
+                // Ne pas dupliquer les opérateurs déjà dans la liste connectés
+                if (connectedCodes.has(operator.code)) {
+                    return;
+                }
+                
+                const option = document.createElement('option');
+                option.value = operator.code;
+                
+                // Indicateur de connexion
+                let statusIcon = operator.isConnected ? ' 🟢' : ' ⚪';
+                
+                option.textContent = `${operator.name} (${operator.code})${statusIcon}`;
+                option.title = `Code: ${operator.code} | Type: ${operator.type || 'N/A'} | ${operator.isConnected ? 'Connecté' : 'Non connecté'}`;
+                
+                optgroupAll.appendChild(option);
+            });
+            
+            this.operatorSelect.appendChild(optgroupAll);
+        }
+
+        if (previousSelected) {
+            const exists = Array.from(this.operatorSelect.options || []).some(opt => String(opt.value) === String(previousSelected));
+            if (exists) {
+                this.operatorSelect.value = String(previousSelected);
+            } else {
+                // L'opérateur sélectionné n'est pas (encore) dans la liste rafraîchie
+                // (ex: liste globale pas encore chargée). On conserve son option pour
+                // ne pas réinitialiser silencieusement le filtre vers un autre opérateur.
+                const keepOption = createElement('option', { value: String(previousSelected) }, `Opérateur ${previousSelected}`);
+                this.operatorSelect.appendChild(keepOption);
+                this.operatorSelect.value = String(previousSelected);
+            }
+            // Préserver le filtre courant quoi qu'il arrive
+            this.selectedOperatorCode = String(previousSelected);
+        } else {
+            this.selectedOperatorCode = this.operatorSelect?.value || '';
+        }
+        
+        this.logger.log('✅ Menu déroulant mis à jour avec', connectedOperators.length, 'connectés et', allOperators.length, 'globaux');
+    }
+
+    // Nouvelle méthode pour mettre à jour le statut des opérateurs
+    async updateOperatorsStatus() {
+        // Éviter les requêtes si on vient de recevoir une erreur 429 récemment
+        const timeSinceLastUpdate = Date.now() - this.lastOperatorsUpdate;
+        if (timeSinceLastUpdate < 10000) {
+            this.logger.log(`⏸️ Mise à jour opérateurs ignorée (données récentes)`);
+            return;
+        }
+        
+        try {
+            const [connectedResponse, allOperatorsResponse] = await Promise.all([
+                this.apiService.getConnectedOperators(),
+                this.apiService.getAllOperators()
+            ]);
+            
+            const connectedOps = connectedResponse?.operators || [];
+            const allOps = allOperatorsResponse?.operators || [];
+            
+            if (connectedOps.length > 0 || allOps.length > 0) {
+                this.updateOperatorSelect(connectedOps, allOps);
+                this.lastOperatorsUpdate = Date.now(); // Mettre à jour le timestamp
+            }
+            
+            // Mettre à jour l'affichage des opérateurs actifs (toujours, même si vide)
+            this.updateActiveOperatorsDisplay(connectedOps);
+        } catch (error) {
+            this.errorHandler.handle(error, 'updateOperatorsStatus');
+            // Mettre à jour l'indicateur avec un état d'erreur
+            this.updateActiveOperatorsDisplay([]);
+            // En cas d'erreur 429, attendre plus longtemps avant la prochaine tentative
+            if (this.errorHandler.isRateLimitError(error)) {
+                this.lastOperatorsUpdate = Date.now() - 5000; // Forcer une attente de 15 secondes minimum
+                this.logger.log('⏸️ Rate limit détecté, attente prolongée avant la prochaine mise à jour');
+            }
+        }
+    }
+
+    // Afficher les opérateurs actifs
+    updateActiveOperatorsDisplay(operators = []) {
+        const activeOperators = operators.filter(op => op.isActive);
+        
+        // Mettre à jour un indicateur visuel des opérateurs actifs
+        const activeIndicator = this.domCache.get('activeOperatorsIndicator');
+        if (activeIndicator) {
+            clearElement(activeIndicator);
+            
+            if (activeOperators.length > 0) {
+                // Afficher les noms (max 3) + compteur
+                const names = activeOperators
+                    .slice(0, 3)
+                    .map(op => `${op.name || op.code} (${op.code})`)
+                    .join(', ');
+                const more = activeOperators.length > 3 ? ` +${activeOperators.length - 3}` : '';
+                const badge = createBadge(`🟢 ${names}${more}`, 'badge-success');
+                activeIndicator.appendChild(badge);
+            } else if (operators.length > 0) {
+                // Des opérateurs sont connectés mais aucun n'est actif
+                const names = operators
+                    .slice(0, 3)
+                    .map(op => `${op.name || op.code} (${op.code})`)
+                    .join(', ');
+                const more = operators.length > 3 ? ` +${operators.length - 3}` : '';
+                const badge = createBadge(`🟢 Connecté(s): ${names}${more}`, 'badge-secondary');
+                activeIndicator.appendChild(badge);
+            } else {
+                // Aucun opérateur connecté
+                const badge = createBadge('Aucun opérateur connecté', 'badge-secondary');
+                activeIndicator.appendChild(badge);
+            }
+        }
+        
+        // Log pour debug
+        if (activeOperators.length > 0) {
+            this.logger.log('🟢 Opérateurs actifs:', activeOperators.map(op => op.code).join(', '));
+        }
+    }
+
+    async handleOperatorChange() {
+        if (this.isLoading) {
+            this.logger.log('⚠️ Chargement en cours, ignorer le changement d\'opérateur');
+            return;
+        }
+        
+        const selectedOperator = this.operatorSelect.value;
+        this.selectedOperatorCode = selectedOperator || '';
+        const operatorCodeSearch = this.domCache.get('operatorCodeSearch');
+        if (selectedOperator && operatorCodeSearch?.value) {
+            operatorCodeSearch.value = '';
+        }
+        this.logger.log('🔄 Changement d\'opérateur sélectionné:', selectedOperator);
+
+        // En mode Monitoring, le filtre opérateur est appliqué via loadMonitoringRecords()
+        this.currentPage = 1;
+        if (this.selectedTempsIds && typeof this.selectedTempsIds.clear === 'function') {
+        this.selectedTempsIds.clear();
+        } else {
+            this.selectedTempsIds = new Set();
+        }
+        const selectAll = this.domCache.get('selectAllRows');
+        if (selectAll) selectAll.checked = false;
+        this.updateOperationsTable();
+        this.updatePaginationInfo();
+        this.loadData();
+    }
+
+    async handleAddOperation() {
+        try {
+            // Demander les informations pour la nouvelle ligne
+            const rawOperator = prompt('Opérateur (code, nom ou prénom) :');
+            if (!rawOperator) return;
+
+            const normalize = (s) =>
+                String(s || '')
+                    .trim()
+                    .toUpperCase()
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '');
+
+            const rawTrim = String(rawOperator).trim();
+            let operatorCode = rawTrim;
+
+            // Si l'admin tape un nom/prénom, retrouver le code opérateur depuis la liste RESSOURC
+            const isNumericCode = /^[0-9]+$/.test(rawTrim);
+            if (!isNumericCode) {
+                let allOps = [];
+                try {
+                    const res = await this.apiService.getAllOperators(true);
+                    allOps = res?.operators || res?.data?.operators || [];
+                } catch (e) {
+                    this.logger.warn('⚠️ Impossible de charger la liste des opérateurs (recherche par nom):', e?.message || e);
+                }
+
+                const q = normalize(rawTrim);
+                const matches = (allOps || [])
+                    .map(o => ({
+                        code: String(o.code || o.OperatorCode || '').trim(),
+                        name: String(o.name || o.NomOperateur || '').trim()
+                    }))
+                    .filter(o => o.code && o.name && normalize(o.name).includes(q));
+
+                if (matches.length === 0) {
+                    this.notificationManager.error(`Aucun opérateur trouvé pour "${rawTrim}".`);
+                    return;
+                }
+
+                if (matches.length === 1) {
+                    operatorCode = matches[0].code;
+                    this.notificationManager.info(`Opérateur trouvé: ${matches[0].name} (${operatorCode})`);
+                } else {
+                    // Laisser l'admin choisir si plusieurs résultats
+                    const top = matches.slice(0, 20);
+                    const lines = top.map((m, idx) => `${idx + 1}) ${m.name} (${m.code})`);
+                    const answer = window.prompt(
+                        `Plusieurs opérateurs correspondent à "${rawTrim}".\nChoisis le numéro:\n\n${lines.join('\n')}\n\nNuméro:`
+                    );
+                    const choiceIdx = Number.parseInt(String(answer || '').trim(), 10) - 1;
+                    const chosen = top[choiceIdx];
+                    if (!chosen) {
+                        this.notificationManager.error('Aucun opérateur sélectionné');
+                        return;
+                    }
+                    operatorCode = chosen.code;
+                    this.notificationManager.info(`Opérateur sélectionné: ${chosen.name} (${operatorCode})`);
+                }
+            }
+            
+            // Valider le code opérateur
+            if (!this.validator.validateOperatorCode(operatorCode)) {
+                this.notificationManager.error('Code opérateur invalide');
+                return;
+            }
+            
+            const lancementCode = prompt('Code lancement :');
+            if (!lancementCode) return;
+            
+            // Valider le code lancement
+            if (!this.validator.validateLancementCode(lancementCode)) {
+                this.notificationManager.error('Code lancement invalide');
+                return;
+            }
+            
+            // Étape (Phase + CodeRubrique) : ne demander que s'il y a plusieurs étapes
+            let codeOperation = null;
+            try {
+                const stepsRes = await this.apiService.getLancementSteps(lancementCode);
+                const steps = stepsRes?.steps || [];
+                const uniqueSteps = stepsRes?.uniqueSteps || [];
+                const stepCount = stepsRes?.stepCount ?? uniqueSteps.length;
+
+                if (Array.isArray(uniqueSteps) && stepCount > 1) {
+                    // Afficher une liste lisible des étapes (Phase (CodeRubrique) — Fabrication)
+                    const byStepId = new Map();
+                    (steps || []).forEach(s => {
+                        const stepId = String(s?.StepId || '').trim();
+                        if (!stepId || byStepId.has(stepId)) return;
+                        byStepId.set(stepId, String(s?.Label || stepId).trim());
+                    });
+                    const options = Array.from(byStepId.entries()).map(([stepId, label]) => ({ stepId, label }));
+                    const lines = options.map((o, idx) => `${idx + 1}) ${o.label}`);
+                    const answer = window.prompt(
+                        `Plusieurs étapes sont disponibles pour ${lancementCode}.\nChoisis le numéro:\n\n${lines.join('\n')}\n\nNuméro:`
+                    );
+                    const choiceIdx = Number.parseInt(String(answer || '').trim(), 10) - 1;
+                    const chosen = options[choiceIdx]?.stepId;
+                    if (!chosen) {
+                        this.notificationManager.error('Aucune étape sélectionnée');
+                        return;
+                    }
+                    codeOperation = chosen;
+                } else if (Array.isArray(uniqueSteps) && uniqueSteps.length === 1) {
+                    // Envoyer StepId (Phase|CodeRubrique) pour éviter les collisions quand CodeOperation est identique
+                    codeOperation = uniqueSteps[0];
+                }
+            } catch (e) {
+                // Best effort: si l'endpoint steps échoue, on laisse l'admin créer une ligne "ADMIN"
+                this.logger.warn('⚠️ Impossible de récupérer les étapes (CodeOperation) pour admin:', e?.message || e);
+            }
+
+            const phase = prompt('Phase (optionnel - laisser vide pour ERP/auto) :') || '';
+
+            const schedule = await this._pickAddSchedule(this._defaultAdminAddDate());
+            if (!schedule) return;
+            const { workDate, startHm, endHm } = schedule;
+            
+            // Créer une nouvelle opération
+            const newOperation = {
+                operatorId: operatorCode,
+                lancementCode: lancementCode,
+                phase: phase,
+                codeOperation,
+                date: workDate,
+                startTime: startHm,
+                endTime: endHm || undefined,
+                status: endHm ? 'FIN' : 'DEBUT'
+            };
+            
+            // Valider l'opération complète
+            const validation = this.validator.validateOperation({
+                operatorId: operatorCode,
+                lancementCode
+            });
+            if (!validation.valid) {
+                this.notificationManager.error(`Erreurs de validation:\n${validation.errors.join('\n')}`);
+                return;
+            }
+            
+            this.logger.log('Ajout d\'une nouvelle opération:', newOperation);
+            
+            // Afficher un indicateur de chargement
+            const addBtn = this.domCache.get('addOperationBtn');
+            this.loadingIndicator.show('addOperation', addBtn, 'Ajout en cours...');
+            
+            try {
+                // Appeler l'API pour ajouter l'opération
+                const result = await this.apiService.post('/admin/operations', newOperation);
+            
+                if (result.success) {
+                    if (result.warning) {
+                        this.notificationManager.warning(result.warning);
+                        this.logger.warn('⚠️ Avertissement:', result.warning);
+                    } else {
+                        this.notificationManager.success(result.message || 'Opération ajoutée avec succès');
+                    }
+                    this.logger.log('Opération ajoutée:', result);
+                    
+                    // Attendre un peu pour que le backend ait fini de traiter
+                    await new Promise(resolve => setTimeout(resolve, 500));
+
+                    this._keepAdminPeriodOnRecordDay(workDate);
+                    // Recharger les données pour afficher la nouvelle ligne
+                    await this.loadData();
+                } else {
+                    const errorMessage = result.error || 'Erreur inconnue lors de l\'ajout';
+                    this.notificationManager.error(`Erreur lors de l'ajout : ${errorMessage}`);
+                    this.logger.error('Erreur d\'ajout:', result);
+                    
+                    // Si le lancement n'existe pas, suggérer de le créer
+                    if (errorMessage.includes('n\'existe pas dans la base de données')) {
+                        const createLancement = confirm(
+                            `${errorMessage}\n\nVoulez-vous créer le lancement dans LCTE maintenant ?`
+                        );
+                        if (createLancement) {
+                            // TODO: Ouvrir un formulaire pour créer le lancement
+                            this.logger.log('Création du lancement demandée');
+                        }
+                    }
+                }
+            } finally {
+                // Masquer l'indicateur de chargement
+                this.loadingIndicator.hide('addOperation');
+            }
+        } catch (error) {
+            this.errorHandler.handle(error, 'handleAddOperation', 'Erreur de connexion lors de l\'ajout');
+            this.loadingIndicator.hide('addOperation');
+        }
+    }
+
+    updateOperationsTable() {
+        this.logger.log('🔄 DEBUT updateOperationsTable()');
+        this.logger.log('📊 OPERATIONS TOTALES:', this.operations.length);
+        this.logger.log('📋 TABLEAU BODY:', this.operationsTableBody);
+        
+        if (!this.operationsTableBody) {
+            this.logger.error('❌ ERREUR: operationsTableBody est null!');
+            return;
+        }
+        
+        // Appliquer les filtres
+        let filteredOperations = [...this.operations];
+        
+        // Filtre statut opération (EN_COURS / EN_PAUSE / TERMINE)
+        const statusFilter = document.getElementById('statusFilter');
+        const selectedOpStatus = statusFilter?.value?.toUpperCase().trim();
+
+        if (selectedOpStatus && selectedOpStatus !== '') {
+            filteredOperations = filteredOperations.filter(op => {
+                const st = String(op?.StatutTraitement ?? '').toUpperCase().trim();
+                if (selectedOpStatus === 'T') {
+                    return st === 'T';
+                }
+                if (selectedOpStatus === 'A') {
+                    return st === 'A';
+                }
+                // Hors filtres SILOG/attente : ne pas mélanger les lignes déjà basculées
+                if (st === 'T') {
+                    return false;
+                }
+                const normalized = this.normalizeOperationStatus(op);
+                if (selectedOpStatus === 'EN_COURS') return normalized === 'EN_COURS';
+                if (selectedOpStatus === 'EN_PAUSE') return normalized === 'EN_PAUSE';
+                if (selectedOpStatus === 'TERMINE') return normalized === 'TERMINE';
+                return true;
+            });
+        }
+        
+        // Filtre opérateur
+        const operatorSelect = this.domCache.get('operatorFilter');
+        const selectedOperatorCode = (this.selectedOperatorCode || operatorSelect?.value || '').toString().trim();
+        if (selectedOperatorCode) {
+            this.logger.log('👤 Filtrage par opérateur:', selectedOperatorCode);
+            filteredOperations = filteredOperations.filter(op => {
+                const opCode = (op.OperatorCode || op.operatorCode || op.operatorId || '').toString().trim();
+                return opCode === selectedOperatorCode;
+            });
+            this.logger.log(`📊 Après filtrage opérateur: ${filteredOperations.length} opérations`);
+        }
+        
+        // Filtre de recherche (code lancement)
+        const searchFilter = this.domCache.get('searchFilter');
+        if (searchFilter && searchFilter.value.trim()) {
+            const searchTerm = searchFilter.value.trim().toLowerCase();
+            this.logger.log('🔍 Filtrage par recherche:', searchTerm);
+            filteredOperations = filteredOperations.filter(op => {
+                const lancementCode = (op.LancementCode || op.lancementCode || '').toLowerCase();
+                return lancementCode.includes(searchTerm);
+            });
+            this.logger.log(`📊 Après filtrage recherche: ${filteredOperations.length} opérations`);
+        }
+
+        const operatorCodeSearch = this.domCache.get('operatorCodeSearch');
+        const operatorCodeTerm = String(operatorCodeSearch?.value || '').trim();
+        if (operatorCodeTerm) {
+            filteredOperations = filteredOperations.filter(op => {
+                const opCode = (op.OperatorCode || op.operatorCode || op.operatorId || '').toString().trim();
+                return opCode.includes(operatorCodeTerm);
+            });
+        }
+
+        // Transmis (T) : visibles et grisés. On masque seulement l'overlay historique
+        // qui répète exactement le même créneau (début + fin). Une ligne corrigée
+        // (autre heure, sans TempsId) reste affichée, même si un cycle du même jour est déjà T.
+        const transmittedExactSlots = new Set();
+        for (const op of this.operations || []) {
+            if (String(op?.StatutTraitement ?? '').toUpperCase().trim() !== 'T') continue;
+            transmittedExactSlots.add(this._getAdminMergeDedupSlotKey(op));
+        }
+        filteredOperations = filteredOperations.filter(op => {
+            if (!this.shouldShowAdminDashboardRow(op)) return false;
+            const isT = String(op?.StatutTraitement ?? '').toUpperCase().trim() === 'T';
+            if (isT) return true;
+            if (op?.TempsId != null && String(op.TempsId).trim() !== '') return true;
+            if (transmittedExactSlots.size === 0) return true;
+            return !transmittedExactSlots.has(this._getAdminMergeDedupSlotKey(op));
+        });
+
+        // Mémoriser pour stats cohérentes avec le tableau
+        this._lastFilteredOperationsForStats = filteredOperations;
+        this.updateStats(filteredOperations);
+
+        const scrollY = typeof window !== 'undefined' ? window.scrollY : 0;
+        const tableContainer = this.operationsTableBody?.closest('.table-container');
+        const tableScrollTop = tableContainer?.scrollTop || 0;
+        
+        clearElement(this.operationsTableBody);
+        
+        // Déterminer le message à afficher si aucune opération
+        let emptyMessage = '';
+        let emptySubMessage = '';
+        
+        if (filteredOperations.length === 0) {
+            this.logger.log('⚠️ AUCUNE OPERATION APRES FILTRAGE - AFFICHAGE MESSAGE');
+            this.logger.log('🔍 Filtres actifs:', {
+                statusFilter: statusFilter?.value || 'aucun',
+                searchFilter: searchFilter?.value || 'aucun',
+                totalOperations: this.operations.length
+            });
+            
+            // Message personnalisé selon les filtres actifs
+            if (statusFilter && statusFilter.value) {
+                const opLabels = {
+                    'EN_COURS': 'en cours',
+                    'EN_PAUSE': 'en pause',
+                    'TERMINE': 'terminés'
+                };
+                const statusLabel = opLabels[statusFilter.value] || statusFilter.value.toLowerCase();
+                emptyMessage = 'Aucun enregistrement trouvé';
+                emptySubMessage = `Il n'y a pas d'enregistrements ${statusLabel} pour la période sélectionnée`;
+            } else if (searchFilter && searchFilter.value.trim()) {
+                emptyMessage = 'Aucun lancement trouvé';
+                emptySubMessage = `Aucun lancement ne correspond à "${searchFilter.value.trim()}"`;
+            } else if (operatorCodeTerm) {
+                emptyMessage = 'Aucun opérateur trouvé';
+                emptySubMessage = `Aucun enregistrement pour le n° « ${operatorCodeTerm} »`;
+            } else if (this.operations.length === 0) {
+                emptyMessage = 'Aucun enregistrement trouvé';
+                emptySubMessage = 'Il n\'y a pas d\'enregistrements pour la date sélectionnée';
+            } else {
+                emptyMessage = 'Aucun enregistrement trouvé';
+                emptySubMessage = 'Aucun enregistrement ne correspond aux filtres sélectionnés';
+            }
+            
+            const row = createElement('tr', { className: 'empty-state-row' });
+            const cell = createTableCell('', { colspan: '9', className: 'empty-state' });
+            
+            const div = createElement('div', { style: { textAlign: 'center', padding: '3rem 2rem' } });
+            
+            const icon = createElement('i', { 
+                className: 'fas fa-inbox',
+                style: { fontSize: '3rem', color: '#ccc', marginBottom: '1rem', display: 'block' }
+            });
+            div.appendChild(icon);
+            
+            const p1 = createElement('p', {
+                style: { fontSize: '1.1rem', color: '#666', margin: '0.5rem 0', fontWeight: '500' }
+            }, emptyMessage);
+            div.appendChild(p1);
+            
+            const p2 = createElement('p', {
+                style: { fontSize: '0.9rem', color: '#999', margin: '0' }
+            }, emptySubMessage);
+            div.appendChild(p2);
+            
+            cell.appendChild(div);
+            row.appendChild(cell);
+            this.operationsTableBody.appendChild(row);
+            this.logger.log('✅ MESSAGE AJOUTE AU TABLEAU');
+            return;
+        }
+        
+        // Pagination UI: afficher une page seulement (admin plus fluide + évite bugs d'affichage)
+        const totalItems = filteredOperations.length;
+        const pageSize = Number(this.pageSize || 25);
+        const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+        const currentPage = Math.min(Math.max(1, Number(this.currentPage || 1)), totalPages);
+        this.currentPage = currentPage;
+        const start = (currentPage - 1) * pageSize;
+        const end = start + pageSize;
+
+        this.pagination = {
+            currentPage,
+            totalPages,
+            totalItems,
+            itemsPerPage: pageSize,
+            hasNextPage: currentPage < totalPages,
+            hasPrevPage: currentPage > 1
+        };
+
+        // Utiliser les opérations filtrées pour l'affichage (page courante uniquement)
+        // ✅ Nouveau comportement: 1 ligne par CYCLE/ENREGISTREMENT (et non plus 1 seule ligne par opérateur).
+        // On ne regroupe plus par OperatorCode: chaque enregistrement retourné par le backend apparaît dans le tableau.
+        const getOperatorCode = (op) => String(op?.OperatorCode || op?.operatorCode || op?.operatorId || '').trim();
+        const getLancementCode = (op) => String(op?.LancementCode || op?.lancementCode || '').trim().toUpperCase();
+        // Timeline SILOG : opérateur puis ordre chronologique (opérations + pauses mélangées)
+        const sorted = [...filteredOperations].sort(compareAdminTimelineRows);
+        const operationsToDisplay = sorted.slice(start, end);
+
+        // Mémoriser des compteurs d'affichage pour la pagination (fallback)
+        this._lastDisplayCounts = {
+            rowsDisplayed: operationsToDisplay.length,
+            operatorsDisplayed: operationsToDisplay.length
+        };
+
+        // Pré-calcul: détecter les LT avec plusieurs opérateurs (pour afficher un badge clair)
+        const ltToOperators = new Map(); // LT -> Set(operatorCode)
+        operationsToDisplay.forEach(op => {
+            const lt = String(op.LancementCode || op.lancementCode || '').trim().toUpperCase();
+            if (!lt) return;
+            const opCode = getOperatorCode(op);
+            if (!ltToOperators.has(lt)) ltToOperators.set(lt, new Set());
+            if (opCode) ltToOperators.get(lt).add(opCode);
+        });
+        
+        const fragment = document.createDocumentFragment();
+        
+        operationsToDisplay.forEach((operation) => {
+            
+            const formattedStartTime = this.formatDateTime(operation.StartTime);
+            const formattedEndTime = this.formatDateTime(operation.EndTime);
+            
+            // Validation des heures incohérentes
+            let timeWarning = '';
+            if (formattedStartTime && formattedEndTime && formattedStartTime !== '-' && formattedEndTime !== '-') {
+                const startMinutes = this.timeToMinutes(formattedStartTime);
+                const endMinutes = this.timeToMinutes(formattedEndTime);
+                
+                // Si l'heure de fin est avant l'heure de début (et pas de traversée de minuit)
+                if (endMinutes < startMinutes && endMinutes > 0) {
+                    timeWarning = ' ⚠️';
+                    this.logger.warn(`⚠️ Heures incohérentes pour ${operation.lancementCode}: ${formattedStartTime} -> ${formattedEndTime}`);
+                }
+            }
+            
+            const row = createElement('tr');
+            const isPauseRow = operation._isPauseRow === true || operation.type === 'pause';
+            const stTrait = String(operation.StatutTraitement || '').toUpperCase().trim();
+            const isTransmitted = stTrait === 'T';
+            const isOnHold = stTrait === 'A';
+
+            if (isPauseRow) {
+                row.classList.add('pause-row');
+            }
+            if (isTransmitted) {
+                row.classList.add('row-transmitted');
+                row.title = 'Transmis à SILOG (StatutTraitement = T)';
+            }
+            if (isOnHold) {
+                row.classList.add('row-on-hold');
+                row.title = 'Bloquée / en attente (StatutTraitement = A) — hors transfert';
+            }
+            
+            // Identifiants (ne pas confondre):
+            // - TempsId: ABTEMPS_OPERATEURS (consolidé)
+            // - EventId/id: ABHISTORIQUE_OPERATEURS (non consolidé)
+            const tempsId = operation.TempsId ?? null;
+            const eventId = operation.EventId ?? operation.id ?? null;
+            const isUnconsolidated = operation._isUnconsolidated === true || !tempsId;
+
+            // data-operation-id sert aux recherches DOM (édition inline / update row)
+            const rowId = tempsId || eventId;
+            row.setAttribute('data-operation-id', rowId);
+            row.dataset.tempsId = tempsId ? String(tempsId) : '';
+            row.dataset.eventId = eventId ? String(eventId) : '';
+            row.dataset.unconsolidated = isUnconsolidated ? 'true' : 'false';
+
+            // Déterminer le statut à afficher :
+            // Priorité au basculement SILOG (T) / blocage (A).
+            let statutCode, statutLabel;
+
+            if (isTransmitted) {
+                statutCode = 'T';
+                statutLabel = STATUS_LABELS[STATUS_CODES.TRANSMIS] || 'TRANSMIS';
+            } else if (isOnHold) {
+                statutCode = 'A';
+                statutLabel = this.getMonitoringStatusText('A');
+            }
+            // Sinon statut opération (Status/StatusCode)
+            else if (operation.StatusCode || operation.statusCode || operation.Status || operation.status) {
+                const rawCode = (operation.StatusCode || operation.statusCode || '').toString().trim();
+                statutCode = rawCode
+                    ? rawCode.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+                    : this.normalizeOperationStatus(operation);
+                const rawLabel = (operation.Status || operation.status || '').toString().trim();
+                statutLabel = rawLabel
+                    || STATUS_LABELS[statutCode]
+                    || (statutCode === 'TERMINE' ? 'Terminé' : statutCode === 'EN_PAUSE' ? 'En pause' : 'En cours');
+            }
+            // Si pas de statut explicite mais une heure de fin réelle, l'opération est terminée
+            else if (this.hasMeaningfulEndTime(operation)) {
+                statutCode = 'TERMINE';
+                statutLabel = 'Terminé';
+            }
+            // Sinon, utiliser le statut de traitement/consolidation
+            else {
+                statutCode = (operation.StatutTraitement === null || operation.StatutTraitement === undefined)
+                ? 'NULL'
+                : String(operation.StatutTraitement).toUpperCase();
+                statutLabel = this.getMonitoringStatusText(statutCode);
+            }
+            
+            // Construire les cellules de manière sécurisée
+            // Cellule 1: Opérateur
+            const cell1 = createTableCell(operation.OperatorName || operation.OperatorCode || '-');
+            row.appendChild(cell1);
+            
+            // Cellule 2: Lancement avec badge multi-opérateurs
+            const cell2 = createTableCell('');
+            const lancementDiv = createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } });
+            const lancementCodeDiv = createElement('div', {}, '');
+            if (isPauseRow) {
+                const pauseIcon = createElement('i', { className: 'fas fa-pause-circle pause-icon' });
+                lancementCodeDiv.appendChild(pauseIcon);
+                lancementCodeDiv.appendChild(document.createTextNode(` ${operation.LancementCode || '-'}`));
+            } else {
+                lancementCodeDiv.textContent = operation.LancementCode || '-';
+            }
+            lancementDiv.appendChild(lancementCodeDiv);
+            
+            const lt = String(operation.LancementCode || '').trim().toUpperCase();
+            const n = lt ? (ltToOperators.get(lt)?.size || 0) : 0;
+            if (n > 1) {
+                const badge = createBadge(`👥 ${n} opérateurs`, 'badge-secondary');
+                badge.style.cssText = 'width:max-content;';
+                lancementDiv.appendChild(badge);
+            }
+            cell2.appendChild(lancementDiv);
+            row.appendChild(cell2);
+            
+            // Cellule 3: Nom lancement
+            const designation = operation.LancementName || '-';
+            const cell3 = createTableCell(
+                createElement('span', { className: 'designation-text' }, designation),
+                { className: 'designation-cell' }
+            );
+            cell3.title = designation === '-' ? '' : designation;
+            row.appendChild(cell3);
+            
+            const { stepCode, stepLabel } = getAdminStepColumnDisplay(operation);
+            const cell4 = createTableCell(stepCode);
+            row.appendChild(cell4);
+
+            const cell5 = createTableCell(stepLabel);
+            row.appendChild(cell5);
+            
+            // Cellule 6: Heure début
+            const cell6 = createTableCell(this.formatAdminTimelineTime(operation, operation.StartTime ?? operation.startTime));
+            row.appendChild(cell6);
+            
+            // Cellule 7: Heure fin avec warning
+            const endTimeText = this.formatAdminTimelineTime(operation, operation.EndTime ?? operation.endTime) + timeWarning;
+            const cell7 = createTableCell(endTimeText);
+            row.appendChild(cell7);
+            
+            // Cellule 9: Statut
+            const cell8 = createTableCell('');
+            const statusBadge = createBadge(statutLabel, `status-badge status-${statutCode}`);
+            cell8.appendChild(statusBadge);
+            row.appendChild(cell8);
+            
+            // Cellule 10: Actions
+            const cell9 = createTableCell('', { className: 'actions-cell' });
+            // Un enregistrement déjà transmis à SILOG (StatutTraitement='T') ne peut être ni corrigé
+            // ni supprimé côté backend : on masque les boutons pour éviter une erreur trompeuse.
+            if (!isPauseRow && isTransmitted) {
+                const lockedInfo = createElement('span', {
+                    className: 'transmitted-lock',
+                    title: 'Transmis à SILOG — non modifiable'
+                });
+                lockedInfo.appendChild(createElement('i', { className: 'fas fa-lock' }));
+                lockedInfo.appendChild(document.createTextNode(' Transmis'));
+                cell9.appendChild(lockedInfo);
+            }
+            if (!isPauseRow && !isTransmitted) {
+            const editBtn = createButton({
+                icon: 'fas fa-edit',
+                className: 'btn-edit',
+                title: 'Corriger',
+                dataset: {
+                    id: rowId,
+                    operationId: rowId,
+                    tempsId: tempsId || '',
+                    eventId: eventId || '',
+                    unconsolidated: isUnconsolidated ? 'true' : 'false'
+                }
+            });
+            const deleteBtn = createButton({
+                icon: 'fas fa-trash',
+                className: 'btn-delete',
+                title: 'Supprimer',
+                dataset: {
+                    id: rowId,
+                    operationId: rowId,
+                    tempsId: tempsId || '',
+                    eventId: eventId || '',
+                    unconsolidated: isUnconsolidated ? 'true' : 'false'
+                }
+            });
+            cell9.appendChild(editBtn);
+            cell9.appendChild(deleteBtn);
+            if (this.aiAssistEnabled && !isPauseRow) {
+                const aiBtn = createButton({
+                    icon: 'fas fa-magic',
+                    className: 'btn-ai-assist',
+                    title: 'Assistance IA : expliquer / proposer bloquer · corriger · transférer',
+                    dataset: {
+                        id: String(rowId),
+                        operationId: String(rowId),
+                        tempsId: tempsId ? String(tempsId) : '',
+                        eventId: eventId ? String(eventId) : ''
+                    }
+                });
+                cell9.appendChild(aiBtn);
+            }
+            if (tempsId && !isUnconsolidated) {
+                if (isOnHold) {
+                    const releaseBtn = createButton({
+                        icon: 'fas fa-lock-open',
+                        className: 'btn-release-hold',
+                        title: 'Ligne bloquée : cliquer pour la débloquer',
+                        dataset: { tempsId: String(tempsId) }
+                    });
+                    cell9.appendChild(releaseBtn);
+                    const transmitOneBtn = createButton({
+                        icon: 'fas fa-paper-plane',
+                        className: 'btn-transmit-one',
+                        title: 'Transférer uniquement cette ligne (débloque + envoie vers SILOG)',
+                        dataset: { tempsId: String(tempsId), onHold: 'true' }
+                    });
+                    cell9.appendChild(transmitOneBtn);
+                } else {
+                    const holdBtn = createButton({
+                        icon: 'fas fa-lock',
+                        className: 'btn-hold',
+                        title: 'Bloquer (hors transfert, le temps de corriger)',
+                        dataset: { tempsId: String(tempsId) }
+                    });
+                    cell9.appendChild(holdBtn);
+                    if (this.isOperationTerminated(operation) && stTrait !== 'T' && stTrait !== 'D') {
+                        const transmitOneBtn = createButton({
+                            icon: 'fas fa-paper-plane',
+                            className: 'btn-transmit-one',
+                            title: 'Transférer uniquement cette ligne vers SILOG',
+                            dataset: { tempsId: String(tempsId), onHold: 'false' }
+                        });
+                        cell9.appendChild(transmitOneBtn);
+                    }
+                }
+            } else if (!isPauseRow && this.isOperationTerminated(operation) && !this._hasOpenSiblingCycle(operation)) {
+                // Pas de TempsId = pas encore consolidé en ABTEMPS → blocage/transfert impossibles.
+                // Tant que le même lancement est encore en cours (reprise après pause), on ne grise pas.
+                const holdHint = createButton({
+                    icon: 'fas fa-lock',
+                    className: 'btn-hold-disabled',
+                    title: 'Pas de cadenas : ligne non consolidée (pas de TempsId). Lance « Transfert » une fois, ou attends la consolidation auto, puis recharge.'
+                });
+                holdHint.disabled = true;
+                cell9.appendChild(holdHint);
+            }
+            }
+            row.appendChild(cell9);
+            fragment.appendChild(row);
+            
+            // Afficher les problèmes détectés pour cette opération
+            this.showOperationIssues(operation, row);
+        });
+        this.operationsTableBody.appendChild(fragment);
+        if (tableContainer) tableContainer.scrollTop = tableScrollTop;
+        if (typeof window !== 'undefined' && Number.isFinite(scrollY)) {
+            window.scrollTo(0, scrollY);
+        }
+    }
+
+    getMonitoringStatusText(code) {
+        const map = {
+            'NULL': 'NON TRAITÉ',
+            'O': 'VALIDÉ',
+            'A': 'BLOQUÉE',
+            'T': 'TRANSMIS',
+            'M': 'FUSIONNÉ',
+            'D': 'ÉCARTÉ'
+        };
+        return map[code] || code;
+    }
+
+    // ===== Helper: déterminer si une opération est Terminé (même logique que dans updateOperationsTable) =====
+    isOperationTerminated(operation) {
+        return this.normalizeOperationStatus(operation) === 'TERMINE';
+    }
+
+    /**
+     * Le créneau d'avant la pause ne doit pas être grisé tant que la reprise
+     * du même lancement, le même jour, n'est pas terminée.
+     */
+    _hasOpenSiblingCycle(operation) {
+        const oc = String(operation?.OperatorCode || operation?.operatorId || '').trim();
+        const lc = String(operation?.LancementCode || operation?.lancementCode || '').trim().toUpperCase();
+        const ymd = this._parseOpDateCreationLocalYmd(operation?.DateCreation) || '';
+        if (!oc || !lc) return false;
+        return (this.operations || []).some((other) => {
+            if (!other || other === operation || other._isPauseRow) return false;
+            const ooc = String(other.OperatorCode || other.operatorId || '').trim();
+            const olc = String(other.LancementCode || other.lancementCode || '').trim().toUpperCase();
+            const oymd = this._parseOpDateCreationLocalYmd(other.DateCreation) || '';
+            if (ooc !== oc || olc !== lc || oymd !== ymd) return false;
+            return this.normalizeOperationStatus(other) === 'EN_COURS';
+        });
+    }
+
+    _getAdminMonitoringFilters() {
+        const now = new Date();
+        const today = toLocalDateOnlyString(now);
+        const periodFilter = this.domCache.get('periodFilter');
+        const period = periodFilter?.value || 'today';
+        const toDateOnly = toLocalDateOnlyString;
+        const startOfWeekMonday = (d) => {
+            const x = new Date(d);
+            x.setHours(0, 0, 0, 0);
+            const day = x.getDay();
+            const diff = (day === 0 ? -6 : 1) - day;
+            x.setDate(x.getDate() + diff);
+            return x;
+        };
+        const startOfMonth = (d) => {
+            const x = new Date(d.getFullYear(), d.getMonth(), 1);
+            x.setHours(0, 0, 0, 0);
+            return x;
+        };
+        const periodRange = (() => {
+            if (period === 'yesterday') {
+                const y = new Date(now);
+                y.setDate(y.getDate() - 1);
+                return { date: toDateOnly(y) };
+            }
+            if (period === 'week') {
+                const start = startOfWeekMonday(now);
+                return { dateStart: toDateOnly(start), dateEnd: today };
+            }
+            if (period === 'month') {
+                const start = startOfMonth(now);
+                return { dateStart: toDateOnly(start), dateEnd: today };
+            }
+            if (period === 'custom') {
+                const pick = this.domCache.get('adminDatePicker')?.value?.trim();
+                if (pick) return { date: pick };
+                return { date: today };
+            }
+            return { date: today };
+        })();
+        const filters = { ...periodRange, includeAllStatuses: true };
+        const operatorCode = this.selectedOperatorCode || this.domCache.get('operatorFilter')?.value || undefined;
+        const lancementCode = this.domCache.get('searchFilter')?.value?.trim() || undefined;
+        if (operatorCode) filters.operatorCode = operatorCode;
+        if (lancementCode) filters.lancementCode = lancementCode;
+        return filters;
+    }
+
+    _getLancementKey(op) {
+        const oc = String(op?.OperatorCode || op?.operatorCode || op?.operatorId || '').trim();
+        const lc = String(op?.LancementCode || op?.lancementCode || '').trim().toUpperCase();
+        return `${oc}|${lc}`;
+    }
+
+    _isLancementStillActiveInDisplay(operatorCode, lancementCode) {
+        const rows = (this.operations || []).filter((op) =>
+            !op._isPauseRow &&
+            String(op.OperatorCode || '') === String(operatorCode) &&
+            String(op.LancementCode || '') === String(lancementCode)
+        );
+        return rows.some((op) => {
+            const st = this.normalizeOperationStatus(op);
+            return st === 'EN_COURS' || st === 'EN_PAUSE';
+        });
+    }
+
+    _upsertTransferEligibleByTempsId(eligibleByTempsId, op) {
+        if (!op?.TempsId) return;
+        if (!this.isOperationTerminated(op)) return;
+        const st = String(op.StatutTraitement ?? '').toUpperCase().trim();
+        // T = déjà transmis ; A = bloqué / en attente correction
+        if (st === 'T' || st === 'A') return;
+        eligibleByTempsId.set(String(op.TempsId), op);
+    }
+
+    /**
+     * Résout les opérations transférables en s'appuyant sur ABTEMPS (TempsId),
+     * indépendamment de l'affichage SILOG qui masque parfois les lignes consolidées.
+     * Un créneau productif = un TempsId (pause = fin de ligne) ; multi-cycles le même LT OK.
+     */
+    async _resolveTransferEligibleOperations() {
+        const filters = this._getAdminMonitoringFilters();
+        const monitoringResult = await this.apiService.getMonitoringTemps(filters);
+        const consolidatedOps = (monitoringResult?.success ? monitoringResult.data : this._consolidatedOpsRaw) || [];
+        this._consolidatedOpsRaw = consolidatedOps;
+
+        const eligibleByTempsId = new Map();
+        consolidatedOps.forEach((op) => this._upsertTransferEligibleByTempsId(eligibleByTempsId, op));
+
+        const tempsIdsByLancement = new Map();
+        for (const op of eligibleByTempsId.values()) {
+            const lk = this._getLancementKey(op);
+            if (!lk || lk === '|') continue;
+            if (!tempsIdsByLancement.has(lk)) tempsIdsByLancement.set(lk, new Set());
+            tempsIdsByLancement.get(lk).add(String(op.TempsId));
+        }
+
+        const seenLancements = new Set();
+        const toConsolidate = [];
+        for (const op of (this.operations || [])) {
+            if (op._isPauseRow || String(op.StatutTraitement ?? '').toUpperCase().trim() === 'T') continue;
+            const key = this._getLancementKey(op);
+            if (!key || key === '|' || seenLancements.has(key)) continue;
+            seenLancements.add(key);
+            const [operatorCode, lancementCode] = key.split('|');
+            if (this._isLancementStillActiveInDisplay(operatorCode, lancementCode)) continue;
+            if (!this.isOperationTerminated(op) &&
+                !consolidatedOps.some((c) => this._getLancementKey(c) === key && this.isOperationTerminated(c))) {
+                continue;
+            }
+            // Consolider si aucun TempsId pour ce LT, ou si l'affichage a une ligne terminée sans TempsId
+            // (nouveau cycle après un cycle déjà consolidé le même jour).
+            const hasAbtemps = (tempsIdsByLancement.get(key)?.size || 0) > 0;
+            const abtempsCount = tempsIdsByLancement.get(key)?.size || 0;
+            // Segments productifs affichés (_isWorkSegment) remplacent parfois la ligne ABTEMPS à l'écran
+            // mais le TempsId est déjà dans monitoring — ne pas re-consolider pour ça.
+            // En revanche une vraie ligne terminée sans TempsId (nouveau cycle) doit déclencher la consolidation.
+            // Si plus de créneaux affichés que de TempsId (ancien ABTEMPS cumulé DEBUT→FIN), forcer
+            // la reconsolidation en 1 TempsId / créneau pour le transfert SILOG.
+            const displaySegmentCount = (this.operations || []).filter((row) =>
+                row._isWorkSegment
+                && this._getLancementKey(row) === key
+                && this.isOperationTerminated(row)
+                && String(row.StatutTraitement ?? '').toUpperCase().trim() !== 'T'
+            ).length;
+            const needsSegmentSplit = displaySegmentCount > 1 && displaySegmentCount > abtempsCount;
+            const hasUnconsolidatedTerminated = (this.operations || []).some((row) =>
+                !row._isPauseRow
+                && !row._isWorkSegment
+                && this._getLancementKey(row) === key
+                && this.isOperationTerminated(row)
+                && (row.TempsId == null || String(row.TempsId).trim() === '')
+                && String(row.StatutTraitement ?? '').toUpperCase().trim() !== 'T'
+            );
+            if (hasAbtemps && !hasUnconsolidatedTerminated && !needsSegmentSplit) continue;
+            toConsolidate.push({ OperatorCode: operatorCode, LancementCode: lancementCode });
+        }
+
+        let skipped = [];
+        let errors = [];
+        if (toConsolidate.length > 0) {
+            const consolidateResult = await this.apiService.consolidateMonitoringBatch(toConsolidate);
+            skipped = consolidateResult?.results?.skipped || [];
+            errors = consolidateResult?.results?.errors || [];
+
+            for (const item of consolidateResult?.results?.success || []) {
+                if (!item?.TempsId) continue;
+                this._upsertTransferEligibleByTempsId(eligibleByTempsId, {
+                    OperatorCode: item.OperatorCode,
+                    LancementCode: item.LancementCode,
+                    TempsId: item.TempsId,
+                    StatutTraitement: null,
+                    StatusCode: 'TERMINE',
+                    Status: 'Terminé'
+                });
+            }
+            for (const item of skipped) {
+                if (!item?.TempsId) continue;
+                this._upsertTransferEligibleByTempsId(eligibleByTempsId, {
+                    OperatorCode: item.OperatorCode,
+                    LancementCode: item.LancementCode,
+                    TempsId: item.TempsId,
+                    StatutTraitement: null,
+                    StatusCode: 'TERMINE',
+                    Status: 'Terminé'
+                });
+            }
+
+            // Toujours recharger ABTEMPS : un LT peut avoir plusieurs TempsId (multi-cycles).
+            const refresh = await this.apiService.getMonitoringTemps(filters);
+            const refreshed = (refresh?.success ? refresh.data : []) || [];
+            refreshed.forEach((op) => this._upsertTransferEligibleByTempsId(eligibleByTempsId, op));
+            this._consolidatedOpsRaw = refreshed.length > 0 ? refreshed : this._consolidatedOpsRaw;
+        }
+
+        return {
+            eligible: Array.from(eligibleByTempsId.values()),
+            skipped,
+            errors,
+            attemptedConsolidation: toConsolidate.length
+        };
+    }
+
+    // ===== Transfert: une seule consolidation puis transfert, sans boucle =====
+    async handleTransfer() {
+        // Empêcher les appels simultanés
+        if (this._isTransferring) {
+            this.logger.log('⏸️ Transfert déjà en cours, ignoré');
+            return;
+        }
+
+        try {
+            this._isTransferring = true;
+            
+            // Désactiver le bouton et changer son texte (sans injecter le loader dedans)
+            const transferBtn = this.domCache.get('transferBtn');
+            if (transferBtn) {
+                transferBtn.disabled = true;
+                transferBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Transfert en cours...';
+            }
+            const allRecordsData = this.operations || [];
+            this.logger.log(`📊 Total opérations dans le tableau: ${allRecordsData.length}`);
+
+            const {
+                eligible: terminatedWithTempsId,
+                skipped: lastConsolidationSkipped,
+                errors: lastConsolidationErrors,
+                attemptedConsolidation
+            } = await this._resolveTransferEligibleOperations();
+
+            const terminatedOps = terminatedWithTempsId;
+            this.logger.log(
+                `📊 Opérations TERMINÉES éligibles (TempsId): ${terminatedWithTempsId.length}` +
+                (attemptedConsolidation > 0 ? ` (consolidation tentée: ${attemptedConsolidation})` : '')
+            );
+
+            if (terminatedWithTempsId.length === 0) {
+                const displayTerminated = allRecordsData.filter(
+                    (op) => !op._isPauseRow && this.isOperationTerminated(op) && op.StatutTraitement !== 'T'
+                );
+                const alreadyTransferred = allRecordsData.filter((op) => op.StatutTraitement === 'T').length;
+
+                if (displayTerminated.length === 0) {
+                    const terminated = allRecordsData.filter((op) => this.isOperationTerminated(op)).length;
+                    this.notificationManager.warning(
+                        `Aucune opération TERMINÉE à transférer (${terminated} terminées, ${alreadyTransferred} déjà transférées)`
+                    );
+                    return;
+                }
+
+                const failedOps = displayTerminated;
+                const skippedKeySet = new Set(
+                    (lastConsolidationSkipped || []).map((s) => `${s.OperatorCode}/${s.LancementCode}`)
+                );
+                const failedNotSkipped = failedOps.filter(
+                    (op) => !skippedKeySet.has(`${op.OperatorCode}/${op.LancementCode}`)
+                );
+                const onlySkipped = failedOps.length > 0 &&
+                    failedNotSkipped.length === 0 &&
+                    (lastConsolidationErrors || []).length === 0;
+                if (onlySkipped) {
+                    const reasonCounts = (lastConsolidationSkipped || []).reduce((acc, s) => {
+                        const r = s.reason || 'Ignoré';
+                        acc[r] = (acc[r] || 0) + 1;
+                        return acc;
+                    }, {});
+                    const reasonsText = Object.entries(reasonCounts)
+                        .map(([k, v]) => `- ${k}: ${v}`)
+                        .join('\n');
+
+                    let msg = `Aucune opération terminée n'est éligible au transfert.\n\n` +
+                        `${failedOps.length} opération(s) ont été ignorée(s) (normal):\n`;
+                    failedOps.forEach((op) => {
+                        msg += `• ${op.OperatorCode || '?'}/${op.LancementCode || '?'} - ${op.OperatorName || 'Opérateur inconnu'}\n`;
+                    });
+                    msg += `\nRaisons d'ignorance (consolidation):\n${reasonsText || '- (non précisé)'}\n\n` +
+                        `Exemples de causes normales: lancement soldé (LancementSolde <> 'N'), composant (TypeRubrique <> 'O'), ou lancement absent de V_LCTC.`;
+
+                    alert(msg);
+                    this.notificationManager.warning(
+                        `${failedOps.length} opération(s) ignorée(s) (normal). Voir l'alerte pour les détails.`,
+                        9000
+                    );
+                    return;
+                }
+
+                let errorDetails = 'Aucune opération terminée n\'a un TempsId valide après consolidation.\n\n';
+                if (failedOps.length > 0) {
+                    errorDetails += `Opérations en échec (${failedOps.length}):\n`;
+                    failedOps.forEach((op) => {
+                        errorDetails += `• ${op.OperatorCode || '?'}/${op.LancementCode || '?'} - ${op.OperatorName || 'Opérateur inconnu'}\n`;
+                    });
+                    errorDetails += '\n';
+                }
+                errorDetails += 'Causes possibles:\n';
+                errorDetails += '• Événements DEBUT ou FIN manquants dans ABHISTORIQUE_OPERATEURS\n';
+                errorDetails += '• Heures incohérentes (fin < début)\n';
+                errorDetails += '• Données invalides dans la base de données\n\n';
+                errorDetails += 'Vérifiez les logs backend pour plus de détails.';
+
+                this.logger.error('❌ Aucune opération consolidée pour transfert:', {
+                    displayTerminated: failedOps.length,
+                    consolidationErrors: lastConsolidationErrors
+                });
+                alert(errorDetails);
+                this.notificationManager.error(
+                    `${failedOps.length} opération(s) n'ont pas pu être consolidée(s). Voir l'alerte pour les détails.`,
+                    10000
+                );
+                return;
+            }
+
+            this.logger.log(
+                `✅ Opérations éligibles au transfert (avec TempsId): ${terminatedWithTempsId.length} ` +
+                `sur ${terminatedOps.length} opérations terminées`
+            );
+
+            // 4) Demander si on transfère tout ou si on passe par la sélection
+            const message = `Transférer ${terminatedWithTempsId.length} opération(s) TERMINÉE(S) ?\n\nOK = tout transférer\nAnnuler = choisir les lancements`;
+            const transferAll = confirm(message);
+            
+            if (transferAll) {
+                // Transférer toutes les opérations terminées AVEC TempsId
+                const ids = terminatedWithTempsId
+                    .map(op => op.TempsId)
+                    .filter(id => !!id);
+
+                if (ids.length === 0) {
+                    this.notificationManager.error('Aucune opération n\'a pu être consolidée pour le transfert');
+                    return;
+                }
+                
+                // Toujours demander EDI : en mode ssh = immédiat ; en scheduled = filet Windows
+                const ok = confirm(
+                    `Valider ${ids.length} opération(s) et envoyer vers SILOG maintenant ?\n\n` +
+                    `OK = validation (O) + déclenchement EDI\nAnnuler = abandon`
+                );
+                if (!ok) return;
+
+                const result = await this.apiService.validateAndTransmitMonitoringBatch(ids, {
+                    triggerEdiJob: true,
+                    // Ne pas marquer T ici : SILOG bascule O→T après intégration réelle
+                    adminMarkTransmitted: false
+                });
+                if (result?.success) {
+                    this.notificationManager.success(
+                        this._formatTransferResultMessage(result, ids.length)
+                    );
+                    if (result.ediJob?.success === false) {
+                        this.notificationManager.warning(
+                            result.ediJob.error || result.ediJob.message || 'EDI_JOB a échoué — lignes en O, retry possible'
+                        );
+                    }
+                    await this.loadData(false);
+                    this.updateOperationsTable();
+                } else {
+                    this.notificationManager.error(result?.error || 'Erreur lors du transfert');
+                }
+            } else {
+                // Ouvrir la modale pour sélectionner les lancements
+                this.openTransferModal(terminatedWithTempsId);
+            }
+        } catch (error) {
+            this.errorHandler.handle(error, 'handleTransfer', 'Erreur de connexion lors du transfert');
+        } finally {
+            this._isTransferring = false;
+            // Remettre le bouton dans son état normal
+            const transferBtnFinal = this.domCache.get('transferBtn');
+            if (transferBtnFinal) {
+                transferBtnFinal.disabled = false;
+                transferBtnFinal.innerHTML = '<i class="fas fa-exchange-alt"></i> Transfert';
+            }
+            this.loadingIndicator.hide('transfer');
+        }
+    }
+
+    openTransferModal(records) {
+        const modal = this.domCache.get('transferSelectionModal');
+        const body = this.domCache.get('transferModalTableBody');
+        const selectAll = this.domCache.get('transferSelectAll');
+        if (!modal || !body) return;
+
+        this.transferSelectionIds.clear();
+        // Ne pré-sélectionner que les lignes non bloquées (A)
+        const transferable = (records || []).filter((r) => {
+            const st = String(r?.StatutTraitement ?? '').toUpperCase().trim();
+            return st !== 'A' && st !== 'T';
+        });
+        if (selectAll) selectAll.checked = transferable.length > 0;
+
+        clearElement(body);
+        for (const r of records) {
+            const id = r.TempsId;
+            const key = String(id);
+            const st = String(r?.StatutTraitement ?? '').toUpperCase().trim();
+            const isBlocked = st === 'A';
+            const preSelect = !isBlocked && st !== 'T';
+            if (preSelect) this.transferSelectionIds.add(key);
+
+            const tr = createElement('tr');
+            if (isBlocked) {
+                tr.classList.add('row-on-hold');
+                tr.title = 'Ligne bloquée (A) — hors transfert';
+            }
+            
+            // Cellule checkbox
+            const cell1 = createTableCell('', { 
+                style: { textAlign: 'center', padding: '10px', borderBottom: '1px solid #f0f0f0' } 
+            });
+            const checkbox = createElement('input', {
+                type: 'checkbox',
+                className: 'transfer-row',
+                dataset: { id: id },
+                checked: preSelect,
+                disabled: isBlocked
+            });
+            cell1.appendChild(checkbox);
+            tr.appendChild(cell1);
+            
+            // Cellule opérateur
+            const cell2 = createTableCell(r.OperatorName || r.OperatorCode || '-', {
+                style: { padding: '10px', borderBottom: '1px solid #f0f0f0' }
+            });
+            tr.appendChild(cell2);
+            
+            // Cellule lancement code
+            const cell3 = createTableCell(r.LancementCode || '-', {
+                style: { padding: '10px', borderBottom: '1px solid #f0f0f0' }
+            });
+            tr.appendChild(cell3);
+            
+            // Cellule lancement name
+            const cell4 = createTableCell(r.LancementName || '-', {
+                style: { padding: '10px', borderBottom: '1px solid #f0f0f0' }
+            });
+            tr.appendChild(cell4);
+            
+            // Cellule heure début
+            const cell5 = createTableCell(this.formatDateTime(r.StartTime), {
+                style: { padding: '10px', borderBottom: '1px solid #f0f0f0' }
+            });
+            tr.appendChild(cell5);
+            
+            // Cellule heure fin
+            const cell6 = createTableCell(this.formatDateTime(r.EndTime), {
+                style: { padding: '10px', borderBottom: '1px solid #f0f0f0' }
+            });
+            tr.appendChild(cell6);
+            
+            body.appendChild(tr);
+        }
+
+        // Delegation checkbox
+        body.onclick = (e) => {
+            const cb = e.target.closest('input.transfer-row');
+            if (!cb) return;
+            const id = String(cb.dataset.id);
+            if (cb.checked) this.transferSelectionIds.add(id);
+            else this.transferSelectionIds.delete(id);
+        };
+
+        modal.style.display = 'block';
+    }
+
+    hideTransferModal() {
+        const modal = this.domCache.get('transferSelectionModal');
+        if (modal) modal.style.display = 'none';
+        this.transferSelectionIds.clear();
+        // Réinitialiser le flag de transfert si la modale est fermée sans transférer
+        // (le flag sera réinitialisé dans le finally de handleTransfer si le transfert a été fait)
+        if (this._isTransferring) {
+            this.logger.log('⚠️ Modale fermée sans transfert, réinitialisation du flag');
+            this._isTransferring = false;
+        }
+    }
+
+    toggleTransferSelectAll(checked) {
+        const body = this.domCache.get('transferModalTableBody');
+        if (!body) return;
+        const cbs = body.querySelectorAll('input.transfer-row');
+        cbs.forEach(cb => {
+            cb.checked = checked;
+            const id = String(cb.dataset.id);
+            if (checked) this.transferSelectionIds.add(id);
+            else this.transferSelectionIds.delete(id);
+        });
+    }
+
+    async holdSelectedFromTransferModal() {
+        const ids = Array.from(this.transferSelectionIds)
+            .map((x) => Number.parseInt(x, 10))
+            .filter((n) => Number.isFinite(n) && n > 0);
+        if (ids.length === 0) {
+            this.notificationManager.warning('Aucune ligne sélectionnée à bloquer');
+            return;
+        }
+        const ok = confirm(
+            `Bloquer ${ids.length} ligne(s) ?\n\n` +
+            `Ces enregistrements passeront en « En attente » (A) et ne seront pas basculés vers SILOG.\n` +
+            `Vous pourrez les débloquer après correction.`
+        );
+        if (!ok) return;
+        try {
+            const result = await this.apiService.onHoldMonitoringBatch(ids);
+            const data = result?.data || result;
+            const count = data?.count ?? data?.heldIds?.length ?? ids.length;
+            this.notificationManager.success(`${count} ligne(s) bloquée(s)`);
+            this.hideTransferModal();
+            await this.loadData();
+        } catch (error) {
+            this.errorHandler.handle(error, 'holdSelectedFromTransferModal', error.message || 'Erreur lors du blocage');
+        }
+    }
+
+    async holdMonitoringRecord(tempsId) {
+        const id = Number.parseInt(tempsId, 10);
+        if (!Number.isFinite(id) || id <= 0) {
+            this.notificationManager.warning('TempsId manquant');
+            return;
+        }
+        const ok = confirm(
+            `Bloquer la ligne TempsId ${id} ?\n` +
+            `Elle restera hors transfert global.\n` +
+            `Tu pourras la corriger le lendemain puis la transférer seule.`
+        );
+        if (!ok) return;
+        try {
+            await this.apiService.onHoldMonitoringTemps(id);
+            this.notificationManager.success(`Ligne ${id} bloquée`);
+            await this.loadData();
+        } catch (error) {
+            this.errorHandler.handle(error, 'holdMonitoringRecord', error.message || 'Erreur blocage');
+        }
+    }
+
+    async releaseHoldMonitoringRecord(tempsId) {
+        const id = Number.parseInt(tempsId, 10);
+        if (!Number.isFinite(id) || id <= 0) {
+            this.notificationManager.warning('TempsId manquant');
+            return;
+        }
+        const ok = confirm(
+            `Débloquer la ligne TempsId ${id} ?\n` +
+            'Elle ne sera plus protégée : le prochain transfert manuel pourra l\'envoyer vers SILOG.'
+        );
+        if (!ok) return;
+        try {
+            await this.apiService.releaseHoldMonitoringTemps(id);
+            this.notificationManager.success(`Ligne ${id} débloquée`);
+            await this.loadData();
+        } catch (error) {
+            this.errorHandler.handle(error, 'releaseHoldMonitoringRecord', error.message || 'Erreur déblocage');
+        }
+    }
+
+    /**
+     * Transfert d'une seule ligne (après correction d'un blocage).
+     * Si la ligne est en A : débloque puis valide/envoie uniquement ce TempsId.
+     */
+    async transmitSingleMonitoringRecord(tempsId, { wasHold = false } = {}) {
+        const id = Number.parseInt(tempsId, 10);
+        if (!Number.isFinite(id) || id <= 0) {
+            this.notificationManager.warning('TempsId manquant');
+            return;
+        }
+        const ok = confirm(
+            wasHold
+                ? `Transférer uniquement la ligne TempsId ${id} ?\nElle sera débloquée puis envoyée vers SILOG (les autres lignes ne sont pas touchées).`
+                : `Transférer uniquement la ligne TempsId ${id} vers SILOG ?`
+        );
+        if (!ok) return;
+        try {
+            if (wasHold) {
+                await this.apiService.releaseHoldMonitoringTemps(id);
+            }
+            const result = await this.apiService.validateAndTransmitMonitoringBatch([id], {
+                triggerEdiJob: true,
+                adminMarkTransmitted: false
+            });
+            if (result?.success) {
+                this.notificationManager.success(
+                    this._formatTransferResultMessage(result, 1) || `Ligne ${id} transférée`
+                );
+                if (result.ediJob?.success === false) {
+                    this.notificationManager.warning(
+                        result.ediJob.error || result.ediJob.message || 'EDI_JOB a échoué — ligne en O'
+                    );
+                }
+                await this.loadData(false);
+            } else {
+                this.notificationManager.error(result?.error || `Échec transfert ligne ${id}`);
+            }
+        } catch (error) {
+            this.errorHandler.handle(error, 'transmitSingleMonitoringRecord', error.message || 'Erreur transfert ligne');
+        }
+    }
+
+    /**
+     * Demande un diagnostic IA pour une ligne (propose seulement — n'applique rien).
+     */
+    async analyzeLineWithAi(rowId) {
+        if (!this.aiAssistEnabled) {
+            this.notificationManager.warning('Assistance IA désactivée (ENABLE_AI_ASSIST / clé API)');
+            return;
+        }
+        if (this._aiAssistLoading) return;
+
+        const operation = this.operations.find((op) => {
+            const tid = op.TempsId != null ? String(op.TempsId) : '';
+            const eid = op.EventId != null ? String(op.EventId) : (op.id != null ? String(op.id) : '');
+            const key = String(rowId);
+            return tid === key || eid === key || String(op.id) === key;
+        });
+        if (!operation) {
+            this.notificationManager.warning('Ligne introuvable — rechargez le tableau');
+            return;
+        }
+
+        const lt = String(operation.LancementCode || '').trim().toUpperCase();
+        let multiOperatorsOnLt = null;
+        if (lt) {
+            const names = new Set(
+                this.operations
+                    .filter((o) => String(o.LancementCode || '').trim().toUpperCase() === lt)
+                    .map((o) => String(o.OperatorCode || o.OperatorName || '').trim())
+                    .filter(Boolean)
+            );
+            multiOperatorsOnLt = names.size > 1 ? names.size : 1;
+        }
+
+        const knownIssues = [];
+        try {
+            const validation = this.validateOperationBeforeEdit(operation);
+            if (validation?.errors?.length) knownIssues.push(...validation.errors);
+            if (validation?.warnings?.length) knownIssues.push(...validation.warnings);
+        } catch {
+            /* ignore */
+        }
+
+        const stTrait = String(operation.StatutTraitement || '').toUpperCase().trim();
+        const context = stTrait === 'A' ? 'hold_corrector' : 'monitoring';
+
+        this._aiAssistLoading = true;
+        try {
+            this.notificationManager.info('Analyse IA en cours…');
+            const result = await this.apiService.analyzeMonitoringLineAi(
+                { ...operation, knownIssues, multiOperatorsOnLt },
+                { context }
+            );
+            if (!result?.success || !result.data) {
+                this.notificationManager.error(result?.error || 'Réponse IA invalide');
+                return;
+            }
+            this.showAiAssistPanel(operation, result.data);
+        } catch (error) {
+            this.errorHandler.handle(error, 'analyzeLineWithAi', error.message || 'Erreur assistance IA');
+        } finally {
+            this._aiAssistLoading = false;
+        }
+    }
+
+    showAiAssistPanel(operation, advice) {
+        const existing = document.getElementById('aiAssistModal');
+        if (existing) existing.remove();
+
+        const tempsId = operation.TempsId ?? null;
+        const rowId = tempsId || operation.EventId || operation.id;
+        const issuesHtml = (advice.issues || [])
+            .map((i) => `<li>${this.escapeHtmlAi(i)}</li>`)
+            .join('');
+        const hintsHtml = (advice.correctionHints || [])
+            .map((h) => `<li>${this.escapeHtmlAi(h)}</li>`)
+            .join('');
+
+        const modal = createElement('div', {
+            id: 'aiAssistModal',
+            className: 'ai-assist-modal',
+            role: 'dialog',
+            'aria-modal': 'true'
+        });
+        modal.innerHTML = `
+            <div class="ai-assist-modal-card">
+                <div class="ai-assist-modal-header">
+                    <strong><i class="fas fa-magic"></i> Assistance ligne</strong>
+                    <button type="button" class="ai-assist-close" aria-label="Fermer">&times;</button>
+                </div>
+                <p class="ai-assist-summary">${this.escapeHtmlAi(advice.summary || '')}</p>
+                <p class="ai-assist-motif"><b>Motif :</b> ${this.escapeHtmlAi(advice.motif || '')}</p>
+                ${issuesHtml ? `<ul class="ai-assist-list">${issuesHtml}</ul>` : ''}
+                ${hintsHtml ? `<p class="ai-assist-hints-title">Pistes</p><ul class="ai-assist-list">${hintsHtml}</ul>` : ''}
+                <p class="ai-assist-conf">Confiance ${(Math.round((advice.confidence || 0) * 100))}%</p>
+                <div class="ai-assist-actions">
+                    <button type="button" class="btn-secondary ai-act-block" ${tempsId ? '' : 'disabled'}>
+                        <i class="fas fa-lock"></i> Bloquer
+                    </button>
+                    <button type="button" class="btn-secondary ai-act-correct">
+                        <i class="fas fa-edit"></i> Corriger
+                    </button>
+                    <button type="button" class="btn-primary ai-act-apply">
+                        <i class="fas fa-check"></i> ${this.escapeHtmlAi(advice.actionLabel || 'Appliquer')}
+                    </button>
+                </div>
+            </div>`;
+
+        const close = () => modal.remove();
+        modal.querySelector('.ai-assist-close')?.addEventListener('click', close);
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) close();
+        });
+
+        modal.querySelector('.ai-act-block')?.addEventListener('click', async () => {
+            close();
+            if (tempsId) await this.holdMonitoringRecord(tempsId);
+        });
+        modal.querySelector('.ai-act-correct')?.addEventListener('click', async () => {
+            close();
+            if (tempsId) await this.editMonitoringRecord(tempsId);
+            else await this.editOperation(rowId);
+        });
+        modal.querySelector('.ai-act-apply')?.addEventListener('click', async () => {
+            close();
+            const action = advice.recommendedAction;
+            if (action === 'block' && tempsId) await this.holdMonitoringRecord(tempsId);
+            else if (action === 'release_hold' && tempsId) await this.releaseHoldMonitoringRecord(tempsId);
+            else if (action === 'transmit' && tempsId) {
+                await this.transmitSingleMonitoringRecord(tempsId, {
+                    wasHold: String(operation.StatutTraitement || '').toUpperCase() === 'A'
+                });
+            } else if (action === 'correct') {
+                if (tempsId) await this.editMonitoringRecord(tempsId);
+                else await this.editOperation(rowId);
+            } else {
+                this.notificationManager.info('Aucune action automatique pour cette recommandation');
+            }
+        });
+
+        document.body.appendChild(modal);
+    }
+
+    escapeHtmlAi(str) {
+        return String(str ?? '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;');
+    }
+
+    async confirmTransferFromModal() {
+        const ids = Array.from(this.transferSelectionIds).map(x => Number.parseInt(x, 10)).filter(n => !Number.isNaN(n));
+        if (ids.length === 0) {
+            this.notificationManager.warning('Aucune ligne sélectionnée');
+            return;
+        }
+        
+        try {
+            const ok = confirm(
+                `Valider ${ids.length} opération(s) et envoyer vers SILOG maintenant ?\n\n` +
+                `OK = validation (O) + déclenchement EDI\nAnnuler = abandon`
+            );
+            if (!ok) return;
+
+            const result = await this.apiService.validateAndTransmitMonitoringBatch(ids, {
+                triggerEdiJob: true,
+                adminMarkTransmitted: false
+            });
+            if (result?.success) {
+                this.notificationManager.success(
+                    this._formatTransferResultMessage(result, ids.length)
+                );
+                if (result.ediJob?.success === false) {
+                    this.notificationManager.warning(
+                        result.ediJob.error || result.ediJob.message || 'EDI_JOB a échoué — lignes en O'
+                    );
+                }
+                this.hideTransferModal();
+                await this.loadData(false);
+            } else {
+                this.notificationManager.error(result?.error || 'Erreur transfert');
+            }
+        } catch (error) {
+            this.logger.error('❌ Erreur lors du transfert depuis la modale:', error);
+            this.notificationManager.error('Erreur de connexion lors du transfert');
+        }
+    }
+
+    /**
+     * Message admin selon le résultat EDI (ssh immédiat vs scheduled).
+     * Inclut le détail par TempsId quand le backend le renvoie.
+     */
+    _formatTransferResultMessage(result, fallbackCount) {
+        const validatedIds = Array.isArray(result?.validatedIds) ? result.validatedIds : [];
+        const invalidIds = Array.isArray(result?.invalidIds) ? result.invalidIds : [];
+        const n = validatedIds.length || result.count || fallbackCount;
+        const edi = result.ediJob;
+        let base;
+        if (!edi) {
+            base = `${n} opération(s) validée(s) (statut O)`;
+        } else if (edi.skipped) {
+            base = `${n} validée(s) (O) — EDI non lancé ici (${edi.message || 'mode planifié'}). Attente tâche Windows.`;
+        } else if (edi.success) {
+            const sec = edi.elapsedMs ? ` en ${Math.round(edi.elapsedMs / 1000)}s` : '';
+            base = `${n} validée(s) (O) — EDI SILOG déclenché${sec}. Passage en TRANSMIS (T) après intégration.`;
+        } else {
+            base = `${n} validée(s) (O) — EDI en erreur (lignes restent en attente)`;
+        }
+        if (validatedIds.length > 0) {
+            base += ` | OK TempsId: ${validatedIds.join(', ')}`;
+        }
+        if (invalidIds.length > 0) {
+            const detail = invalidIds.map((inv) => {
+                const err = Array.isArray(inv.errors) ? inv.errors.join(', ') : (inv.errors || inv.error || '?');
+                return `${inv.tempsId}: ${err}`;
+            }).join(' ; ');
+            base += ` | Échec: ${detail}`;
+        }
+        return base;
+    }
+
+    /**
+     * Une ligne admin peut fusionner ABTEMPS (TempsId) + ABHISTORIQUE (EventId).
+     * Les supprimer ensemble évite de devoir cliquer deux fois pour faire disparaître la ligne.
+     */
+    async deleteAdminLine({ tempsId = null, eventId = null, fallbackId = null } = {}) {
+        let resolvedTempsId = tempsId != null && String(tempsId).trim() !== ''
+            ? Number.parseInt(tempsId, 10)
+            : null;
+        if (Number.isNaN(resolvedTempsId)) resolvedTempsId = null;
+
+        let resolvedEventId = eventId != null && String(eventId).trim() !== ''
+            ? String(eventId).trim()
+            : null;
+
+        const matchOp = (this.operations || []).find((op) => {
+            if (resolvedTempsId != null && Number(op?.TempsId) === resolvedTempsId) return true;
+            if (resolvedEventId != null && String(op?.EventId ?? op?.id) === resolvedEventId) return true;
+            if (fallbackId != null && String(op?.TempsId ?? op?.EventId ?? op?.id) === String(fallbackId)) return true;
+            return false;
+        });
+
+        if (matchOp) {
+            if (resolvedTempsId == null && matchOp.TempsId != null && String(matchOp.TempsId).trim() !== '') {
+                const tid = Number.parseInt(matchOp.TempsId, 10);
+                if (!Number.isNaN(tid)) resolvedTempsId = tid;
+            }
+            if (!resolvedEventId && (matchOp.EventId != null || matchOp.id != null)) {
+                resolvedEventId = String(matchOp.EventId ?? matchOp.id);
+            }
+            // Si le TempsId a été greffé sur un segment, récupérer aussi via le raw consolidé.
+            if (resolvedTempsId == null && Array.isArray(this._consolidatedOpsRaw)) {
+                const slot = this._getAdminStartSlotKey(matchOp);
+                const cons = this._consolidatedOpsRaw.find((op) => this._getAdminStartSlotKey(op) === slot);
+                if (cons?.TempsId != null) {
+                    const tid = Number.parseInt(cons.TempsId, 10);
+                    if (!Number.isNaN(tid)) resolvedTempsId = tid;
+                }
+            }
+        }
+
+        if (resolvedTempsId == null && !resolvedEventId && fallbackId != null) {
+            const fb = Number.parseInt(fallbackId, 10);
+            if (!Number.isNaN(fb) && this.validator.validateId(fb)) {
+                resolvedTempsId = fb;
+            } else {
+                resolvedEventId = String(fallbackId);
+            }
+        }
+
+        if (resolvedTempsId == null && !resolvedEventId) {
+            this.notificationManager.error('Impossible d\'identifier la ligne à supprimer');
+            return;
+        }
+
+        if (!confirm('Supprimer cette ligne ? Les temps consolidés et l\'historique associés seront retirés.')) {
+            return;
+        }
+
+        try {
+            this.loadingIndicator.show('deleteMonitoring', null, 'Suppression en cours...');
+
+            let deletedSomething = false;
+            let hardError = null;
+            let alreadyTransmitted = false;
+
+            if (resolvedTempsId != null) {
+                try {
+                    const result = await this.apiService.deleteMonitoringTemps(resolvedTempsId);
+                    if (result?.success) {
+                        deletedSomething = true;
+                        this.selectedTempsIds.delete(String(resolvedTempsId));
+                    } else if (result?.error && String(result.error).includes('non trouvé')) {
+                        // déjà absent : continuer avec l'historique
+                    } else if (result?.error) {
+                        hardError = result.error;
+                    }
+                } catch (error) {
+                    const msg = String(error?.message || '');
+                    if (msg.includes('déjà transmis')) {
+                        alreadyTransmitted = true;
+                    } else if (!msg.includes('non trouvé')) {
+                        hardError = msg || 'Erreur suppression temps';
+                    }
+                }
+            }
+
+            if (resolvedEventId) {
+                try {
+                    const result = await this.apiService.deleteOperation(resolvedEventId);
+                    if (result?.success) {
+                        deletedSomething = true;
+                    } else if (result?.error && !String(result.error).includes('non trouv')) {
+                        hardError = hardError || result.error;
+                    }
+                } catch (error) {
+                    const msg = String(error?.message || '');
+                    if (!msg.includes('non trouv')) {
+                        hardError = hardError || msg || 'Erreur suppression historique';
+                    }
+                }
+            }
+
+            if (alreadyTransmitted && !deletedSomething) {
+                this.notificationManager.warning('Cet enregistrement a déjà été transmis à SILOG : il ne peut plus être supprimé. Actualisation...');
+            } else if (deletedSomething) {
+                this.notificationManager.success('Ligne supprimée');
+            } else if (hardError) {
+                this.notificationManager.error(hardError);
+            } else {
+                this.notificationManager.warning('Cette ligne n\'existe plus. Actualisation...');
+            }
+
+            await this.loadData();
+        } catch (error) {
+            this.errorHandler.handle(error, 'deleteAdminLine', 'Erreur lors de la suppression');
+        } finally {
+            this.loadingIndicator.hide('deleteMonitoring');
+        }
+    }
+
+    async deleteOperation(id) {
+        return this.deleteAdminLine({ eventId: id, fallbackId: id });
+    }
+
+    async deleteMonitoringRecord(id) {
+        return this.deleteAdminLine({ tempsId: id, fallbackId: id });
+    }
+
+    /**
+     * Menu déroulant des codes rubrique associés au lancement (étapes LCTC / SILOG).
+     * Retourne le code choisi, ou null si annulé (= pas de modification).
+     * Si aucune rubrique n'est trouvée pour le lancement, on revient à la saisie libre.
+     */
+    async pickCodeRubrique(lancementCode, currentCodeRubrique = '') {
+        const current = String(currentCodeRubrique || '').trim();
+        const byRubrique = new Map();
+        try {
+            const res = await this.apiService.getLancementSteps(String(lancementCode || '').trim().toUpperCase());
+            (res?.steps || []).forEach(s => {
+                const rubrique = String(s?.CodeRubrique || '').trim();
+                if (!rubrique) return;
+                if (!byRubrique.has(rubrique)) byRubrique.set(rubrique, { phases: new Set(), ops: new Set() });
+                const entry = byRubrique.get(rubrique);
+                const phase = String(s?.Phase || '').trim();
+                const op = String(s?.CodeOperation || '').trim();
+                if (phase) entry.phases.add(phase);
+                if (op) entry.ops.add(op);
+            });
+        } catch (e) {
+            this.logger.warn('⚠️ Impossible de récupérer les codes rubrique du lancement:', e?.message || e);
+        }
+
+        if (byRubrique.size === 0) {
+            return prompt(`CodeRubrique (actuel: ${current || 'vide'}) :`, current);
+        }
+
+        const esc = (v) => this.escapeHtmlAi(v);
+        const optionsHtml = Array.from(byRubrique.entries()).map(([rubrique, { phases, ops }]) => {
+            const details = [
+                phases.size ? `phase ${Array.from(phases).join(', ')}` : '',
+                ops.size ? Array.from(ops).join(' / ') : ''
+            ].filter(Boolean).join(' — ');
+            const label = `${rubrique}${details ? ` (${details})` : ''}${rubrique === current ? ' — actuel' : ''}`;
+            return `<option value="${esc(rubrique)}" ${rubrique === current ? 'selected' : ''}>${esc(label)}</option>`;
+        });
+        if (current && !byRubrique.has(current)) {
+            optionsHtml.unshift(`<option value="${esc(current)}" selected>${esc(current)} — actuel (hors lancement)</option>`);
+        }
+
+        return new Promise((resolve) => {
+            const modal = createElement('div', {
+                className: 'ai-assist-modal',
+                role: 'dialog',
+                'aria-modal': 'true'
+            });
+            modal.innerHTML = `
+                <div class="ai-assist-modal-card">
+                    <div class="ai-assist-modal-header">
+                        <strong>Code rubrique — ${esc(lancementCode)}</strong>
+                        <button type="button" class="ai-assist-close" aria-label="Fermer">&times;</button>
+                    </div>
+                    <p class="ai-assist-motif">Actuel : <b>${esc(current || 'vide')}</b></p>
+                    <select class="code-rubrique-select" style="width:100%;padding:8px;font-size:1rem;margin-bottom:12px;">
+                        ${optionsHtml.join('')}
+                    </select>
+                    <div class="ai-assist-actions">
+                        <button type="button" class="btn-secondary code-rubrique-cancel">Annuler</button>
+                        <button type="button" class="btn-primary code-rubrique-ok"><i class="fas fa-check"></i> Valider</button>
+                    </div>
+                </div>`;
+
+            const select = modal.querySelector('.code-rubrique-select');
+            const done = (value) => {
+                modal.remove();
+                resolve(value);
+            };
+            modal.querySelector('.ai-assist-close')?.addEventListener('click', () => done(null));
+            modal.querySelector('.code-rubrique-cancel')?.addEventListener('click', () => done(null));
+            modal.querySelector('.code-rubrique-ok')?.addEventListener('click', () => done(select?.value ?? null));
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) done(null);
+            });
+            modal.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') done(null);
+                if (e.key === 'Enter') done(select?.value ?? null);
+            });
+
+            document.body.appendChild(modal);
+            select?.focus();
+        });
+    }
+
+    async editMonitoringRecord(id) {
+        // Convertir l'ID en nombre pour éviter les problèmes de type
+        const tempsId = Number.parseInt(id, 10);
+        if (Number.isNaN(tempsId)) {
+            this.logger.error('❌ ID invalide:', id);
+            this.notificationManager.error('ID d\'enregistrement invalide');
+            return;
+        }
+
+        // Trouver l'enregistrement actuel pour pré-remplir les prompts
+        const record = this.operations.find(op => op.TempsId == tempsId);
+        
+        if (!record) {
+            this.logger.warn(`⚠️ Enregistrement avec TempsId ${tempsId} non trouvé dans les données locales. Actualisation...`);
+            this.notificationManager.warning('Enregistrement non trouvé. Actualisation des données...');
+            await this.loadData();
+            return;
+        }
+
+        // Si l'enregistrement est non consolidé, utiliser editOperation à la place
+        if (record._isUnconsolidated) {
+            this.logger.log('⚠️ Enregistrement non consolidé, redirection vers editOperation');
+            await this.editOperation(id);
+            return;
+        }
+
+        const currentLancementCode = record?.LancementCode || '';
+        const currentPhase = record?.Phase || '';
+        const currentCodeRubrique = record?.CodeRubrique || '';
+        const currentStartTime = record?.StartTime ? this.formatDateTime(record.StartTime) : '';
+        const currentEndTime = record?.EndTime ? this.formatDateTime(record.EndTime) : '';
+
+        // Correction simple via prompts (Phase/CodeRubrique/Start/End)
+        const lancementCode = prompt(`Lancement (actuel: ${currentLancementCode || 'vide'}) :`, currentLancementCode);
+        const phase = prompt(`Phase (actuel: ${currentPhase || 'vide'}) :`, currentPhase);
+        const targetLancementCode = (lancementCode !== null && lancementCode !== '') ? lancementCode : currentLancementCode;
+        const codeRubrique = await this.pickCodeRubrique(targetLancementCode, currentCodeRubrique);
+        const startTime = prompt(`Heure début (actuel: ${currentStartTime || 'vide'}) (YYYY-MM-DDTHH:mm:ss ou HH:mm) :`, currentStartTime);
+        const endTime = prompt(`Heure fin (actuel: ${currentEndTime || 'vide'}) (YYYY-MM-DDTHH:mm:ss ou HH:mm) :`, currentEndTime);
+
+        const corrections = {};
+        if (lancementCode !== null && lancementCode !== '' && lancementCode !== currentLancementCode) corrections.LancementCode = lancementCode;
+        if (phase !== null && phase !== '' && phase !== currentPhase) corrections.Phase = phase;
+        if (codeRubrique !== null && codeRubrique !== '' && codeRubrique !== currentCodeRubrique) corrections.CodeRubrique = codeRubrique;
+        if (startTime !== null && startTime !== '' && startTime !== currentStartTime) corrections.StartTime = startTime;
+        if (endTime !== null && endTime !== '' && endTime !== currentEndTime) corrections.EndTime = endTime;
+
+        if (Object.keys(corrections).length === 0) {
+            this.notificationManager.info('Aucune modification effectuée');
+            return;
+        }
+
+        try {
+            const result = await this.apiService.correctMonitoringTemps(tempsId, corrections);
+            if (result && result.success) {
+                this.notificationManager.success('Enregistrement corrigé');
+                
+                // Mettre à jour l'enregistrement en mémoire immédiatement
+                if (record) {
+                    const recordDay = this._parseOpDateCreationLocalYmd(record.DateCreation)
+                        || this._parseOpDateCreationLocalYmd(record.StartTime);
+                    if (corrections.LancementCode !== undefined) record.LancementCode = corrections.LancementCode;
+                    if (corrections.Phase !== undefined) record.Phase = corrections.Phase;
+                    if (corrections.CodeRubrique !== undefined) record.CodeRubrique = corrections.CodeRubrique;
+                    if (corrections.StartTime !== undefined) {
+                        record.StartTime = composeClockOnDay(recordDay, corrections.StartTime);
+                    }
+                    if (corrections.EndTime !== undefined) {
+                        record.EndTime = composeClockOnDay(recordDay, corrections.EndTime);
+                    }
+                    
+                    // Mettre à jour la ligne dans le tableau sans tout recharger
+                    this.updateMonitoringRowInTable(tempsId, record);
+                    this._keepAdminPeriodOnRecordDay(recordDay);
+                }
+                
+                this.lastEditTime = Date.now();
+                // Rechargement immédiat (pas silent différé) : sinon les segments historiques
+                // masquent encore l'ancienne heure tant que le cache UI n'est pas rafraîchi.
+                await this.loadData(false);
+            } else {
+                this.notificationManager.error(result?.error || 'Erreur correction');
+            }
+        } catch (error) {
+            this.logger.error('❌ Erreur lors de la correction:', error);
+            
+            // Si c'est une erreur 404 (enregistrement non trouvé), rafraîchir les données
+            if (error.message && error.message.includes('non trouvé')) {
+                this.notificationManager.warning('Cet enregistrement n\'existe plus (peut-être déjà supprimé). Actualisation...');
+                await this.loadData();
+            } else {
+                this.notificationManager.error(`Erreur lors de la correction: ${error.message || 'Erreur inconnue'}`);
+            }
+        }
+    }
+
+    /**
+     * Valide une opération avant édition
+     * @param {Object} operation - Opération à valider
+     * @returns {Object} { valid: boolean, errors: Array, warnings: Array }
+     */
+    validateOperationBeforeEdit(operation) {
+        const errors = [];
+        const warnings = [];
+        
+        if (!operation) {
+            return { valid: false, errors: ['Opération non trouvée'], warnings: [] };
+        }
+        
+        // Vérifier les heures
+        const startTime = operation.startTime || operation.StartTime;
+        const endTime = operation.endTime || operation.EndTime;
+        
+        if (startTime && endTime) {
+            const start = this.parseTime(startTime);
+            const end = this.parseTime(endTime);
+            
+            if (start && end && end <= start) {
+                warnings.push('Heure de fin antérieure ou égale à l\'heure de début (peut être valide si traverse minuit)');
+            }
+        }
+        
+        // Vérifier les durées pour les opérations consolidées
+        if (operation.TempsId && !operation._isUnconsolidated && operation.TotalDuration != null) {
+            const totalDuration = operation.TotalDuration || 0;
+            const pauseDuration = operation.PauseDuration || 0;
+            const productiveDuration = operation.ProductiveDuration || 0;
+            const calculatedProductive = totalDuration - pauseDuration;
+            
+            if (Math.abs(productiveDuration - calculatedProductive) > 1) {
+                warnings.push(`Incohérence des durées: TotalDuration (${totalDuration}) - PauseDuration (${pauseDuration}) = ${calculatedProductive}, mais ProductiveDuration = ${productiveDuration}`);
+            }
+            
+            if (totalDuration < 0 || pauseDuration < 0 || productiveDuration < 0) {
+                errors.push('Durées négatives détectées');
+            }
+        }
+        
+        return {
+            valid: errors.length === 0,
+            errors,
+            warnings
+        };
+    }
+    
+    /**
+     * Affiche les problèmes détectés pour une opération
+     * @param {Object} operation - Opération à vérifier
+     * @param {HTMLElement} row - Ligne du tableau
+     */
+    showOperationIssues(operation, row) {
+        // Supprimer les anciens badges d'avertissement
+        const existingBadge = row.querySelector('.operation-issue-badge');
+        if (existingBadge) {
+            existingBadge.remove();
+        }
+        
+        const validation = this.validateOperationBeforeEdit(operation);
+        
+        if (!validation.valid || validation.warnings.length > 0) {
+            // Créer un badge d'avertissement
+            const badge = createElement('span', {
+                className: 'operation-issue-badge badge badge-warning',
+                style: { marginLeft: '5px', cursor: 'pointer' },
+                title: [...validation.errors, ...validation.warnings].join('\n')
+            });
+            const icon = createElement('i', { className: 'fas fa-exclamation-triangle' });
+            badge.appendChild(icon);
+            
+            badge.addEventListener('click', () => {
+                const message = [
+                    'Problèmes détectés:',
+                    ...validation.errors.map(e => `❌ ${e}`),
+                    ...validation.warnings.map(w => `⚠️ ${w}`)
+                ].join('\n');
+                alert(message);
+            });
+            
+            // Ajouter le badge dans la cellule statut ou actions
+            const statusCell = row.querySelector('td:nth-child(6)'); // Colonne statut
+            if (statusCell) {
+                statusCell.appendChild(badge);
+            }
+        }
+    }
+    
+    /**
+     * Parse un format d'heure (HH:mm ou HH:mm:ss)
+     * @param {string} timeString - Chaîne d'heure
+     * @returns {number|null} Minutes depuis minuit ou null si invalide
+     */
+    parseTime(timeString) {
+        if (!timeString) return null;
+        
+        const timeStr = String(timeString).trim();
+        const parts = timeStr.split(':');
+        
+        if (parts.length < 2) return null;
+        
+        const hours = Number.parseInt(parts[0], 10);
+        const minutes = Number.parseInt(parts[1], 10);
+        
+        if (Number.isNaN(hours) || Number.isNaN(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+            return null;
+        }
+        
+        return hours * 60 + minutes;
+    }
+
+    async editOperation(id) {
+        // Éditer une opération non consolidée (ABHISTORIQUE_OPERATEURS) avec des popups (prompts)
+        // id = EventId (NoEnreg)
+        this.logger.log('✏️ Édition (popup) opération non consolidée, EventId:', id);
+        
+        const record = this.operations.find(op => 
+            (op.EventId && op.EventId == id) || 
+            (op.id && op.id == id) ||
+            (op._isUnconsolidated && (op.EventId == id || op.id == id))
+        );
+        
+        if (!record) {
+            this.logger.warn(`⚠️ Opération avec EventId ${id} non trouvée. Actualisation...`);
+            this.notificationManager.warning('Opération non trouvée. Actualisation des données...');
+            await this.loadData();
+            return;
+        }
+
+        // Si l'opération est en fait consolidée, rediriger vers l'édition monitoring
+        if (!record._isUnconsolidated && record.TempsId) {
+            this.logger.warn(`⚠️ Opération ${id} est consolidée, redirection vers editMonitoringRecord`);
+            await this.editMonitoringRecord(record.TempsId);
+            return;
+        }
+
+        const eventId = record.EventId || record.id || id;
+
+        // Préparer les valeurs actuelles pour les popups
+        const currentLancementCode = String(record.LancementCode || record.CodeLanctImprod || record.lancementCode || '').trim();
+        const currentStart = this.cleanTimeValue(record.startTime || record.StartTime || '');
+        const currentEnd = this.cleanTimeValue(record.endTime || record.EndTime || '');
+
+        const newLancementCode = prompt(
+            `Lancement (actuel: ${currentLancementCode || 'vide'}) :`,
+            currentLancementCode
+        );
+        if (newLancementCode === null) {
+            // Annulé par l'utilisateur
+            return;
+        }
+
+        const newStart = prompt(
+            `Heure début (actuel: ${currentStart || 'vide'}) - format HH:mm :`,
+            currentStart
+        );
+        if (newStart === null) {
+            // Annulé par l'utilisateur
+            return;
+        }
+
+        const newEnd = prompt(
+            `Heure fin (actuel: ${currentEnd || 'vide'}) - format HH:mm :`,
+            currentEnd
+        );
+        if (newEnd === null) {
+            // Annulé par l'utilisateur
+            return;
+        }
+
+        const updateData = {};
+        const normalizedLancement = String(newLancementCode || '').trim();
+        if (normalizedLancement && normalizedLancement !== currentLancementCode) updateData.lancementCode = normalizedLancement;
+        if (newStart && newStart !== currentStart) updateData.startTime = newStart;
+        if (newEnd && newEnd !== currentEnd) updateData.endTime = newEnd;
+
+        if (Object.keys(updateData).length === 0) {
+            this.notificationManager.info('Aucune modification effectuée');
+            return;
+        }
+
+        try {
+            const result = await this.apiService.updateOperation(eventId, updateData);
+            if (result && result.success) {
+                this.notificationManager.success('Opération modifiée avec succès');
+                await this.loadData();
+            } else {
+                this.notificationManager.error(result?.error || 'Erreur lors de la modification');
+            }
+        } catch (error) {
+            this.logger.error('❌ Erreur lors de la modification de l\'opération:', error);
+            this.notificationManager.error('Erreur lors de la modification');
+        }
+    }
+    
+    // Fonction d'édition inline (non-async car manipulation DOM directe)
+    editOperationInline(id) {
+        this.logger.log('🔧 Édition inline de l\'opération:', id, 'Type:', typeof id);
+        
+        // Convertir l'ID en nombre si nécessaire pour la comparaison
+        const numericId = typeof id === 'string' ? Number.parseInt(id, 10) : id;
+        
+        // Trouver la ligne correspondante - essayer plusieurs méthodes
+        let row = document.querySelector(`tr[data-operation-id="${id}"]`);
+        if (!row) {
+            row = document.querySelector(`tr[data-operation-id="${numericId}"]`);
+        }
+        if (!row) {
+            // Essayer de trouver via le bouton
+            const button = document.querySelector(`button.btn-edit[data-id="${id}"]`) || 
+                          document.querySelector(`button.btn-edit[data-id="${numericId}"]`);
+            if (button) {
+                row = button.closest('tr');
+            }
+        }
+        
+        if (!row) {
+            this.logger.error('❌ Ligne non trouvée pour l\'ID:', id);
+            this.notificationManager.warning(`Ligne non trouvée pour l'opération ${id}. Rechargement du tableau...`);
+            this.loadData();
+            return;
+        }
+        
+        // Trouver l'opération dans les données
+        const operation = this.operations.find(op => {
+            const match = op.id == id || op.id == numericId || 
+                         op.EventId == id || op.EventId == numericId ||
+                         op.TempsId == id || op.TempsId == numericId ||
+                         String(op.id) === String(id) || String(op.id) === String(numericId) ||
+                         String(op.EventId) === String(id) || String(op.EventId) === String(numericId);
+            return match;
+        });
+        
+        if (!operation) {
+            this.logger.error('❌ Opération non trouvée pour l\'ID:', id);
+            this.notificationManager.warning(`Opération ${id} non trouvée dans les données. Rechargement...`);
+            this.loadData();
+            return;
+        }
+        
+        // Sauvegarder les valeurs originales
+        const startTimeValue = operation.startTime || operation.StartTime || '';
+        const endTimeValue = operation.endTime || operation.EndTime || '';
+        const originalStartTime = this.cleanTimeValue(startTimeValue);
+        const originalEndTime = this.cleanTimeValue(endTimeValue);
+        
+        // Remplacer les cellules par des inputs (même logique que dans l'ancienne fonction)
+        const cells = row.querySelectorAll('td');
+        if (cells.length >= 6) {
+            // Cellule heure début (index 5)
+            clearElement(cells[5]);
+            const startInput = createElement('input', {
+                type: 'time',
+                className: 'time-input form-control',
+                dataset: {
+                    field: 'startTime',
+                    id: id,
+                    original: originalStartTime
+                },
+                value: originalStartTime || '',
+                style: { width: '100%', padding: '4px' }
+            });
+            cells[5].appendChild(startInput);
+            
+            // Cellule heure fin (index 6)
+            clearElement(cells[6]);
+            const endInput = createElement('input', {
+                type: 'time',
+                className: 'time-input form-control',
+                dataset: {
+                    field: 'endTime',
+                    id: id,
+                    original: originalEndTime
+                },
+                value: originalEndTime || '',
+                style: { width: '100%', padding: '4px' }
+            });
+            endInput.addEventListener('change', () => this.validateTimeInput(endInput));
+            cells[6].appendChild(endInput);
+            
+            // Cellule actions (index 8) - remplacer par boutons sauvegarder/annuler
+            clearElement(cells[8]);
+            const saveBtn = createButton({
+                icon: 'fas fa-check',
+                className: 'btn btn-sm btn-success',
+                title: 'Sauvegarder',
+                onClick: () => this.saveOperation(id)
+            });
+            const cancelBtn = createButton({
+                icon: 'fas fa-times',
+                className: 'btn btn-sm btn-secondary',
+                title: 'Annuler',
+                onClick: () => this.cancelEdit(id)
+            });
+            cancelBtn.style.marginLeft = '5px';
+            cells[8].appendChild(saveBtn);
+            cells[8].appendChild(cancelBtn);
+        }
+    }
+    
+    cancelEdit(id) {
+        // Recharger les données pour annuler l'édition et restaurer l'état normal
+        this.loadData();
+    }
+
+    updateMonitoringRowInTable(tempsId, record) {
+        const row = document.querySelector(`tr[data-operation-id="${tempsId}"]`)
+            || document.querySelector(`tr[data-temps-id="${tempsId}"]`);
+        if (!row) {
+            this.logger.warn(`⚠️ Ligne non trouvée pour TempsId ${tempsId}, rechargement complet`);
+            this.updateOperationsTable();
+            return;
+        }
+
+        const cells = row.querySelectorAll('td');
+        if (cells.length >= 8) {
+            // Cellule 2 = lancement (peut contenir un sous-div)
+            if (record.LancementCode != null && cells[1]) {
+                const codeNode = cells[1].querySelector('div') || cells[1];
+                // Garder d'éventuelles icônes ; remplacer le texte du LT
+                const textParts = [];
+                codeNode.childNodes.forEach((n) => {
+                    if (n.nodeType === Node.TEXT_NODE) textParts.push(n);
+                });
+                if (textParts.length > 0) {
+                    textParts[textParts.length - 1].textContent = ` ${record.LancementCode}`;
+                } else {
+                    cells[1].textContent = record.LancementCode;
+                }
+            }
+
+            // Mettre à jour les heures (cellules 5 et 6)
+            const formattedStartTime = this.formatDateTime(record.StartTime);
+            const formattedEndTime = this.formatDateTime(record.EndTime);
+            
+            cells[5].textContent = formattedStartTime;
+            cells[6].textContent = formattedEndTime;
+            
+            this.logger.log(`✅ Ligne ${tempsId} mise à jour dans le tableau:`, {
+                LancementCode: record.LancementCode,
+                StartTime: formattedStartTime,
+                EndTime: formattedEndTime
+            });
+        }
+    }
+
+    formatDateTime(dateString) {
+        // Si c'est null ou undefined, retourner un tiret
+        if (!dateString) return '-';
+        
+        if (this.debugTime) {
+            this.logger.log(`🔧 formatDateTime input: "${dateString}" (type: ${typeof dateString}) and value:`, dateString);
+        }
+        
+        // Si c'est déjà au format HH:mm, le retourner directement
+        if (typeof dateString === 'string') {
+            const timeMatch = dateString.match(/^(\d{1,2}):(\d{2})$/);
+            if (timeMatch) {
+                const hours = timeMatch[1].padStart(2, '0');
+                const minutes = timeMatch[2];
+                const result = `${hours}:${minutes}`;
+                if (this.debugTime) this.logger.log(`✅ formatDateTime: ${dateString} → ${result}`);
+                return result;
+            }
+            
+            // Si c'est au format HH:mm:ss, extraire HH:mm
+            const timeWithSecondsMatch = dateString.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+            if (timeWithSecondsMatch) {
+                const hours = timeWithSecondsMatch[1].padStart(2, '0');
+                const minutes = timeWithSecondsMatch[2];
+                const result = `${hours}:${minutes}`;
+                if (this.debugTime) this.logger.log(`✅ formatDateTime: ${dateString} → ${result}`);
+                return result;
+            }
+        }
+        
+        // Si c'est un objet Date, extraire l'heure avec fuseau horaire français
+        if (dateString instanceof Date) {
+            const result = dateString.toLocaleTimeString('fr-FR', {
+                timeZone: 'Europe/Paris',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            });
+            if (this.debugTime) this.logger.log(`✅ formatDateTime: Date → ${result}`);
+            return result;
+        }
+        
+        // Sinon, essayer de formater comme une date complète avec fuseau horaire Paris
+        try {
+            const date = new Date(dateString);
+            if (!Number.isNaN(date.getTime())) {
+                // Utiliser fuseau horaire français (Europe/Paris)
+                const result = date.toLocaleTimeString('fr-FR', {
+                    timeZone: 'Europe/Paris',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false
+                });
+                if (this.debugTime) this.logger.log(`✅ formatDateTime: Date string → ${result}`);
+                return result;
+            }
+        } catch (error) {
+            this.logger.warn('Erreur formatage heure:', dateString, error);
+        }
+        
+        // En dernier recours, retourner la valeur originale ou un tiret
+        this.logger.warn(`⚠️ Format non reconnu: ${dateString}`);
+        return dateString || '-';
+    }
+
+    getStatusText(status) {
+        const statusMap = {
+            'active': 'En cours',
+            'paused': 'En pause',
+            'completed': 'Terminé',
+            'started': 'Démarré',
+            'TERMINE': 'Terminé',
+            'PAUSE': 'En pause',
+            'EN_COURS': 'En cours',
+            'PAUSE_TERMINEE': 'Pause terminée'
+        };
+        return statusMap[status] || status;
+    }
+    
+    // ===== SYSTÈME DE SAUVEGARDE AUTOMATIQUE =====
+    
+    startAutoSave() {
+        if (this.autoSaveEnabled) {
+            this.autoSaveTimer = setInterval(() => {
+                this.processAutoSave();
+            }, this.autoSaveInterval);
+            
+            this.logger.log(`🔄 Sauvegarde automatique activée (${this.autoSaveInterval/1000}s)`);
+        }
+    }
+    
+    stopAutoSave() {
+        if (this.autoSaveTimer) {
+            clearInterval(this.autoSaveTimer);
+            this.autoSaveTimer = null;
+            this.logger.log('⏹️ Sauvegarde automatique désactivée');
+        }
+    }
+    
+    addPendingChange(operationId, field, value) {
+        if (!this.pendingChanges.has(operationId)) {
+            this.pendingChanges.set(operationId, {});
+        }
+        
+        const operationChanges = this.pendingChanges.get(operationId);
+        operationChanges[field] = value;
+        
+        this.logger.log(`📝 Modification en attente pour ${operationId}:`, operationChanges);
+        
+        // Sauvegarde immédiate pour les modifications critiques
+        if (field === 'startTime' || field === 'endTime') {
+            this.saveOperationImmediately(operationId, operationChanges);
+        }
+    }
+    
+    async processAutoSave() {
+        if (this.pendingChanges.size === 0) {
+            return;
+        }
+        
+        this.logger.log(`💾 Sauvegarde automatique de ${this.pendingChanges.size} modifications...`);
+        
+        const savePromises = [];
+        
+        for (const [operationId, changes] of this.pendingChanges) {
+            if (Object.keys(changes).length > 0) {
+                savePromises.push(this.saveOperationChanges(operationId, changes));
+            }
+        }
+        
+        try {
+            await Promise.all(savePromises);
+            this.pendingChanges.clear();
+            this.logger.log('✅ Sauvegarde automatique terminée');
+            
+            // Notification discrète
+            this.showAutoSaveNotification('Modifications sauvegardées automatiquement');
+            
+        } catch (error) {
+            this.logger.error('❌ Erreur sauvegarde automatique:', error);
+            this.showAutoSaveNotification('Erreur lors de la sauvegarde automatique', 'error');
+        }
+    }
+    
+    async saveOperationImmediately(operationId, changes) {
+        try {
+            await this.saveOperationChanges(operationId, changes);
+            this.pendingChanges.delete(operationId);
+            this.logger.log(`⚡ Sauvegarde immédiate réussie pour ${operationId}`);
+        } catch (error) {
+            this.logger.error(`❌ Erreur sauvegarde immédiate ${operationId}:`, error);
+        }
+    }
+    
+    async saveOperationChanges(operationId, changes) {
+        const operation = this.operations.find(op => op.id == operationId);
+        if (!operation) {
+            throw new Error(`Opération ${operationId} non trouvée`);
+        }
+        
+        const updateData = {
+            ...changes,
+            id: operationId
+        };
+        
+        const result = await this.apiService.updateOperation(updateData);
+        
+        if (result.success) {
+            // Mettre à jour l'opération locale
+            Object.assign(operation, changes);
+            this.logger.log(`✅ Opération ${operationId} mise à jour:`, changes);
+        } else {
+            throw new Error(result.error || 'Erreur lors de la mise à jour');
+        }
+        
+        return result;
+    }
+    
+    showAutoSaveNotification(message, type = 'success') {
+        if (this.notificationManager) {
+            this.notificationManager.show(message, type, 3000);
+        } else {
+            // Fallback si pas de notification manager
+            this.logger.log(`📢 ${message}`);
+        }
+    }
+    
+    // ===== VALIDATION AUTOMATIQUE DES CODES LANCEMENT =====
+    
+    async validateLancementCode(code) {
+        if (!code || code.length < 3) {
+            return { valid: false, error: 'Code trop court' };
+        }
+        
+        try {
+            const result = await this.apiService.validateLancementCode(code);
+            return result;
+        } catch (error) {
+            this.logger.error('❌ Erreur validation code:', error);
+            return { valid: false, error: 'Erreur de validation' };
+        }
+    }
+    
+    setupLancementValidation(inputElement) {
+        let validationTimeout;
+        
+        inputElement.addEventListener('input', (e) => {
+            const code = e.target.value.trim();
+            
+            // Annuler la validation précédente
+            if (validationTimeout) {
+                clearTimeout(validationTimeout);
+            }
+            
+            // Validation différée (éviter trop d'appels API)
+            validationTimeout = setTimeout(async () => {
+                if (code.length >= 3) {
+                    await this.performLancementValidation(inputElement, code);
+                } else {
+                    this.clearValidationFeedback(inputElement);
+                }
+            }, 500);
+        });
+    }
+    
+    async performLancementValidation(inputElement, code) {
+        // Ajouter indicateur de chargement
+        inputElement.classList.add('validating');
+        
+        try {
+            const result = await this.validateLancementCode(code);
+            
+            if (result.valid) {
+                this.showValidationSuccess(inputElement, result.data);
+            } else {
+                this.showValidationError(inputElement, result.error);
+            }
+            
+        } catch (error) {
+            this.showValidationError(inputElement, 'Erreur de validation');
+        } finally {
+            inputElement.classList.remove('validating');
+        }
+    }
+    
+    showValidationSuccess(inputElement, data) {
+        inputElement.classList.remove('validation-error');
+        inputElement.classList.add('validation-success');
+        
+        // Ajouter un tooltip avec les infos
+        const tooltip = createElement('div', { className: 'validation-tooltip success' });
+        const strong = createElement('strong', {}, '✅ Code valide');
+        tooltip.appendChild(strong);
+        tooltip.appendChild(createElement('br'));
+        tooltip.appendChild(document.createTextNode(data.designation));
+        tooltip.appendChild(createElement('br'));
+        const small = createElement('small', {}, `Statut: ${data.statut}`);
+        tooltip.appendChild(small);
+        
+        inputElement.parentNode.appendChild(tooltip);
+        
+        // Supprimer le tooltip après 3 secondes
+        setTimeout(() => {
+            if (tooltip.parentNode) {
+                tooltip.parentNode.removeChild(tooltip);
+            }
+        }, 3000);
+    }
+    
+    showValidationError(inputElement, error) {
+        inputElement.classList.remove('validation-success');
+        inputElement.classList.add('validation-error');
+        
+        // Ajouter un tooltip d'erreur
+        const tooltip = createElement('div', { className: 'validation-tooltip error' });
+        const strong = createElement('strong', {}, `❌ ${error}`);
+        tooltip.appendChild(strong);
+        
+        inputElement.parentNode.appendChild(tooltip);
+        
+        // Supprimer le tooltip après 5 secondes
+        setTimeout(() => {
+            if (tooltip.parentNode) {
+                tooltip.parentNode.removeChild(tooltip);
+            }
+        }, 5000);
+    }
+    
+    clearValidationFeedback(inputElement) {
+        inputElement.classList.remove('validation-success', 'validation-error', 'validating');
+        
+        // Supprimer les tooltips existants
+        const existingTooltips = inputElement.parentNode.querySelectorAll('.validation-tooltip');
+        existingTooltips.forEach(tooltip => tooltip.remove());
+    }
+
+    cleanTimeValue(timeString) {
+        if (!timeString) return '';
+        
+        // Si c'est déjà au format HH:mm, le retourner directement
+        if (typeof timeString === 'string' && /^\d{2}:\d{2}$/.test(timeString)) {
+            return timeString;
+        }
+        
+        // Si c'est au format HH:mm:ss, enlever les secondes
+        if (typeof timeString === 'string' && /^\d{2}:\d{2}:\d{2}$/.test(timeString)) {
+            return timeString.substring(0, 5);
+        }
+        
+        // Si c'est au format H:mm ou H:m, ajouter le zéro manquant
+        if (typeof timeString === 'string' && /^\d{1,2}:\d{1,2}$/.test(timeString)) {
+            const parts = timeString.split(':');
+            const hours = parts[0].padStart(2, '0');
+            const minutes = parts[1].padStart(2, '0');
+            return `${hours}:${minutes}`;
+        }
+        
+        this.logger.warn(`⚠️ Format d'heure non reconnu pour nettoyage: "${timeString}"`);
+        return '';
+    }
+
+    formatTimeForInput(timeString) {
+        if (!timeString) return '';
+        
+        if (this.debugTime) this.logger.log(`🔧 formatTimeForInput: "${timeString}"`);
+        
+        // Si c'est déjà au format HH:mm, le retourner directement
+        if (typeof timeString === 'string' && /^\d{2}:\d{2}$/.test(timeString)) {
+            if (this.debugTime) this.logger.log(`✅ Format HH:mm direct: ${timeString}`);
+            return timeString;
+        }
+        
+        // Si c'est au format HH:mm:ss, enlever les secondes
+        if (typeof timeString === 'string' && /^\d{2}:\d{2}:\d{2}$/.test(timeString)) {
+            const result = timeString.substring(0, 5);
+            if (this.debugTime) this.logger.log(`✅ Format HH:mm:ss → HH:mm: ${timeString} → ${result}`);
+            return result;
+        }
+        
+        // Si c'est une date complète, extraire seulement l'heure
+        if (typeof timeString === 'string' && timeString.includes('T')) {
+            try {
+                const date = new Date(timeString);
+                if (!Number.isNaN(date.getTime())) {
+                    // Utiliser toLocaleTimeString avec fuseau horaire français
+                    const formattedTime = date.toLocaleTimeString('fr-FR', {
+                        timeZone: 'Europe/Paris',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        hour12: false
+                    });
+                    if (this.debugTime) this.logger.log(`✅ Date complète → HH:mm: ${timeString} → ${formattedTime}`);
+                    return formattedTime;
+                }
+            } catch (error) {
+                this.logger.warn('Erreur parsing date:', timeString, error);
+            }
+        }
+        
+        // Si c'est un objet Date, extraire l'heure avec fuseau horaire français
+        if (timeString instanceof Date) {
+            const formattedTime = timeString.toLocaleTimeString('fr-FR', {
+                timeZone: 'Europe/Paris',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            });
+            if (this.debugTime) this.logger.log(`✅ Date object → HH:mm: ${timeString} → ${formattedTime}`);
+            return formattedTime;
+        }
+        
+        this.logger.warn(`⚠️ Format d'heure non reconnu: "${timeString}" (type: ${typeof timeString})`);
+        return '';
+    }
+
+    formatDateTimeForInput(dateString) {
+        if (!dateString) return '';
+        
+        // Si c'est déjà au format HH:mm, créer une date d'aujourd'hui avec cette heure
+        if (typeof dateString === 'string' && /^\d{2}:\d{2}$/.test(dateString)) {
+            const today = new Date();
+            const [hours, minutes] = dateString.split(':');
+            today.setHours(Number.parseInt(hours), Number.parseInt(minutes), 0, 0);
+            return today.toISOString().slice(0, 16); // Format YYYY-MM-DDTHH:mm
+        }
+        
+        // Sinon, essayer de traiter comme une date complète
+        const date = new Date(dateString);
+        if (Number.isNaN(date.getTime())) {
+            this.logger.warn('Date invalide reçue:', dateString);
+            return '';
+        }
+        
+        return date.toISOString().slice(0, 16); // Format YYYY-MM-DDTHH:mm
+    }
+
+    // Fonction wrapper pour les appels inline (onchange)
+    validateTimeInput(inputElement) {
+        const row = inputElement.closest('tr');
+        if (!row) return;
+        
+        const operationId = row.dataset.id || row.dataset.tempsId || row.dataset.eventId;
+        this.validateTimeInputs(row, operationId);
+    }
+
+    validateTimeInputs(row, operationId) {
+        const startTimeInput = row.querySelector('input[data-field="startTime"]');
+        const endTimeInput = row.querySelector('input[data-field="endTime"]');
+        
+        if (!startTimeInput || !endTimeInput) return;
+
+        const startTime = startTimeInput.value;
+        const endTime = endTimeInput.value;
+
+        if (startTime && endTime) {
+            const startTimeObj = new Date(`2000-01-01 ${startTime}`);
+            const endTimeObj = new Date(`2000-01-01 ${endTime}`);
+            
+            if (endTimeObj <= startTimeObj) {
+                // Marquer les inputs comme invalides
+                startTimeInput.style.borderColor = '#dc3545';
+                startTimeInput.style.backgroundColor = '#f8d7da';
+                endTimeInput.style.borderColor = '#dc3545';
+                endTimeInput.style.backgroundColor = '#f8d7da';
+                
+                // Ajouter un message d'erreur
+                this.showTimeValidationError(row, 'L\'heure de fin doit être postérieure à l\'heure de début');
+            } else {
+                // Restaurer l'apparence normale
+                startTimeInput.style.borderColor = '';
+                startTimeInput.style.backgroundColor = '';
+                endTimeInput.style.borderColor = '';
+                endTimeInput.style.backgroundColor = '';
+                
+                // Supprimer le message d'erreur
+                this.hideTimeValidationError(row);
+            }
+        }
+    }
+
+    showTimeValidationError(row, message) {
+        // Supprimer l'ancien message s'il existe
+        this.hideTimeValidationError(row);
+        
+        // Créer le message d'erreur
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'time-validation-error';
+        errorDiv.style.cssText = `
+            color: #dc3545;
+            font-size: 12px;
+            margin-top: 5px;
+            padding: 5px;
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            border-radius: 4px;
+        `;
+        errorDiv.textContent = message;
+        
+        // Insérer après la ligne
+        row.parentNode.insertBefore(errorDiv, row.nextSibling);
+    }
+
+    hideTimeValidationError(row) {
+        const errorDiv = row.parentNode.querySelector('.time-validation-error');
+        if (errorDiv) {
+            errorDiv.remove();
+        }
+    }
+
+    async saveOperation(id) {
+        try {
+            // Rechercher dans la ligne ciblée pour éviter les sélections globales nulles
+            const row = document.querySelector(`tr[data-operation-id="${id}"]`);
+            
+            if (!row) {
+                this.logger.warn('⚠️ Ligne non trouvée pour l\'opération', id);
+                this.notificationManager.warning('Ligne non trouvée');
+                this.updateOperationsTable();
+                return;
+            }
+
+            // Rechercher les inputs avec plusieurs sélecteurs possibles
+            const startTimeInput = row.querySelector('input[data-field="startTime"]') || 
+                                 row.querySelector('input[data-id="' + id + '"][data-field="startTime"]') ||
+                                 row.querySelector('.time-input[data-field="startTime"]');
+            const endTimeInput = row.querySelector('input[data-field="endTime"]') || 
+                               row.querySelector('input[data-id="' + id + '"][data-field="endTime"]') ||
+                               row.querySelector('.time-input[data-field="endTime"]');
+            const statusSelect = row.querySelector('select[data-field="status"]') ||
+                               row.querySelector('.status-select[data-field="status"]');
+
+            this.logger.log('🔍 Recherche des inputs:', {
+                id,
+                rowFound: !!row,
+                startTimeInputFound: !!startTimeInput,
+                endTimeInputFound: !!endTimeInput,
+                statusSelectFound: !!statusSelect,
+                rowHTML: row.innerHTML.substring(0, 200) + '...'
+            });
+
+            if (!startTimeInput || !endTimeInput) {
+                this.logger.warn('⚠️ Impossible de trouver les champs d\'heure pour la ligne', id);
+                this.logger.log('🔍 Contenu de la ligne:', row.innerHTML);
+                this.notificationManager.warning('Aucune édition active pour cette ligne - Rechargement du tableau');
+                this.updateOperationsTable();
+                return;
+            }
+            
+            // Le statut est optionnel (peut ne pas être en mode édition)
+            if (!statusSelect) {
+                this.logger.log('ℹ️ Aucun select de statut trouvé - mode édition partielle');
+            }
+
+            // Récupérer les valeurs originales
+            const originalStartTime = startTimeInput.getAttribute('data-original');
+            const originalEndTime = endTimeInput.getAttribute('data-original');
+            const originalStatus = statusSelect ? statusSelect.getAttribute('data-original') : null;
+            
+            // Validation des heures
+            const startTime = startTimeInput.value;
+            const endTime = endTimeInput.value;
+            
+            if (startTime && endTime) {
+                const startTimeObj = new Date(`2000-01-01 ${startTime}`);
+                const endTimeObj = new Date(`2000-01-01 ${endTime}`);
+                
+                if (endTimeObj <= startTimeObj) {
+                    this.notificationManager.error('❌ L\'heure de fin doit être postérieure à l\'heure de début');
+                    this.logger.warn('⚠️ Heure de fin antérieure à l\'heure de début:', { startTime, endTime });
+                    return;
+                }
+            }
+
+            // Vérifier si les valeurs ont vraiment changé
+            const startTimeChanged = startTimeInput.value !== originalStartTime;
+            const endTimeChanged = endTimeInput.value !== originalEndTime;
+            const statusChanged = statusSelect ? (statusSelect.value !== originalStatus) : false;
+            
+            this.logger.log(`🔧 Comparaison des valeurs pour ${id}:`, {
+                startTime: {
+                    original: originalStartTime,
+                    current: startTimeInput.value,
+                    changed: startTimeChanged
+                },
+                endTime: {
+                    original: originalEndTime,
+                    current: endTimeInput.value,
+                    changed: endTimeChanged
+                },
+                status: {
+                    original: originalStatus,
+                    current: statusSelect ? statusSelect.value : 'N/A',
+                    changed: statusChanged
+                }
+            });
+            
+            // Si aucune valeur n'a changé, ne pas envoyer de requête mais restaurer l'état normal
+            if (!startTimeChanged && !endTimeChanged && !statusChanged) {
+                this.logger.log(`ℹ️ Aucune modification détectée pour l'opération ${id}`);
+                this.notificationManager.info('Aucune modification détectée');
+                // Recharger les données pour restaurer l'état normal (sortir du mode édition)
+                await this.loadData();
+                return;
+            }
+            
+            const updateData = {};
+            
+            // Ajouter seulement les champs qui ont changé avec validation
+            if (startTimeChanged) {
+                const startTime = this.validateAndFormatTime(startTimeInput.value);
+                if (startTime) {
+                    updateData.startTime = startTime;
+                } else {
+                    this.notificationManager.error('Format d\'heure de début invalide');
+                    return;
+                }
+            }
+            
+            if (endTimeChanged) {
+                const endTime = this.validateAndFormatTime(endTimeInput.value);
+                if (endTime) {
+                    updateData.endTime = endTime;
+                } else {
+                    this.notificationManager.error('Format d\'heure de fin invalide');
+                    return;
+                }
+            }
+            
+            // Ajouter le statut s'il a changé
+            if (statusChanged && statusSelect) {
+                updateData.status = statusSelect.value;
+                this.logger.log(`🔧 Statut changé: ${originalStatus} → ${statusSelect.value}`);
+            }
+            
+            // Validation de cohérence des heures
+            if (updateData.startTime && updateData.endTime) {
+                if (!this.validateTimeConsistency(updateData.startTime, updateData.endTime)) {
+                    this.notificationManager.warning('Attention: L\'heure de fin est antérieure à l\'heure de début');
+                }
+            }
+
+            this.logger.log(`💾 Sauvegarde opération ${id}:`, updateData);
+
+            // Vérifier si c'est un enregistrement de monitoring (ABTEMPS_OPERATEURS) ou historique (ABHISTORIQUE_OPERATEURS)
+            // Utiliser la ligne déjà trouvée (row déclarée plus haut)
+            const tempsIdFromRow = row?.dataset?.tempsId ? Number.parseInt(row.dataset.tempsId, 10) : null;
+            const eventIdFromRow = row?.dataset?.eventId || null;
+            const isUnconsolidatedFromRow = row?.dataset?.unconsolidated === 'true';
+            
+            // Trouver l'enregistrement dans la liste
+            const record = this.operations.find(op => {
+                if (tempsIdFromRow && op.TempsId == tempsIdFromRow) return true;
+                if (eventIdFromRow && (op.EventId == eventIdFromRow || op.id == eventIdFromRow)) return true;
+                if (op.TempsId == id || op.EventId == id || op.id == id) return true;
+                return false;
+            });
+            
+            const isMonitoringRecord = record && record.TempsId && !record._isUnconsolidated;
+            
+            let response;
+            if (isMonitoringRecord) {
+                // C'est un enregistrement de monitoring - utiliser la route de correction
+                const corrections = {};
+                if (updateData.startTime) corrections.StartTime = updateData.startTime;
+                if (updateData.endTime) corrections.EndTime = updateData.endTime;
+                if (updateData.Phase) corrections.Phase = updateData.Phase;
+                if (updateData.CodeRubrique) corrections.CodeRubrique = updateData.CodeRubrique;
+                
+                response = await this.apiService.correctMonitoringTemps(record.TempsId, corrections);
+            } else {
+                // C'est un enregistrement historique (non consolidé) - utiliser la route operations
+                response = await this.apiService.updateOperation(id, updateData);
+            }
+            
+            if (response.success) {
+                this.notificationManager.success('Opération mise à jour avec succès');
+                
+                // Enregistrer le temps de la dernière édition pour éviter le rechargement automatique
+                this.lastEditTime = Date.now();
+                
+                // Mettre à jour en mémoire AVANT de mettre à jour l'affichage
+                if (isMonitoringRecord) {
+                    // Pour monitoring, mettre à jour avec les noms de champs corrects
+                    if (updateData.startTime) record.StartTime = updateData.startTime;
+                    if (updateData.endTime) record.EndTime = updateData.endTime;
+                    if (updateData.Phase) record.Phase = updateData.Phase;
+                    if (updateData.CodeRubrique) record.CodeRubrique = updateData.CodeRubrique;
+                } else {
+                    this.updateOperationInMemory(id, updateData);
+                }
+                
+                // Vérifier que la mise à jour en mémoire a bien fonctionné
+                const updatedOperation = this.operations.find(op => (op.TempsId == id || op.id == id));
+                this.logger.log('🔍 Opération après mise à jour en mémoire:', updatedOperation);
+                
+                // Recharger complètement les données pour restaurer l'état normal (sortir du mode édition)
+                await this.loadData();
+            } else {
+                const errorMessage = response.error || 'Erreur lors de la mise à jour';
+                this.notificationManager.error(`Erreur: ${errorMessage}`);
+                this.logger.error('Erreur de mise à jour:', response);
+            }
+        } catch (error) {
+            this.logger.error('Erreur sauvegarde:', error);
+            
+            let errorMessage = 'Erreur lors de la sauvegarde';
+            if (error.message.includes('fetch')) {
+                errorMessage = 'Impossible de contacter le serveur';
+            } else if (error.message.includes('HTTP')) {
+                errorMessage = `Erreur serveur: ${error.message}`;
+            }
+            
+            this.notificationManager.error(errorMessage);
+            
+            // Restaurer les valeurs originales en cas d'erreur
+            this.loadData();
+        }
+    }
+
+    updateOperationInMemory(operationId, updateData) {
+        this.logger.log(`🔄 Mise à jour en mémoire de l'opération ${operationId}:`, updateData);
+        
+        const operation = this.operations.find(op => op.id == operationId);
+        if (!operation) {
+            this.logger.error(`❌ Opération ${operationId} non trouvée en mémoire`);
+            return;
+        }
+        
+        // Mettre à jour les champs modifiés
+        if (updateData.startTime !== undefined) {
+            operation.startTime = updateData.startTime;
+            this.logger.log(`✅ startTime mis à jour: ${operation.startTime}`);
+        }
+        
+        if (updateData.endTime !== undefined) {
+            operation.endTime = updateData.endTime;
+            this.logger.log(`✅ endTime mis à jour: ${operation.endTime}`);
+        }
+        
+        // Mettre à jour le statut si modifié
+        if (updateData.status !== undefined) {
+            operation.statusCode = updateData.status;
+            // Mettre à jour aussi le label du statut
+            const statusLabels = {
+                'EN_COURS': 'En cours',
+                'EN_PAUSE': 'En pause',
+                'TERMINE': 'Terminé',
+                'PAUSE_TERMINEE': 'Pause terminée',
+                'FORCE_STOP': 'Arrêt forcé'
+            };
+            operation.status = statusLabels[updateData.status] || updateData.status;
+            this.logger.log(`✅ Statut mis à jour: ${operation.statusCode} (${operation.status})`);
+        }
+        
+        // Mettre à jour le timestamp de dernière modification
+        operation.lastUpdate = new Date().toISOString();
+        
+        this.logger.log(`✅ Opération ${operationId} mise à jour en mémoire`);
+    }
+
+    updateSingleRowInTable(operationId) {
+        this.logger.log(`🔄 Mise à jour de la ligne ${operationId} dans le tableau`);
+        
+        // Chercher l'opération par id ou TempsId (pour les opérations non consolidées)
+        const operation = this.operations.find(op => op.id == operationId || op.TempsId == operationId);
+        if (!operation) {
+            this.logger.error(`❌ Opération ${operationId} non trouvée pour mise à jour du tableau`);
+            return;
+        }
+        
+        // Trouver la ligne existante
+        const existingRow = document.querySelector(`tr[data-operation-id="${operationId}"]`);
+        if (!existingRow) {
+            this.logger.warn(`⚠️ Ligne non trouvée pour l'opération ${operationId}, rechargement complet`);
+            this.updateOperationsTable();
+            return;
+        }
+        
+        // Mettre à jour les cellules d'heures et statut
+        const cells = existingRow.querySelectorAll('td');
+        if (cells.length >= 8) {
+            // Cellule heure début (index 5) - utiliser startTime ou StartTime
+            const startTimeValue = operation.startTime || operation.StartTime;
+            const formattedStartTime = this.formatDateTime(startTimeValue);
+            clearElement(cells[5]);
+            cells[5].textContent = formattedStartTime;
+            
+            // Cellule heure fin (index 6) - utiliser endTime ou EndTime
+            const endTimeValue = operation.endTime || operation.EndTime;
+            const formattedEndTime = this.formatDateTime(endTimeValue);
+            clearElement(cells[6]);
+            cells[6].textContent = formattedEndTime;
+            
+            // Cellule statut (index 7)
+            // Utiliser le statut de l'opération, mais ne pas utiliser 'EN_COURS' par défaut si le statut est explicitement défini
+            let statusCode = operation.statusCode || operation.StatusCode;
+            let statusLabel = operation.status || operation.Status;
+            
+            // Si le statut n'est pas défini, utiliser 'EN_COURS' seulement si c'est vraiment nécessaire
+            if (!statusCode && operation.status) {
+                // Essayer de déduire le statusCode depuis le status label
+                const statusMap = {
+                    'En cours': 'EN_COURS',
+                    'En pause': 'EN_PAUSE',
+                    'Terminé': 'TERMINE',
+                    'Pause terminée': 'PAUSE_TERMINEE',
+                    'Arrêt forcé': 'FORCE_STOP'
+                };
+                statusCode = statusMap[operation.status] || 'EN_COURS';
+            } else if (!statusCode) {
+                statusCode = 'EN_COURS';
+                statusLabel = 'En cours';
+            }
+            
+            this.logger.log(`🔍 Mise à jour statut pour ${operationId}:`, {
+                statusCode: statusCode,
+                statusLabel: statusLabel,
+                operationStatusCode: operation.statusCode,
+                operationStatus: operation.status
+            });
+            
+            clearElement(cells[7]);
+            const statusBadge = createBadge(statusLabel, `status-badge status-${statusCode}`);
+            cells[7].appendChild(statusBadge);
+            
+            this.logger.log(`✅ Ligne ${operationId} mise à jour: ${formattedStartTime} -> ${formattedEndTime}, statut: ${statusCode} (${statusLabel})`);
+        } else {
+            this.logger.error(`❌ Pas assez de cellules dans la ligne ${operationId}: ${cells.length}`);
+        }
+    }
+
+    debugTimeSync(operationId) {
+        const operation = this.operations.find(op => op.id == operationId);
+        const row = document.querySelector(`tr[data-operation-id="${operationId}"]`);
+        
+        if (!operation) {
+            this.logger.error(`❌ Opération ${operationId} non trouvée en mémoire`);
+            return;
+        }
+        
+        if (!row) {
+            this.logger.error(`❌ Ligne ${operationId} non trouvée dans le DOM`);
+            return;
+        }
+        
+        const cells = row.querySelectorAll('td');
+        const displayedStartTime = cells[5] ? cells[5].textContent : 'N/A';
+        const displayedEndTime = cells[6] ? cells[6].textContent : 'N/A';
+        
+        this.logger.log(`🔍 Debug synchronisation ${operationId}:`, {
+            memory: {
+                startTime: operation.startTime,
+                endTime: operation.endTime
+            },
+            displayed: {
+                startTime: displayedStartTime,
+                endTime: displayedEndTime
+            },
+            formatted: {
+                startTime: this.formatDateTime(operation.startTime),
+                endTime: this.formatDateTime(operation.endTime)
+            }
+        });
+    }
+
+    validateAndFormatTime(timeString) {
+        if (!timeString) return null;
+        
+        // Nettoyer la chaîne
+        const cleanTime = timeString.trim();
+        
+        // Vérifier le format HH:mm
+        const timeMatch = cleanTime.match(/^(\d{1,2}):(\d{2})$/);
+        if (timeMatch) {
+            const hours = Number.parseInt(timeMatch[1]);
+            const minutes = Number.parseInt(timeMatch[2]);
+            
+            // Validation des valeurs
+            if (hours < 0 || hours > 23) {
+                this.logger.error(`Heures invalides: ${hours}`);
+                return null;
+            }
+            if (minutes < 0 || minutes > 59) {
+                this.logger.error(`Minutes invalides: ${minutes}`);
+                return null;
+            }
+            
+            // Retourner au format HH:mm
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+        }
+        
+        this.logger.error(`Format d'heure invalide: ${timeString}`);
+        return null;
+    }
+
+    validateTimeConsistency(startTime, endTime) {
+        if (!startTime || !endTime) return true; // Pas de validation si une heure manque
+        
+        const startMinutes = this.timeToMinutes(startTime);
+        const endMinutes = this.timeToMinutes(endTime);
+        
+        return endMinutes >= startMinutes;
+    }
+
+    timeToMinutes(timeString) {
+        if (!timeString) return 0;
+        
+        const parts = timeString.split(':');
+        if (parts.length < 2) return 0;
+        
+        const hours = Number.parseInt(parts[0]) || 0;
+        const minutes = Number.parseInt(parts[1]) || 0;
+        
+        return hours * 60 + minutes;
+    }
+
+
+    // Méthodes pour l'export des données
+    exportToCSV() {
+        if (this.operations.length === 0) {
+            this.notificationManager.warning('Aucune donnée à exporter');
+            return;
+        }
+
+        const headers = ['Opérateur', 'Code Lancement', 'Article', 'Début', 'Fin', 'Durée', 'Statut'];
+        const csvContent = [
+            headers.join(','),
+            ...this.operations.map(op => [
+                op.operatorName || '',
+                op.lancementCode || '',
+                op.article || '',
+                this.formatDateTime(op.startTime),
+                op.endTime ? this.formatDateTime(op.endTime) : '',
+                op.duration || '',
+                this.getStatusText(op.status)
+            ].join(','))
+        ].join('\n');
+
+        // Date locale (pas UTC) pour cohérence avec la base
+        const d = new Date();
+        const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        this.downloadCSV(csvContent, `operations_${today}.csv`);
+    }
+
+    downloadCSV(content, filename) {
+        const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        const url = URL.createObjectURL(blob);
+        link.setAttribute('href', url);
+        link.setAttribute('download', filename);
+        if (link.style) {
+            link.style.visibility = 'hidden';
+        }
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+
+    // Méthodes pour les statistiques avancées
+    getDailyStats() {
+        const stats = {
+            totalOperations: this.operations.length,
+            totalDuration: 0,
+            averageDuration: 0,
+            operators: new Set(),
+            lancements: new Set()
+        };
+
+        this.operations.forEach(op => {
+            if (op.operatorName) stats.operators.add(op.operatorName);
+            if (op.lancementCode) stats.lancements.add(op.lancementCode);
+            if (op.duration) {
+                const duration = this.parseDuration(op.duration);
+                stats.totalDuration += duration;
+            }
+        });
+
+        stats.uniqueOperators = stats.operators.size;
+        stats.uniqueLancements = stats.lancements.size;
+        stats.averageDuration = stats.totalOperations > 0 ? stats.totalDuration / stats.totalOperations : 0;
+
+        return stats;
+    }
+
+    parseDuration(durationString) {
+        return TimeUtils.parseDuration(durationString) / 60; // Convertir en minutes
+    }
+
+    formatDuration(minutes) {
+        return TimeUtils.formatDuration(Math.floor(minutes * 60));
+    }
+
+    // Méthode pour filtrer les opérations
+    filterOperations(filter) {
+        let filtered = [...this.operations];
+
+        if (filter.operator) {
+            filtered = filtered.filter(op => 
+                op.operatorName && op.operatorName.toLowerCase().includes(filter.operator.toLowerCase())
+            );
+        }
+
+        if (filter.lancement) {
+            filtered = filtered.filter(op => 
+                op.lancementCode && op.lancementCode.toLowerCase().includes(filter.lancement.toLowerCase())
+            );
+        }
+
+        if (filter.status) {
+            filtered = filtered.filter(op => op.status === filter.status);
+        }
+
+        return filtered;
+    }
+
+    getOperations() {
+        return this.operations;
+    }
+
+    getStats() {
+        return this.stats;
+    }
+
+    async loadTablesData() {
+        try {
+            this.logger.log('  Chargement des données des tables ERP...');
+            
+            const data = await this.apiService.getTablesInfo();
+            
+            if (data.success) {
+                this.updateTablesDisplay(data.data, data.counts);
+                this.notificationManager.success(`Données chargées: ${data.counts.pause} entrées Pause, ${data.counts.temp} entrées Temp`);
+            } else {
+                this.notificationManager.error('Erreur lors du chargement des tables ERP');
+            }
+        } catch (error) {
+            this.errorHandler.handle(error, 'loadTablesData', 'Erreur de connexion lors du chargement des tables ERP');
+        }
+    }
+
+    updateTablesDisplay(data, counts) {
+        // Mise à jour des compteurs
+        const pauseCount = this.domCache.get('pauseCount');
+        const tempCount = this.domCache.get('tempCount');
+        if (pauseCount) pauseCount.textContent = counts.pause;
+        if (tempCount) tempCount.textContent = counts.temp;
+
+        // Mise à jour de la table abetemps_Pause
+        this.updateErpTable('pauseTableBody', data.abetemps_Pause);
+        
+        // Mise à jour de la table abetemps_temp
+        this.updateErpTable('tempTableBody', data.abetemps_temp);
+    }
+
+    updateErpTable(tableBodyId, tableData) {
+        const tableBody = this.domCache.get(tableBodyId);
+        if (!tableBody) return;
+        
+        clearElement(tableBody);
+
+        if (!tableData || tableData.length === 0) {
+            const row = createElement('tr');
+            const cell = createTableCell('Aucune donnée trouvée', {
+                colspan: '7',
+                style: { textAlign: 'center', padding: '1rem', color: '#666' }
+            });
+            row.appendChild(cell);
+            tableBody.appendChild(row);
+            return;
+        }
+
+        tableData.forEach(item => {
+            const row = createElement('tr');
+            
+            // Cellule NoEnreg
+            const cell1 = createTableCell(item.NoEnreg || '-');
+            row.appendChild(cell1);
+            
+            // Cellule Ident avec badge
+            const cell2 = createTableCell('');
+            const badge = createBadge(item.Ident || '-', `badge-${this.getIdentBadgeClass(item.Ident)}`);
+            cell2.appendChild(badge);
+            row.appendChild(cell2);
+            
+            // Cellule DateTravail
+            const cell3 = createTableCell(this.formatDateTime(item.DateTravail) || '-');
+            row.appendChild(cell3);
+            
+            // Cellule CodeLanctImprod
+            const cell4 = createTableCell(item.CodeLanctImprod || '-');
+            row.appendChild(cell4);
+            
+            // Cellule Phase
+            const cell5 = createTableCell(item.Phase || '-');
+            row.appendChild(cell5);
+            
+            // Cellule CodePoste
+            const cell6 = createTableCell(item.CodePoste || '-');
+            row.appendChild(cell6);
+            
+            // Cellule CodeOperateur (en gras)
+            const cell7 = createTableCell('');
+            const strong = createElement('strong', {}, item.CodeOperateur || '-');
+            cell7.appendChild(strong);
+            row.appendChild(cell7);
+            
+            // Cellule NomOperateur
+            const cell8 = createTableCell(item.NomOperateur || 'Non assigné');
+            row.appendChild(cell8);
+            
+            tableBody.appendChild(row);
+        });
+    }
+
+    getIdentBadgeClass(ident) {
+        const classMap = {
+            'DEBUT': 'success',
+            'PAUSE': 'warning', 
+            'REPRISE': 'info',
+            'FIN': 'secondary',
+            'ARRET': 'danger'
+        };
+        return classMap[ident] || 'light';
+    }
+
+    // Méthodes de pagination
+    async loadPage(page) {
+        // Pagination pure UI (les données sont chargées par loadData)
+        this.currentPage = page;
+        this.updateOperationsTable();
+        this.updatePaginationInfo();
+    }
+
+    updatePaginationInfo() {
+        const paginationInfo = this.domCache.get('paginationInfo');
+        if (paginationInfo && this.pagination) {
+            // Fix: éviter "Page 1 sur 0 (0 éléments)" quand on affiche des lignes (regroupement par opérateur)
+            const displayedRows = Number(this._lastDisplayCounts?.rowsDisplayed || 0);
+            const fallbackTotalItems = displayedRows > 0 ? displayedRows : (this.operations?.length || 0);
+
+            let totalPages = Number(this.pagination.totalPages || 0);
+            let currentPage = Number(this.pagination.currentPage || 1);
+            let totalItems = Number(this.pagination.totalItems || 0);
+
+            if (!Number.isFinite(totalPages) || totalPages < 1) totalPages = 1;
+            if (!Number.isFinite(currentPage) || currentPage < 1) currentPage = 1;
+            if (currentPage > totalPages) currentPage = totalPages;
+            if (!Number.isFinite(totalItems) || totalItems < 1) totalItems = fallbackTotalItems;
+
+            clearElement(paginationInfo);
+            
+            const paginationDiv = createElement('div', { className: 'pagination-info' });
+            
+            const span1 = createElement('span', {}, `Page ${currentPage} sur ${totalPages}`);
+            paginationDiv.appendChild(span1);
+            
+            const span2 = createElement('span', {}, `(${totalItems} éléments au total)`);
+            paginationDiv.appendChild(span2);
+            
+            const controlsDiv = createElement('div', { className: 'pagination-controls' });
+            
+            const prevBtn = createButton({
+                className: 'btn btn-sm btn-outline-primary',
+                onClick: () => this.loadPage(currentPage - 1)
+            });
+            prevBtn.appendChild(document.createTextNode('← Précédent'));
+            if (!this.pagination.hasPrevPage) prevBtn.disabled = true;
+            controlsDiv.appendChild(prevBtn);
+            
+            const nextBtn = createButton({
+                className: 'btn btn-sm btn-outline-primary',
+                onClick: () => this.loadPage(currentPage + 1)
+            });
+            nextBtn.appendChild(document.createTextNode('Suivant →'));
+            if (!this.pagination.hasNextPage) nextBtn.disabled = true;
+            controlsDiv.appendChild(nextBtn);
+            
+            paginationDiv.appendChild(controlsDiv);
+            paginationInfo.appendChild(paginationDiv);
+        }
+    }
+}
+
+export {
+    getAdminStepColumnDisplay,
+    compareAdminTimelineRows,
+    getAdminRowSortTimestamp,
+    formatAdminRowDate,
+    composeClockOnDay
+};
+export default AdminPage;

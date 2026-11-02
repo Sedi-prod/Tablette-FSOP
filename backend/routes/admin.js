@@ -1,0 +1,5465 @@
+const express = require('express');
+const { executeQuery, executeProcedure } = require('../config/database');
+const moment = require('moment');
+const router = express.Router();
+const { authenticateAdmin, requireDangerousRoute, requireDebugMode } = require('../middleware/auth');
+const dataValidation = require('../services/DataValidationService');
+const { getConcurrencyStats } = require('../middleware/concurrencyManager');
+const SessionService = require('../services/SessionService');
+const { generateRequestId } = require('../middleware/audit');
+const AiAssistService = require('../services/AiAssistService');
+
+// IMPORTANT: toutes les routes /api/admin doivent être protégées
+router.use(authenticateAdmin);
+
+function mapAiError(error, res) {
+    if (error?.code === 'AI_DISABLED') {
+        return res.status(503).json({ success: false, error: error.message, code: 'AI_DISABLED' });
+    }
+    if (error?.code === 'AI_CONFIG') {
+        return res.status(503).json({ success: false, error: error.message, code: 'AI_CONFIG' });
+    }
+    console.error('❌ AI assist:', error);
+    return res.status(500).json({
+        success: false,
+        error: error?.message || 'Erreur assistance IA'
+    });
+}
+
+// GET /api/admin/ai/status — feature flag (sans appeler le LLM)
+router.get('/ai/status', (req, res) => {
+    res.json({ success: true, data: AiAssistService.status() });
+});
+
+// POST /api/admin/ai/analyze-line — diagnostic ligne monitoring / hold
+router.post('/ai/analyze-line', async (req, res) => {
+    try {
+        const line = req.body?.line || req.body?.operation || req.body;
+        const context = req.body?.context || 'monitoring';
+        if (!line || typeof line !== 'object') {
+            return res.status(400).json({ success: false, error: 'Payload ligne manquant' });
+        }
+        const result = await AiAssistService.analyzeMonitoringLine(line, { context });
+        return res.json(result);
+    } catch (error) {
+        return mapAiError(error, res);
+    }
+});
+
+// POST /api/admin/ai/summarize-support-tech — résumé atelier écarts
+router.post('/ai/summarize-support-tech', async (req, res) => {
+    try {
+        const result = await AiAssistService.summarizeSupportTech(req.body || {});
+        return res.json(result);
+    } catch (error) {
+        return mapAiError(error, res);
+    }
+});
+
+// POST /api/admin/ai/ops-diagnose — runbook logs (maintenance)
+router.post('/ai/ops-diagnose', async (req, res) => {
+    try {
+        const { symptoms, logs, context } = req.body || {};
+        const result = await AiAssistService.diagnoseOps({ symptoms, logs, context });
+        return res.json(result);
+    } catch (error) {
+        return mapAiError(error, res);
+    }
+});
+
+const TIME_HM_RE = /^(\d{1,2}):(\d{2})$/;
+const TIME_HMS_RE = /^(\d{1,2}):(\d{2}):(\d{2})$/;
+
+function resolveCycleStatus(lastEvent, lastDebutEvent, finEvent) {
+    let currentStatus = 'EN_COURS';
+    let statusLabel = 'En cours';
+    if (lastEvent?.Ident === 'FIN') {
+        currentStatus = 'TERMINE';
+        statusLabel = 'Terminé';
+    } else if (lastEvent?.Ident === 'PAUSE') {
+        currentStatus = 'EN_PAUSE';
+        statusLabel = 'En pause';
+    } else if (lastEvent?.Ident === 'REPRISE') {
+        currentStatus = 'EN_COURS';
+        statusLabel = 'En cours';
+    } else if (lastDebutEvent?.Statut?.trim()) {
+        const dbStatus = lastDebutEvent.Statut.toUpperCase().trim();
+        const statusMap = {
+            'EN_COURS': 'En cours',
+            'EN_PAUSE': 'En pause',
+            'PAUSE': 'En pause',
+            'TERMINE': 'Terminé',
+            'TERMINÉ': 'Terminé',
+            'PAUSE_TERMINEE': 'Pause terminée',
+            'PAUSE_TERMINÉE': 'Pause terminée',
+            'FORCE_STOP': 'Arrêt forcé'
+        };
+        if (statusMap[dbStatus] || dbStatus === 'TERMINE' || dbStatus === 'TERMINÉ') {
+            currentStatus = dbStatus;
+            statusLabel = statusMap[dbStatus] || 'Terminé';
+        }
+    }
+    const statusUpper = String(currentStatus || '').toUpperCase();
+    if ((statusUpper === 'TERMINE' || statusUpper === 'TERMINÉ') && !finEvent) {
+        currentStatus = 'EN_COURS';
+        statusLabel = 'En cours';
+    }
+    return { currentStatus, statusLabel };
+}
+
+function resolveLastUpdate(finEvent, pauseEvent, startEvent) {
+    if (finEvent) return finEvent.CreatedAt || finEvent.DateCreation;
+    if (pauseEvent) return pauseEvent.CreatedAt || pauseEvent.DateCreation;
+    return startEvent.CreatedAt || startEvent.DateCreation;
+}
+
+function formatStartClock(startEvent) {
+    let heureDebut = Array.isArray(startEvent.HeureDebut) ? startEvent.HeureDebut[0] : startEvent.HeureDebut;
+    if (!heureDebut) {
+        return formatDateTime(startEvent.CreatedAt || startEvent.DateCreation);
+    }
+    if (typeof heureDebut === 'string' && /^\d{2}:\d{2}(:\d{2})?$/.test(heureDebut)) {
+        return heureDebut.substring(0, 5);
+    }
+    if (heureDebut instanceof Date) {
+        return heureDebut.toLocaleTimeString('fr-FR', {
+            timeZone: 'Europe/Paris',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+    }
+    return formatDateTime(heureDebut);
+}
+
+function collectOperationTimeUpdates(body) {
+    const updateFields = [];
+    const params = {};
+    let formattedEndTimeForFinEvent = null;
+    let error = null;
+    if (body.startTime !== undefined) {
+        const formattedStartTime = formatTimeForSQL(body.startTime);
+        if (!formattedStartTime) {
+            error = 'Format d\'heure de début invalide';
+            return { updateFields, params, formattedEndTimeForFinEvent, error };
+        }
+        updateFields.push('HeureDebut = @startTime');
+        params.startTime = formattedStartTime;
+    }
+    if (body.endTime !== undefined) {
+        const formattedEndTime = formatTimeForSQL(body.endTime);
+        if (!formattedEndTime) {
+            error = 'Format d\'heure de fin invalide';
+            return { updateFields, params, formattedEndTimeForFinEvent, error };
+        }
+        params.endTime = formattedEndTime;
+        formattedEndTimeForFinEvent = formattedEndTime;
+        updateFields.push('HeureFin = @endTime');
+    }
+    if (body.status !== undefined) {
+        const validStatuses = ['EN_COURS', 'EN_PAUSE', 'TERMINE', 'PAUSE_TERMINEE', 'FORCE_STOP'];
+        if (!validStatuses.includes(body.status)) {
+            error = `Statut invalide. Statuts autorisés: ${validStatuses.join(', ')}`;
+            return { updateFields, params, formattedEndTimeForFinEvent, error };
+        }
+        updateFields.push('Statut = @status');
+        params.status = body.status;
+    }
+    return { updateFields, params, formattedEndTimeForFinEvent, error };
+}
+
+async function getStepsForLaunch(lt) {
+    const rows = await executeQuery(`
+        SELECT DISTINCT
+            LTRIM(RTRIM(C.CodeOperation)) AS CodeOperation,
+            LTRIM(RTRIM(C.Phase)) AS Phase,
+            LTRIM(RTRIM(C.CodeRubrique)) AS CodeRubrique
+        FROM [SEDI_ERP].[dbo].[LCTC] C
+        INNER JOIN [SEDI_ERP].[dbo].[LCTE] E
+            ON E.CodeLancement = C.CodeLancement
+            AND E.LancementSolde = 'N'
+        WHERE C.CodeLancement = @lancementCode
+          AND C.TypeRubrique = 'O'
+          AND C.CodeOperation IS NOT NULL
+          AND LTRIM(RTRIM(C.CodeOperation)) <> ''
+          AND UPPER(LTRIM(RTRIM(C.CodeOperation))) COLLATE Latin1_General_CI_AI NOT IN ('SECHAGE', 'ETUVAGE')
+        ORDER BY LTRIM(RTRIM(C.Phase)), LTRIM(RTRIM(C.CodeOperation)), LTRIM(RTRIM(C.CodeRubrique))
+    `, { lancementCode: lt });
+    const steps = (rows || []).map(s => {
+        const phase = String(s?.Phase || '').trim();
+        const rubrique = String(s?.CodeRubrique || '').trim();
+        const fabrication = String(s?.CodeOperation || '').trim();
+        const rubriquePart = rubrique ? ` (${rubrique})` : '';
+        return {
+            ...s,
+            StepId: `${phase}|${rubrique}`,
+            Label: `${phase}${rubriquePart} — ${fabrication || 'Fabrication'}`
+        };
+    });
+    const uniqueOps = [...new Set(steps.map(s => String(s?.CodeOperation || '').trim()).filter(Boolean))];
+    const uniqueSteps = [...new Set(steps.map(s => String(s?.StepId || '').trim()).filter(Boolean))];
+    return { steps, uniqueOps, uniqueSteps };
+}
+
+async function resolveStep(lt, op) {
+    const { steps, uniqueOps, uniqueSteps } = await getStepsForLaunch(lt);
+    const raw = String(op || '').trim();
+    if (!raw) return { steps, uniqueOps, uniqueSteps, ctx: steps[0] || null };
+    if (raw.includes('|')) {
+        const [ph, rub] = raw.split('|').map(x => String(x || '').trim());
+        const matchByKey = steps.find(s =>
+            String(s?.Phase || '').trim() === ph &&
+            String(s?.CodeRubrique || '').trim() === rub
+        );
+        return { steps, uniqueOps, uniqueSteps, ctx: matchByKey || null };
+    }
+    const ctx = steps.find(s => String(s?.CodeOperation || '').trim() === raw) || null;
+    return { steps, uniqueOps, uniqueSteps, ctx };
+}
+
+// Bundle GET /api/admin : éviter la troncature historique (ex. 25 lignes) alors que le front fusionne avec le monitoring.
+const ADMIN_DASHBOARD_OPERATIONS_CAP = Math.min(
+    Math.max(Number.parseInt(process.env.ADMIN_DASHBOARD_OPERATIONS_LIMIT || '10000', 10) || 10000, 500),
+    20000
+);
+
+// Fonction pour valider et récupérer les informations d'un lancement depuis LCTE
+async function validateLancement(codeLancement) {
+    try {
+        console.log(`🔍 Validation du lancement ${codeLancement} dans LCTE...`);
+        
+        const query = `
+            SELECT TOP 1 
+                [CodeLancement],
+                [CodeArticle],
+                [DesignationLct1],
+                [CodeModele],
+                [DesignationArt1],
+                [DesignationArt2]
+            FROM [SEDI_ERP].[dbo].[LCTE]
+            WHERE [CodeLancement] = @codeLancement
+        `;
+        
+        const result = await executeQuery(query, { codeLancement });
+        
+        if (result && result.length > 0) {
+            const lancement = result[0];
+            console.log(` Lancement ${codeLancement} trouvé:`, {
+                CodeArticle: lancement.CodeArticle,
+                DesignationLct1: lancement.DesignationLct1,
+                CodeModele: lancement.CodeModele
+            });
+
+            // Enregistrer la consultation du lancement (mapping côté SEDI_APP_INDEPENDANTE)
+            try {
+                await executeProcedure('sp_RecordLancementConsultation', { CodeLancement: codeLancement });
+            } catch (error) {
+                // Ne pas faire échouer la requête admin si la procédure n'est pas encore installée
+                console.warn(`⚠️ Erreur enregistrement consultation lancement ${codeLancement}:`, error.message);
+            }
+
+            return {
+                valid: true,
+                data: lancement
+            };
+        } else {
+            console.log(` Lancement ${codeLancement} non trouvé dans LCTE`);
+            return {
+                valid: false,
+                error: `Le numéro de lancement ${codeLancement} n'existe pas dans la base de données`
+            };
+        }
+    } catch (error) {
+        console.error(' Erreur lors de la validation du lancement:', error);
+        return {
+            valid: false,
+            error: 'Erreur lors de la validation du lancement'
+        };
+    }
+}
+
+// Fonction pour valider et formater une heure au format TIME SQL
+/** Date admin AAAA-MM-JJ, aujourd'hui ou dans le passé. null si absente, false si invalide. */
+function normalizeAdminWorkDate(value) {
+    if (value == null || String(value).trim() === '') return null;
+    const s = String(value).trim().slice(0, 10);
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (!match) return false;
+    const year = Number.parseInt(match[1], 10);
+    const month = Number.parseInt(match[2], 10);
+    const day = Number.parseInt(match[3], 10);
+    const picked = new Date(year, month - 1, day);
+    if (picked.getFullYear() !== year || picked.getMonth() !== month - 1 || picked.getDate() !== day) {
+        return false;
+    }
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (picked > today) return false;
+    return s;
+}
+
+function formatTimeForSQL(timeInput) {
+    if (!timeInput) return null;
+    
+    try {
+        console.log(`🔧 formatTimeForSQL input: "${timeInput}" (type: ${typeof timeInput})`);
+        
+        // Si c'est déjà une chaîne au format HH:mm ou HH:mm:ss
+        if (typeof timeInput === 'string') {
+            // Nettoyer la chaîne (enlever espaces, etc.)
+            const cleanTime = timeInput.trim();
+            
+            // Format HH:mm
+            const timeMatch = TIME_HM_RE.exec(cleanTime);
+            if (timeMatch) {
+                const hours = timeMatch[1].padStart(2, '0');
+                const minutes = timeMatch[2];
+                const result = `${hours}:${minutes}:00`;
+                console.log(`🔧 formatTimeForSQL: ${timeInput} → ${result}`);
+                return result;
+            }
+            
+            // Format HH:mm:ss
+            const timeWithSecondsMatch = TIME_HMS_RE.exec(cleanTime);
+            if (timeWithSecondsMatch) {
+                const hours = timeWithSecondsMatch[1].padStart(2, '0');
+                const minutes = timeWithSecondsMatch[2];
+                const seconds = timeWithSecondsMatch[3];
+                const result = `${hours}:${minutes}:${seconds}`;
+                console.log(`🔧 formatTimeForSQL: ${timeInput} → ${result}`);
+                return result;
+            }
+        }
+        
+        // Si c'est un objet Date, extraire seulement l'heure avec fuseau horaire français
+        if (timeInput instanceof Date) {
+            const timeString = timeInput.toLocaleTimeString('fr-FR', {
+                timeZone: 'Europe/Paris',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            });
+            console.log(`🔧 formatTimeForSQL: Date → ${timeString}`);
+            return timeString;
+        }
+        
+        console.warn(`⚠️ Format d'heure non reconnu: ${timeInput}`);
+        return null;
+    } catch (error) {
+        console.error('Erreur formatage heure SQL:', error);
+        return null;
+    }
+}
+
+// Fonction pour convertir une heure en minutes depuis minuit
+function timeToMinutes(timeString) {
+    if (!timeString) return 0;
+    
+    const parts = timeString.split(':');
+    if (parts.length < 2) return 0;
+    
+    const hours = Number.parseInt(parts[0]) || 0;
+    const minutes = Number.parseInt(parts[1]) || 0;
+    
+    return hours * 60 + minutes;
+}
+
+// Fonction pour valider les heures suspectes (comme 02:00 qui pourrait indiquer un problème)
+function validateSuspiciousTime(timeString, context = '') {
+    if (!timeString) return { isValid: true, warning: null };
+    
+    const time = timeString.split(':');
+    const hour = Number.parseInt(time[0]);
+    const minute = Number.parseInt(time[1]);
+    
+    // Détecter les heures suspectes
+    if (hour === 2 && minute === 0) {
+        return {
+            isValid: true,
+            warning: `⚠️ Heure suspecte détectée: ${timeString} ${context}. Cela pourrait indiquer une opération terminée à 2h du matin ou un problème de calcul de durée.`
+        };
+    }
+    
+    // Détecter les heures très tardives ou très matinales
+    if (hour >= 22 || hour <= 4) {
+        return {
+            isValid: true,
+            warning: `ℹ Heure inhabituelle: ${timeString} ${context}. Vérifiez si cette opération traverse minuit.`
+        };
+    }
+    
+    return { isValid: true, warning: null };
+}
+
+// Fonction pour formater une date en HH:mm (fuseau horaire Paris)
+function formatSqlTimeAsHhMm(dateTime) {
+    // mssql renvoie souvent TIME comme Date 1970-01-01T HH:mm:ss.000Z (heure murale en UTC).
+    // toLocaleTimeString(Europe/Paris) décale alors d'1h/2h — on lit les composants UTC.
+    if (!(dateTime instanceof Date) || Number.isNaN(dateTime.getTime())) return null;
+    const y = dateTime.getUTCFullYear();
+    if (y >= 1969 && y <= 1971) {
+        const hh = String(dateTime.getUTCHours()).padStart(2, '0');
+        const mm = String(dateTime.getUTCMinutes()).padStart(2, '0');
+        return `${hh}:${mm}`;
+    }
+    return null;
+}
+
+function formatDateTime(dateTime) {
+    if (!dateTime) {
+        console.log('🔍 formatDateTime: dateTime est null/undefined');
+        return null;
+    }
+    
+    // Si c'est un tableau, prendre le premier élément
+    if (Array.isArray(dateTime)) {
+        console.log('🔍 formatDateTime: Tableau détecté, utilisation du premier élément');
+        if (dateTime.length > 0) {
+            dateTime = dateTime[0];
+        } else {
+            return null;
+        }
+    }
+    
+    try {
+        // Si c'est déjà une chaîne au format HH:mm ou HH:mm:ss, la retourner directement
+        if (typeof dateTime === 'string' && /^\d{2}:\d{2}(:\d{2})?$/.test(dateTime)) {
+            const parts = dateTime.split(':');
+            const formattedTime = `${parts[0]}:${parts[1]}`;
+            
+            // Valider les heures suspectes
+            const validation = validateSuspiciousTime(formattedTime, '(format direct)');
+            if (validation.warning) {
+                console.warn(validation.warning);
+            }
+            
+            return formattedTime;
+        }
+        
+        // Si c'est un objet Date, extraire l'heure avec fuseau horaire français
+        if (dateTime instanceof Date) {
+            const sqlTime = formatSqlTimeAsHhMm(dateTime);
+            if (sqlTime) return sqlTime;
+            const timeString = dateTime.toLocaleTimeString('fr-FR', {
+                timeZone: 'Europe/Paris',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            });
+            
+            // Valider les heures suspectes
+            const validation = validateSuspiciousTime(timeString, '(formatage Date object)');
+            if (validation.warning) {
+                console.warn(validation.warning);
+            }
+            
+            console.log(`🔍 formatDateTime: Date object -> ${timeString}`);
+            return timeString;
+        }
+        
+        // Sinon, essayer de créer un objet Date
+        const date = new Date(dateTime);
+        if (Number.isNaN(date.getTime())) {
+            console.warn('🔍 formatDateTime: Date invalide:', dateTime);
+            return null;
+        }
+        
+        // Utiliser fuseau horaire français (Europe/Paris)
+        const timeString = date.toLocaleTimeString('fr-FR', {
+            timeZone: 'Europe/Paris',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+        
+        // Valider les heures suspectes
+        const validation = validateSuspiciousTime(timeString, '(formatage date)');
+        if (validation.warning) {
+            console.warn(validation.warning);
+        }
+        
+        console.log(`🔍 formatDateTime: ${dateTime} -> ${timeString}`);
+        return timeString;
+    } catch (error) {
+        console.error('🔍 formatDateTime: Erreur formatage date:', dateTime, error);
+        return null;
+    }
+}
+
+// Fonction pour calculer la durée entre deux dates en minutes
+function calculateDuration(startDate, endDate) {
+    if (!startDate || !endDate) return null;
+    
+    try {
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        
+        if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+        
+        const diffMs = end.getTime() - start.getTime();
+        const diffMinutes = Math.floor(diffMs / (1000 * 60));
+        
+        // Gérer les durées négatives (traversée de minuit)
+        if (diffMinutes < 0) {
+            console.log(`⚠️ Durée négative détectée: ${startDate} -> ${endDate} (${diffMinutes}min)`);
+            // Si la durée est négative, cela peut indiquer une traversée de minuit
+            // Dans ce cas, on peut soit retourner null soit ajuster
+            return null;
+        }
+        
+        const hours = Math.floor(diffMinutes / 60);
+        const minutes = diffMinutes % 60;
+        
+        // Format amélioré pour les durées longues
+        if (hours >= 24) {
+            const days = Math.floor(hours / 24);
+            const remainingHours = hours % 24;
+            if (remainingHours > 0) {
+                return `${days}j${remainingHours}h${minutes.toString().padStart(2, '0')}`;
+            } else {
+                return `${days}j${minutes.toString().padStart(2, '0')}min`;
+            }
+        } else if (hours > 0) {
+            return `${hours}h${minutes.toString().padStart(2, '0')}`;
+        } else {
+            return `${minutes}min`;
+        }
+    } catch (error) {
+        console.error('Erreur calcul durée:', error);
+        return null;
+    }
+}
+
+// Fonction pour consolider les temps d'un lancement terminé dans ABTEMPS_OPERATEURS
+// DÉPRÉCIÉE : Utiliser ConsolidationService.consolidateOperation() à la place
+// Conservée pour compatibilité ascendante
+async function consolidateLancementTimes(operatorCode, lancementCode) {
+    try {
+        console.log(`⚠️ consolidateLancementTimes() est dépréciée, utiliser ConsolidationService.consolidateOperation() à la place`);
+        
+        // Utiliser le nouveau service de consolidation
+        const ConsolidationService = require('../services/ConsolidationService');
+        const result = await ConsolidationService.consolidateOperation(operatorCode, lancementCode, { autoFix: true });
+        
+        if (result.success) {
+            return result.tempsId;
+        } else {
+            console.error(`❌ Erreur consolidation: ${result.error}`);
+            return null;
+        }
+    } catch (error) {
+        console.error('❌ Erreur consolidation temps:', error);
+        return null;
+    }
+}
+
+// Fonction pour regrouper les événements par lancement sur une seule ligne (sans pauses séparées)
+function processLancementEventsSingleLine(events) {
+    const lancementGroups = {};
+    
+    // Regrouper par CodeLanctImprod et CodeRubrique
+    events.forEach(event => {
+        const key = `${event.CodeLanctImprod}_${event.CodeRubrique}`;
+        if (!lancementGroups[key]) {
+            lancementGroups[key] = [];
+        }
+        lancementGroups[key].push(event);
+    });
+    
+    const processedItems = [];
+    
+    Object.keys(lancementGroups).forEach(key => {
+        const groupEvents = lancementGroups[key].sort((a, b) => {
+            const da = new Date(a.CreatedAt || a.DateCreation).getTime();
+            const db = new Date(b.CreatedAt || b.DateCreation).getTime();
+            if (da !== db) return da - db;
+            return (a.NoEnreg || 0) - (b.NoEnreg || 0);
+        });
+        
+        console.log(`🔍 Traitement du groupe ${key}:`, groupEvents.map(e => ({
+            ident: e.Ident,
+            dateCreation: e.DateCreation,
+            heureDebut: e.HeureDebut,
+            heureFin: e.HeureFin
+        })));
+        
+        // Trouver les événements clés
+        // ⚠️ Important: un même opérateur peut faire plusieurs cycles DEBUT..FIN pour le même lancement.
+        // Pour l'affichage "actuel" (admin + historique opérateur), on prend toujours le DERNIER cycle,
+        // sinon un ancien FIN masque un nouveau DEBUT (et l'admin n'affiche jamais "En cours").
+        let lastDebutIdx = -1;
+        for (let i = groupEvents.length - 1; i >= 0; i--) {
+            if (groupEvents[i]?.Ident === 'DEBUT') {
+                lastDebutIdx = i;
+                break;
+            }
+        }
+        const cycleEvents = lastDebutIdx >= 0 ? groupEvents.slice(lastDebutIdx) : [];
+        const debutEvent = cycleEvents.find(e => e.Ident === 'DEBUT');
+        const finEvent = cycleEvents.find(e => e.Ident === 'FIN');
+        const pauseEvents = cycleEvents.filter(e => e.Ident === 'PAUSE');
+        const repriseEvents = cycleEvents.filter(e => e.Ident === 'REPRISE');
+        
+        if (debutEvent) {
+            let status, statusLabel;
+            let endTime = null;
+            
+            if (finEvent) {
+                // DÉMARRÉ → FIN = TERMINÉ
+                status = 'TERMINE';
+                statusLabel = 'Terminé';
+                endTime = finEvent.HeureFin ? formatDateTime(finEvent.HeureFin) : formatDateTime(finEvent.CreatedAt || finEvent.DateCreation);
+            } else if (pauseEvents.length > 0 && pauseEvents.length > repriseEvents.length) {
+                status = 'PAUSE';
+                statusLabel = 'En pause';
+            } else {
+                status = 'EN_COURS';
+                statusLabel = 'En cours';
+            }
+            
+            console.log(`🔍 Ligne unique pour ${key}:`, status);
+            processedItems.push(createLancementItem(debutEvent, groupEvents, status, statusLabel, endTime));
+        }
+        
+        console.log(`🔍 Créé 1 item pour ${key}`);
+    });
+    
+    console.log(`🔍 Total d'items créés: ${processedItems.length}`);
+    return processedItems.sort((a, b) => 
+        new Date(b.lastUpdate) - new Date(a.lastUpdate)
+    );
+}
+
+// Fonction pour regrouper les événements par lancement et calculer les temps (évite les doublons)
+function extractEventTime(event) {
+    if (!event) return null;
+    const heure = Array.isArray(event.HeureDebut) ? event.HeureDebut[0] : event.HeureDebut;
+    if (heure && typeof heure === 'string' && /^\d{2}:\d{2}(:\d{2})?$/.test(heure)) {
+        return heure.substring(0, 5);
+    }
+    if (heure && heure instanceof Date) {
+        const sqlTime = formatSqlTimeAsHhMm(heure);
+        if (sqlTime) return sqlTime;
+        return heure.toLocaleTimeString('fr-FR', {
+            timeZone: 'Europe/Paris',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+    }
+    if (heure) return formatDateTime(heure);
+    return formatDateTime(event.CreatedAt || event.DateCreation);
+}
+
+function extractEventEndTime(event) {
+    if (!event) return null;
+    const heure = Array.isArray(event.HeureFin) ? event.HeureFin[0] : event.HeureFin;
+    if (heure && typeof heure === 'string' && /^\d{2}:\d{2}(:\d{2})?$/.test(heure)) {
+        return heure.substring(0, 5);
+    }
+    if (heure && heure instanceof Date) {
+        const sqlTime = formatSqlTimeAsHhMm(heure);
+        if (sqlTime) return sqlTime;
+        return heure.toLocaleTimeString('fr-FR', {
+            timeZone: 'Europe/Paris',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+    }
+    if (heure) return formatDateTime(heure);
+    return formatDateTime(event.CreatedAt || event.DateCreation);
+}
+
+function pairPauseRepriseEvents(pauseEvents, repriseEvents) {
+    const pairs = [];
+    const usedRepriseIds = new Set();
+    pauseEvents.forEach((pauseEvent) => {
+        const pauseTs = new Date(pauseEvent.CreatedAt || pauseEvent.DateCreation).getTime();
+        const repriseEvent = repriseEvents.find((reprise) => {
+            if (usedRepriseIds.has(reprise.NoEnreg)) return false;
+            const repriseTs = new Date(reprise.CreatedAt || reprise.DateCreation).getTime();
+            return repriseTs >= pauseTs;
+        });
+        if (repriseEvent) usedRepriseIds.add(repriseEvent.NoEnreg);
+        pairs.push({ pauseEvent, repriseEvent: repriseEvent || null });
+    });
+    return pairs;
+}
+
+function createWorkSegmentItem(startEvent, endTime, statusCode, statusLabel, referenceEvent, segmentIndex) {
+    return {
+        // Utiliser le vrai NoEnreg de l'événement de départ (DEBUT ou REPRISE) pour que
+        // l'édition/suppression retrouve l'enregistrement en base (ABHISTORIQUE_OPERATEURS).
+        id: startEvent.NoEnreg,
+        operatorId: referenceEvent.OperatorCode,
+        operatorName: referenceEvent.operatorName || 'Non assigné',
+        lancementCode: referenceEvent.CodeLanctImprod,
+        article: referenceEvent.Article || 'N/A',
+        phase: referenceEvent.Phase,
+        codeRubrique: referenceEvent.CodeRubrique || null,
+        startTime: extractEventTime(startEvent),
+        endTime: endTime || null,
+        pauseTime: null,
+        duration: null,
+        pauseDuration: null,
+        status: statusLabel,
+        statusCode,
+        generalStatus: statusCode,
+        events: 1,
+        lastUpdate: startEvent.CreatedAt || startEvent.DateCreation,
+        dateCreation: String(referenceEvent.DateCreation || startEvent.DateCreation || '').substring(0, 10) || null,
+        type: 'lancement',
+        _isWorkSegment: true,
+        _isPauseRow: false,
+        editable: true
+    };
+}
+
+function sameDisplayedClock(start, end) {
+    if (!start || !end) return false;
+    return String(start).slice(0, 5) === String(end).slice(0, 5);
+}
+
+function buildWorkSegmentItems(debutEvent, cycleEvents, pauseEvents, repriseEvents, finEvent) {
+    const segments = [];
+    const pairs = pairPauseRepriseEvents(pauseEvents, repriseEvents);
+    let workStartEvent = debutEvent;
+    let segIdx = 0;
+
+    const pushSegment = (startEvent, endTime, statusCode, statusLabel) => {
+        if (sameDisplayedClock(extractEventTime(startEvent), endTime)) return;
+        segments.push(createWorkSegmentItem(startEvent, endTime, statusCode, statusLabel, debutEvent, segIdx++));
+    };
+
+    if (pauseEvents.length === 0) {
+        if (finEvent) {
+            pushSegment(workStartEvent, extractEventEndTime(finEvent), 'TERMINE', 'Terminé');
+        } else {
+            pushSegment(workStartEvent, null, 'EN_COURS', 'En cours');
+        }
+        return segments;
+    }
+
+    pairs.forEach(({ pauseEvent, repriseEvent }, index) => {
+        const pauseStart = extractEventTime(pauseEvent);
+        const isLastPair = index === pairs.length - 1;
+        // Dernier créneau alors que l'opérateur est TOUJOURS en pause (pas de reprise ni FIN).
+        if (isLastPair && !repriseEvent && !finEvent) {
+            pushSegment(workStartEvent, pauseStart, 'EN_PAUSE', 'En pause');
+        } else {
+            // Même logique tablette : fin de ligne = heure de pause → Terminé.
+            // Cadenas gris évité côté admin via _hasOpenSiblingCycle si reprise encore ouverte.
+            pushSegment(workStartEvent, pauseStart, 'TERMINE', 'Terminé');
+        }
+        if (repriseEvent) {
+            workStartEvent = repriseEvent;
+        }
+    });
+
+    const lastIdent = cycleEvents[cycleEvents.length - 1]?.Ident;
+    if (finEvent) {
+        pushSegment(workStartEvent, extractEventEndTime(finEvent), 'TERMINE', 'Terminé');
+    } else if (lastIdent === 'REPRISE' || (lastIdent === 'DEBUT' && pauseEvents.length === 0)) {
+        pushSegment(workStartEvent, null, 'EN_COURS', 'En cours');
+    }
+
+    return segments;
+}
+
+function createPauseRowItem(pauseEvent, repriseEvent, referenceEvent) {
+    const startTime = extractEventTime(pauseEvent);
+    const endTime = repriseEvent ? extractEventTime(repriseEvent) : null;
+    const statusCode = repriseEvent ? 'PAUSE_TERMINEE' : 'EN_PAUSE';
+    const statusLabel = repriseEvent ? 'Pause terminée' : 'En pause';
+
+    return {
+        id: `PAUSE-${pauseEvent.NoEnreg}`,
+        operatorId: referenceEvent.OperatorCode,
+        operatorName: referenceEvent.operatorName || 'Non assigné',
+        lancementCode: referenceEvent.CodeLanctImprod,
+        article: referenceEvent.Article || 'N/A',
+        phase: referenceEvent.Phase,
+        codeRubrique: referenceEvent.CodeRubrique || null,
+        startTime,
+        endTime,
+        pauseTime: startTime,
+        duration: null,
+        pauseDuration: null,
+        status: statusLabel,
+        statusCode,
+        generalStatus: statusCode,
+        events: 2,
+        lastUpdate: pauseEvent.CreatedAt || pauseEvent.DateCreation,
+        dateCreation: String(pauseEvent.DateCreation || '').substring(0, 10) || null,
+        type: 'pause',
+        _isPauseRow: true,
+        editable: false
+    };
+}
+
+function dedupeHistoriqueEvents(events) {
+    // Garde-fou : un JOIN ABTEMPS multi-cycles peut renvoyer le même NoEnreg N fois.
+    // Sans dédoublonnage, chaque DEBUT dupliqué crée un faux cycle "EN COURS".
+    const seen = new Set();
+    const unique = [];
+    for (const event of events || []) {
+        const id = event?.NoEnreg;
+        const key = id == null
+            ? `${event?.Ident}|${event?.OperatorCode}|${event?.CodeLanctImprod}|${event?.CreatedAt || event?.DateCreation}|${event?.HeureDebut}|${event?.HeureFin}`
+            : String(id);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(event);
+    }
+    return unique;
+}
+
+function processLancementEventsWithPauses(events, { includePauseRows = false, includeWorkSegments = false } = {}) {
+    const lancementGroups = {};
+    
+    // 🔒 ISOLATION STRICTE : Regrouper par CodeLanctImprod + OperatorCode + Phase + CodeRubrique
+    // Chaque opérateur a son propre historique pour chaque lancement
+    // Un même lancement peut avoir plusieurs historiques (un par opérateur)
+    dedupeHistoriqueEvents(events).forEach(event => {
+        const phase = (event.Phase || '').toString().trim();
+        const rubrique = (event.CodeRubrique || '').toString().trim();
+        // Clé unique = Lancement + Opérateur + Étape (garantit l'isolation par fabrication)
+        const key = `${event.CodeLanctImprod}_${event.OperatorCode}_${phase}_${rubrique}`;
+        if (!lancementGroups[key]) {
+            lancementGroups[key] = [];
+        }
+        lancementGroups[key].push(event);
+    });
+    
+    // Log pour debug si plusieurs opérateurs sur le même lancement
+    const lancementByCode = {};
+    events.forEach(event => {
+        if (!lancementByCode[event.CodeLanctImprod]) {
+            lancementByCode[event.CodeLanctImprod] = new Set();
+        }
+        lancementByCode[event.CodeLanctImprod].add(event.OperatorCode);
+    });
+    
+    Object.keys(lancementByCode).forEach(lancementCode => {
+        if (lancementByCode[lancementCode].size > 1) {
+            const operators = Array.from(lancementByCode[lancementCode]);
+            console.log(`ℹ️ Lancement ${lancementCode} partagé entre ${operators.length} opérateurs: ${operators.join(', ')}`);
+            console.log(`   → Chaque opérateur aura son propre historique isolé`);
+        }
+    });
+    
+    const processedItems = [];
+    
+    Object.keys(lancementGroups).forEach(key => {
+        const groupEvents = lancementGroups[key].sort((a, b) => {
+            const da = new Date(a.CreatedAt || a.DateCreation).getTime();
+            const db = new Date(b.CreatedAt || b.DateCreation).getTime();
+            if (da !== db) return da - db;
+            return (a.NoEnreg || 0) - (b.NoEnreg || 0);
+        });
+        
+        console.log(`🔍 Traitement du groupe ${key}:`, groupEvents.map(e => ({
+            ident: e.Ident,
+            dateCreation: e.DateCreation,
+            heureDebut: e.HeureDebut,
+            heureFin: e.HeureFin
+        })));
+        
+        // Logique : une ligne par CYCLE (DEBUT..FIN ou DEBUT..PAUSE/REPRISE), pas seulement la dernière.
+        console.log(`🔍 Traitement de ${groupEvents.length} événements pour ${key}`);
+
+        // Identifier tous les indices de DEBUT pour découper en cycles successifs
+        const debutIndices = [];
+        for (let i = 0; i < groupEvents.length; i++) {
+            if (groupEvents[i]?.Ident === 'DEBUT') {
+                debutIndices.push(i);
+            }
+        }
+
+        if (debutIndices.length === 0) {
+            console.warn(`⚠️ Aucun DEBUT trouvé pour ${key}, groupe ignoré.`);
+            return;
+        }
+
+        debutIndices.forEach((startIdx, idx) => {
+            const endIdx = (idx + 1 < debutIndices.length) 
+                ? debutIndices[idx + 1] - 1 
+                : groupEvents.length - 1;
+            const cycleEvents = groupEvents.slice(startIdx, endIdx + 1);
+
+            const debutEvent = cycleEvents.find(e => e.Ident === 'DEBUT');
+            const finEvent = cycleEvents.find(e => e.Ident === 'FIN');
+            const pauseEvents = cycleEvents.filter(e => e.Ident === 'PAUSE');
+            const repriseEvents = cycleEvents.filter(e => e.Ident === 'REPRISE');
+
+            const debutEvents = cycleEvents
+                .filter(e => e.Ident === 'DEBUT')
+                .sort((a, b) => new Date(b.DateCreation) - new Date(a.DateCreation));
+            const lastDebutEvent = debutEvents[0];
+
+            const lastEvent = cycleEvents[cycleEvents.length - 1];
+            const { currentStatus, statusLabel } = resolveCycleStatus(lastEvent, lastDebutEvent, finEvent);
+
+            if (lastEvent?.Ident === 'PAUSE') {
+                console.log(`✅ Statut déterminé depuis dernier événement PAUSE: ${currentStatus}`);
+            } else if (lastEvent?.Ident === 'REPRISE') {
+                console.log(`✅ Statut déterminé depuis dernier événement REPRISE: ${currentStatus}`);
+            }
+
+            if (debutEvent) {
+                let endTime = null;
+
+                if (finEvent) {
+                    endTime = finEvent.HeureFin
+                        ? formatDateTime(finEvent.HeureFin)
+                        : formatDateTime(finEvent.CreatedAt || finEvent.DateCreation);
+                }
+
+                console.log(`🔍 Ligne pour ${key}, cycle ${idx}:`, currentStatus);
+                console.log(`🔍 Pauses trouvées: ${pauseEvents.length}, Reprises trouvées: ${repriseEvents.length}`);
+
+                if (includeWorkSegments) {
+                    const segments = buildWorkSegmentItems(
+                        debutEvent,
+                        cycleEvents,
+                        pauseEvents,
+                        repriseEvents,
+                        finEvent
+                    );
+                    // Chronologie simple : chaque créneau productif = 1 ligne.
+                    // Fin de ligne = début de pause ; début de ligne suivante = reprise.
+                    // Pas de ligne « pause » séparée.
+                    processedItems.push(...segments);
+                } else {
+                processedItems.push(
+                    createLancementItem(
+                        debutEvent,
+                        cycleEvents,
+                        currentStatus,
+                        statusLabel,
+                        endTime,
+                        pauseEvents,
+                        repriseEvents
+                    )
+                );
+
+                if (includePauseRows && pauseEvents.length > 0) {
+                    pairPauseRepriseEvents(pauseEvents, repriseEvents).forEach(({ pauseEvent, repriseEvent }) => {
+                        processedItems.push(
+                            createPauseRowItem(pauseEvent, repriseEvent, debutEvent)
+                        );
+                    });
+                }
+                }
+            }
+        });
+    });
+    
+    console.log(`🔍 Total d'items créés: ${processedItems.length}`);
+    return processedItems.sort((a, b) => {
+        const opA = String(a.operatorId || '').trim();
+        const opB = String(b.operatorId || '').trim();
+        if (opA !== opB) return opA.localeCompare(opB, 'fr');
+        const dateA = String(a.dateCreation || '').substring(0, 10);
+        const dateB = String(b.dateCreation || '').substring(0, 10);
+        const hmA = String(a.startTime || '99:99').substring(0, 5);
+        const hmB = String(b.startTime || '99:99').substring(0, 5);
+        const tsA = dateA && /^\d{2}:\d{2}$/.test(hmA) ? new Date(`${dateA}T${hmA}:00`).getTime() : 0;
+        const tsB = dateB && /^\d{2}:\d{2}$/.test(hmB) ? new Date(`${dateB}T${hmB}:00`).getTime() : 0;
+        if (tsA !== tsB) return tsA - tsB;
+        // Même minute : créneau productif avant la pause, puis reprise
+        const rank = (x) => {
+            if (x?._isPauseRow || x?.type === 'pause') return 1;
+            if (x?._isWorkSegment) return 0;
+            return 2;
+        };
+        const r = rank(a) - rank(b);
+        if (r !== 0) return r;
+        return String(a.id || '').localeCompare(String(b.id || ''), 'fr');
+    });
+}
+
+// Fonction helper pour créer un item de lancement
+function createLancementItem(startEvent, sequence, status, statusLabel, endTime = null, pauseEvents = [], repriseEvents = []) {
+    const finEvent = sequence.find(e => e.Ident === 'FIN');
+    const pauseEvent = sequence.find(e => e.Ident === 'PAUSE');
+    
+    // Debug uniquement si problème détecté
+    if (startEvent.HeureDebut && typeof startEvent.HeureDebut !== 'string' && !(startEvent.HeureDebut instanceof Date)) {
+        console.log(`⚠️ createLancementItem - HeureDebut problématique:`, {
+            HeureDebut: startEvent.HeureDebut,
+            HeureDebutType: typeof startEvent.HeureDebut,
+            Ident: startEvent.Ident
+        });
+    }
+    
+    const startTime = formatStartClock(startEvent);
+    
+    // Debug uniquement si problème détecté
+    if (startTime && startTime.includes(':')) {
+        const [hours, minutes] = startTime.split(':').map(Number);
+        if (hours > 23 || minutes > 59) {
+            console.log(`⚠️ startTime problématique:`, startTime);
+        }
+    }
+    
+    // Utiliser l'endTime fourni ou calculer selon le contexte
+    let finalEndTime;
+    if (endTime !== null) {
+        // Si endTime est fourni explicitement (cas des pauses terminées), l'utiliser
+        finalEndTime = endTime;
+    } else if (finEvent) {
+        // Pour les opérations terminées, utiliser HeureFin ou DateCreation
+        // Gérer le cas où HeureFin est un tableau
+        let heureFin = Array.isArray(finEvent.HeureFin) ? finEvent.HeureFin[0] : finEvent.HeureFin;
+        
+        if (heureFin) {
+            if (typeof heureFin === 'string' && /^\d{2}:\d{2}(:\d{2})?$/.test(heureFin)) {
+                // Format HH:mm ou HH:mm:ss - retourner directement
+                finalEndTime = heureFin.substring(0, 5);
+            } else if (heureFin instanceof Date) {
+                // Objet Date - extraire l'heure avec fuseau horaire français
+                finalEndTime = heureFin.toLocaleTimeString('fr-FR', {
+                    timeZone: 'Europe/Paris',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false
+                });
+            } else {
+                // Autre format - utiliser formatDateTime
+                finalEndTime = formatDateTime(heureFin);
+            }
+        } else {
+            // Pas d'heure de fin - utiliser CreatedAt (DATETIME2) plutôt que DateCreation (DATE) pour éviter les problèmes de timezone
+            finalEndTime = formatDateTime(finEvent.CreatedAt || finEvent.DateCreation);
+        }
+    } else if (pauseEvent && status === 'PAUSE') {
+        // Pour les pauses en cours, pas d'heure de fin
+        finalEndTime = null;
+    } else {
+        // Fallback par défaut
+        finalEndTime = null;
+    }
+    
+    // Validation et correction des heures incohérentes
+    if (startTime && finalEndTime && startTime.includes(':') && finalEndTime.includes(':')) {
+        const [startHours, startMinutes] = startTime.split(':').map(Number);
+        const [endHours, endMinutes] = finalEndTime.split(':').map(Number);
+        
+        const startTotalMinutes = startHours * 60 + startMinutes;
+        const endTotalMinutes = endHours * 60 + endMinutes;
+        
+        // Si l'heure de fin est avant l'heure de début (et pas de traversée de minuit)
+        if (endTotalMinutes < startTotalMinutes && endTotalMinutes > 0) {
+            console.log(`⚠️ Heures incohérentes détectées: ${startTime} -> ${finalEndTime}`);
+            console.log(`🔧 Correction: heure de fin mise à null pour éviter l'incohérence`);
+            finalEndTime = null; // Mettre à null plutôt qu'une heure incorrecte
+        }
+    }
+    
+    // Debug uniquement si problème détecté
+    if (finalEndTime && finalEndTime.includes(':')) {
+        const [hours, minutes] = finalEndTime.split(':').map(Number);
+        if (hours > 23 || minutes > 59) {
+            console.log(`⚠️ finalEndTime problématique:`, finalEndTime);
+        }
+    }
+    
+    // Utiliser CreatedAt pour les calculs de durée (plus précis que DateCreation)
+    const duration = finalEndTime ? 
+        calculateDuration(startEvent.CreatedAt || startEvent.DateCreation, new Date(finalEndTime)) : null;
+    
+    return {
+        id: startEvent.NoEnreg,
+        operatorId: startEvent.OperatorCode,
+        operatorName: startEvent.operatorName || 'Non assigné',
+        lancementCode: startEvent.CodeLanctImprod,
+        article: startEvent.Article || 'N/A',
+        phase: startEvent.Phase,
+        codeRubrique: startEvent.CodeRubrique || null,
+        startTime: startTime,
+        endTime: finalEndTime,
+        // pauseEvent.DateCreation peut être un DATE => utiliser CreatedAt pour l'heure réelle
+        pauseTime: pauseEvent ? formatDateTime(pauseEvent.CreatedAt || pauseEvent.DateCreation) : null,
+        duration: duration,
+        pauseDuration: null,
+        status: statusLabel,
+        statusCode: status,
+        generalStatus: status,
+        events: sequence.length,
+        // lastUpdate doit être une datetime fiable pour le tri
+        lastUpdate: resolveLastUpdate(finEvent, pauseEvent, startEvent),
+        dateCreation: String(startEvent.DateCreation || '').substring(0, 10) || null,
+        type: (status === 'PAUSE' || status === 'PAUSE_TERMINEE') ? 'pause' : 'lancement'
+    };
+}
+
+// Fonction originale pour regrouper les événements par lancement et calculer les temps
+function processLancementEvents(events) {
+    const lancementGroups = {};
+    
+    // Regrouper par CodeLanctImprod et CodeRubrique
+    events.forEach(event => {
+        const key = `${event.CodeLanctImprod}_${event.CodeRubrique}`;
+        if (!lancementGroups[key]) {
+            lancementGroups[key] = [];
+        }
+        lancementGroups[key].push(event);
+    });
+    
+    const processedLancements = [];
+    
+    Object.keys(lancementGroups).forEach(key => {
+        // Trier par CreatedAt si disponible (datetime réelle), sinon DateCreation
+        const groupEvents = lancementGroups[key].sort((a, b) => {
+            const da = a.CreatedAt || a.DateCreation;
+            const db = b.CreatedAt || b.DateCreation;
+            return new Date(da) - new Date(db);
+        });
+        
+        // Trouver les événements clés
+        const debutEvent = groupEvents.find(e => e.Ident === 'DEBUT');
+        const finEvent = groupEvents.find(e => e.Ident === 'FIN');
+        const pauseEvents = groupEvents.filter(e => e.Ident === 'PAUSE');
+        const repriseEvents = groupEvents.filter(e => e.Ident === 'REPRISE');
+        
+        // Déterminer le statut de la ligne principale (jamais "EN PAUSE")
+        const currentStatus = finEvent ? 'TERMINE' : 'EN_COURS';
+        const statusLabel = finEvent ? 'Terminé' : 'En cours';
+        
+        // Calculer les temps
+        // Utiliser CreatedAt (DATETIME2) plutôt que DateCreation (DATE) pour éviter les problèmes de timezone
+        // DateCreation est souvent DATE (00:00Z => 01:00 Paris). Utiliser CreatedAt si possible.
+        const startTime = debutEvent ? formatDateTime(debutEvent.CreatedAt || debutEvent.DateCreation) : null;
+        const endTime = finEvent ? formatDateTime(finEvent.CreatedAt || finEvent.DateCreation) : null;
+        // Utiliser CreatedAt pour les calculs de durée (plus précis que DateCreation)
+        const duration = (debutEvent && finEvent) ? 
+            calculateDuration(debutEvent.CreatedAt || debutEvent.DateCreation, finEvent.CreatedAt || finEvent.DateCreation) : null;
+        
+        // Calculer le temps de pause total
+        let totalPauseTime = 0;
+        for (let i = 0; i < Math.min(pauseEvents.length, repriseEvents.length); i++) {
+            const pauseStart = new Date(pauseEvents[i].CreatedAt || pauseEvents[i].DateCreation);
+            const pauseEnd = new Date(repriseEvents[i].CreatedAt || repriseEvents[i].DateCreation);
+            if (!Number.isNaN(pauseStart.getTime()) && !Number.isNaN(pauseEnd.getTime())) {
+                totalPauseTime += pauseEnd.getTime() - pauseStart.getTime();
+            }
+        }
+        
+        const pauseDuration = totalPauseTime > 0 ? 
+            Math.floor(totalPauseTime / (1000 * 60)) + 'min' : null;
+        
+        // Utiliser le dernier événement pour les infos générales
+        const lastEvent = groupEvents[groupEvents.length - 1];
+        
+        processedLancements.push({
+            id: lastEvent.NoEnreg,
+            operatorId: lastEvent.CodeRubrique,
+            lancementCode: lastEvent.CodeLanctImprod,
+            phase: lastEvent.Phase,
+            startTime: startTime,
+            endTime: endTime,
+            pauseTime: pauseEvents.length > 0 ? formatDateTime(pauseEvents[0].CreatedAt || pauseEvents[0].DateCreation) : null,
+            duration: duration,
+            pauseDuration: pauseDuration,
+            status: statusLabel,
+            statusCode: currentStatus,
+            generalStatus: currentStatus,
+            events: groupEvents.length,
+            lastUpdate: lastEvent.CreatedAt || lastEvent.DateCreation,
+            type: 'lancement' // Ligne principale toujours de type 'lancement'
+        });
+    });
+    
+    return processedLancements.sort((a, b) => 
+        new Date(b.lastUpdate) - new Date(a.lastUpdate)
+    );
+}
+
+// GET /api/admin - Route racine admin
+router.get('/', async (req, res) => {
+    try {
+        console.log('🚀 DEBUT route /api/admin');
+
+        // Éviter le cache (sinon le navigateur peut recevoir 304 sans body JSON)
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+
+        const { date, dateStart, dateEnd } = req.query;
+        const targetDate = date || moment().format('YYYY-MM-DD');
+        
+        // Récupérer les statistiques (toujours sur la date du jour pour les stats live)
+        const stats = await getAdminStats(targetDate);
+        
+        // Récupérer les opérations pour le tableau (cap élevé : le front pagine côté UI après fusion monitoring)
+        const operationsResult = await getAdminOperations(targetDate, 1, ADMIN_DASHBOARD_OPERATIONS_CAP, dateStart, dateEnd);
+        
+        res.json({
+            stats,
+            operations: operationsResult.operations || [],
+            pagination: operationsResult.pagination || null,
+            date: targetDate
+        });
+        
+    } catch (error) {
+        console.error('Erreur lors de la récupération des données admin:', error);
+        res.status(500).json({ 
+            error: 'Erreur lors de la récupération des données admin' 
+        });
+    }
+});
+
+// GET /api/admin/operations - Récupérer les opérations pour l'interface admin
+router.get('/operations', async (req, res) => {
+    try {
+        const { date, dateStart, dateEnd, page = 1, limit = 25 } = req.query;
+        const targetDate = date || moment().format('YYYY-MM-DD');
+        
+        // Éviter le cache
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        
+        const result = await getAdminOperations(targetDate, Number.parseInt(page), Number.parseInt(limit), dateStart, dateEnd);
+        console.log('🎯 Envoi des opérations admin:', result.operations?.length || 0, 'éléments');
+        res.json(result);
+        
+    } catch (error) {
+        console.error('Erreur lors de la récupération des opérations:', error);
+        res.status(500).json({ 
+            error: 'Erreur lors de la récupération des opérations' 
+        });
+    }
+});
+
+// GET /api/admin/stats - Récupérer uniquement les statistiques
+router.get('/stats', async (req, res) => {
+    try {
+        const { date } = req.query;
+        const targetDate = date || moment().format('YYYY-MM-DD');
+        
+        const stats = await getAdminStats(targetDate);
+        res.json(stats);
+        
+    } catch (error) {
+        console.error('Erreur lors de la récupération des statistiques:', error);
+        res.status(500).json({ 
+            error: 'Erreur lors de la récupération des statistiques' 
+        });
+    }
+});
+
+// GET /api/admin/concurrency-stats - Statistiques de concurrence
+router.get('/concurrency-stats', (req, res) => {
+    try {
+        const stats = getConcurrencyStats();
+        res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            concurrency: stats,
+            recommendations: {
+                maxConcurrentConnections: 20,
+                currentLoad: `${stats.totalActiveOperations}/20`,
+                status: stats.totalActiveOperations > 15 ? 'HIGH_LOAD' : 'NORMAL'
+            }
+        });
+    } catch (error) {
+        console.error('❌ Erreur récupération stats concurrence:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la récupération des statistiques de concurrence'
+        });
+    }
+});
+
+// GET /api/admin/export/:format - Exporter les données
+router.get('/export/:format', async (req, res) => {
+    try {
+        const { format } = req.params;
+        const { date } = req.query;
+        const targetDate = date || moment().format('MM-DD');
+        
+        if (format !== 'csv') {
+            return res.status(400).json({ 
+                error: 'Format non supporté. Utilisez csv.' 
+            });
+        }
+        
+        const opsResult = await getAdminOperations(targetDate, 1, ADMIN_DASHBOARD_OPERATIONS_CAP);
+        const operations = Array.isArray(opsResult) ? opsResult : (opsResult?.operations || []);
+
+        // Générer CSV
+        const csvHeader = 'ID,Opérateur,Code Lancement,Article,Date,Statut\n';
+        const csvData = operations.map(op => 
+            `${op.id},"${op.operatorName}","${op.lancementCode}","${op.article}","${op.startTime}","${op.status}"`
+        ).join('\n');
+        
+            res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="operations-${targetDate}.csv"`);
+        res.send(csvHeader + csvData);
+        
+    } catch (error) {
+        console.error('Erreur lors de l\'export des données:', error);
+        res.status(500).json({ 
+            error: 'Erreur lors de l\'export des données' 
+        });
+    }
+});
+
+// Fonction pour récupérer les statistiques avec les vraies tables
+async function getAdminStats(date) {
+    try {
+        const ttlHours = Math.max(1, Math.min(Number.parseInt(process.env.OPERATOR_SESSION_TTL_HOURS || '12', 10) || 12, 72));
+        // Opérateurs "en ligne" = dernier événement du jour = travail EN_COURS/EN_PAUSE
+        // OU session tablette encore ACTIVE (ABSESSIONS) même entre deux lancements / après veille.
+        const operatorsQuery = `
+            WITH last_per_operator AS (
+                SELECT
+                    h.OperatorCode,
+                    h.Ident,
+                    h.Statut,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY h.OperatorCode
+                        ORDER BY h.DateCreation DESC, h.NoEnreg DESC
+                    ) AS rn
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h WITH (NOLOCK)
+                WHERE h.DateCreation >= CONVERT(date, GETDATE())
+                  AND h.DateCreation <  DATEADD(day, 1, CONVERT(date, GETDATE()))
+                  AND h.OperatorCode IS NOT NULL
+                  AND LTRIM(RTRIM(h.OperatorCode)) <> ''
+                  AND h.OperatorCode <> '0'
+            ),
+            histo_online AS (
+                SELECT l.OperatorCode
+                FROM last_per_operator l
+                WHERE l.rn = 1
+                  AND UPPER(LTRIM(RTRIM(COALESCE(l.Ident, '')))) <> 'FIN'
+                  AND UPPER(LTRIM(RTRIM(COALESCE(l.Statut, '')))) IN ('EN_COURS', 'EN_PAUSE')
+            ),
+            session_active AS (
+                SELECT DISTINCT s.OperatorCode
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] s WITH (NOLOCK)
+                WHERE s.SessionStatus = 'ACTIVE'
+                  AND COALESCE(s.LastActivityTime, s.LoginTime, s.DateCreation) >= DATEADD(HOUR, -@ttlHours, GETDATE())
+                  AND s.OperatorCode IS NOT NULL
+                  AND LTRIM(RTRIM(s.OperatorCode)) <> ''
+                  AND s.OperatorCode <> '0'
+            ),
+            merged AS (
+                SELECT OperatorCode FROM histo_online
+                UNION
+                SELECT OperatorCode FROM session_active
+            )
+            SELECT COUNT(*) AS totalOperators FROM merged
+        `;
+        
+        // Récupérer les événements depuis ABHISTORIQUE_OPERATEURS pour la date spécifiée
+        // Utiliser la même logique que getAdminOperations pour la cohérence
+        const targetDate = date ? moment(date).format('YYYY-MM-DD') : moment().format('YYYY-MM-DD');
+        
+        // Utiliser le service de validation pour récupérer les événements (même source que le tableau)
+        // ⚡ Perf: filtrer directement côté SQL sur la journée demandée (sinon scan de tout l'historique)
+        const validationResult = await dataValidation.getAdminDataSecurely(targetDate);
+        
+        // Exécuter la requête des opérateurs en parallèle
+        const operatorStats = await executeQuery(operatorsQuery, { ttlHours });
+        
+        if (!validationResult.valid) {
+            console.error('❌ Erreur de validation des données pour les statistiques:', validationResult.error);
+            return {
+                totalOperators: operatorStats[0]?.totalOperators || 0,
+                activeLancements: 0,
+                pausedLancements: 0,
+                completedLancements: 0
+            };
+        }
+        
+        const allEvents = validationResult.events;
+        
+        // Filtrer les événements par date (par défaut, utiliser aujourd'hui)
+        // IMPORTANT: DateCreation est renvoyé en 'YYYY-MM-DD' (string) pour éviter les décalages timezone.
+        let filteredEvents = allEvents.filter(event => String(event.DateCreation || '') === targetDate);
+
+        // Exclure l'historique seulement si tous les ABTEMPS du couple
+        // opérateur+LT+phase+rubrique sont transmis (multi-cycles : un T ne masque pas les autres).
+        try {
+            const abtempsQuery = `
+                SELECT OperatorCode, LancementCode, Phase, CodeRubrique, StatutTraitement
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] WITH (NOLOCK)
+                WHERE DateCreation = @date
+            `;
+            const abtempsRows = await executeQuery(abtempsQuery, { date: targetDate });
+            const fullyTransmittedKeys = new Set();
+            const keyStats = new Map();
+            for (const t of abtempsRows) {
+                const k = `${t.OperatorCode}_${t.LancementCode}_${String(t.Phase || '').trim()}_${String(t.CodeRubrique || '').trim()}`;
+                if (!keyStats.has(k)) keyStats.set(k, { hasT: false, hasPending: false });
+                const st = keyStats.get(k);
+                if (String(t.StatutTraitement || '').toUpperCase().trim() === 'T') st.hasT = true;
+                else st.hasPending = true;
+            }
+            for (const [k, st] of keyStats) {
+                if (st.hasT && !st.hasPending) fullyTransmittedKeys.add(k);
+            }
+            filteredEvents = filteredEvents.filter(e => {
+                const k = `${e.OperatorCode}_${e.CodeLanctImprod}_${String(e.Phase || '').trim()}_${String(e.CodeRubrique || '').trim()}`;
+                return !fullyTransmittedKeys.has(k);
+            });
+        } catch (e) {
+            console.warn('⚠️ Impossible de filtrer les opérations transmises pour les stats:', e.message);
+        }
+        
+        console.log(` Calcul des statistiques pour ${filteredEvents.length} événements (date: ${targetDate})`);
+        
+        // Utiliser la même fonction que getAdminOperations pour la cohérence
+        const processedLancements = processLancementEventsWithPauses(filteredEvents);
+        
+        console.log(`📊 ${processedLancements.length} lancements traités pour les statistiques`);
+        
+        // Compter par statut (utiliser statusCode pour plus de fiabilité)
+        // Debug: afficher les statuts trouvés
+        const statusCounts = {};
+        processedLancements.forEach(l => {
+            const key = `${l.statusCode || 'NO_CODE'}_${l.status || 'NO_STATUS'}_${l.statusLabel || 'NO_LABEL'}`;
+            statusCounts[key] = (statusCounts[key] || 0) + 1;
+        });
+        console.log('📊 Répartition des statuts:', statusCounts);
+        
+        const activeLancements = processedLancements.filter(l => 
+            l.statusCode === 'EN_COURS' || 
+            (l.status?.toLowerCase() === 'en cours' || l.status === 'En cours') ||
+            (l.statusLabel?.toLowerCase() === 'en cours')
+        ).length;
+        
+        const pausedLancements = processedLancements.filter(l => 
+            l.statusCode === 'EN_PAUSE' || l.statusCode === 'PAUSE' ||
+            (l.status?.toLowerCase().includes('pause') || l.status === 'En pause') ||
+            (l.statusLabel?.toLowerCase().includes('pause'))
+        ).length;
+        
+        const completedLancements = processedLancements.filter(l => 
+            l.statusCode === 'TERMINE' ||
+            (l.status?.toLowerCase().includes('terminé') || l.status?.toLowerCase().includes('termine')) ||
+            (l.statusLabel?.toLowerCase().includes('terminé') || l.statusLabel?.toLowerCase().includes('termine'))
+        ).length;
+        
+        console.log(`📊 Statistiques calculées:`, {
+            active: activeLancements,
+            paused: pausedLancements,
+            completed: completedLancements,
+            total: processedLancements.length
+        });
+    
+        return {
+            totalOperators: operatorStats[0]?.totalOperators || 0,
+            activeLancements: activeLancements,
+            pausedLancements: pausedLancements,
+            completedLancements: completedLancements
+        };
+    } catch (error) {
+        console.error('Erreur lors de la récupération des statistiques:', error);
+    return {
+            totalOperators: 0,
+            activeLancements: 0,
+            pausedLancements: 0,
+            completedLancements: 0
+        };
+    }
+}
+
+// Fonction pour récupérer les opérations basées sur les événements ABHISTORIQUE_OPERATEURS
+function buildInParams(values, prefix) {
+    const params = {};
+    const placeholders = [];
+    (values || []).forEach((v, i) => {
+        const key = `${prefix}${i}`;
+        params[key] = v;
+        placeholders.push(`@${key}`);
+    });
+    return { params, placeholders: placeholders.join(', ') };
+}
+
+async function getLctcStepsByLaunch(lancements) {
+    // Map: CodeLancement -> [{ Phase, CodeRubrique, CodeOperation }]
+    const unique = [...new Set((lancements || []).map(x => String(x || '').trim()).filter(Boolean))];
+    const byLaunch = new Map();
+    if (unique.length === 0) return byLaunch;
+
+    const { params, placeholders } = buildInParams(unique, 'lc');
+    const rows = await executeQuery(`
+        SELECT DISTINCT
+            C.CodeLancement,
+            LTRIM(RTRIM(C.Phase)) AS Phase,
+            LTRIM(RTRIM(C.CodeRubrique)) AS CodeRubrique,
+            LTRIM(RTRIM(C.CodeOperation)) AS CodeOperation
+        FROM [SEDI_ERP].[dbo].[LCTC] C
+        WHERE C.TypeRubrique = 'O'
+          AND C.CodeOperation IS NOT NULL
+          AND LTRIM(RTRIM(C.CodeOperation)) <> ''
+          AND UPPER(LTRIM(RTRIM(C.CodeOperation))) COLLATE Latin1_General_CI_AI NOT IN ('SECHAGE', 'ETUVAGE')
+          AND C.CodeLancement IN (${placeholders})
+        ORDER BY C.CodeLancement, LTRIM(RTRIM(C.Phase)), LTRIM(RTRIM(C.CodeRubrique))
+    `, params);
+
+    (rows || []).forEach(r => {
+        const lc = String(r?.CodeLancement || '').trim();
+        const ph = String(r?.Phase || '').trim();
+        const rub = String(r?.CodeRubrique || '').trim();
+        const op = String(r?.CodeOperation || '').trim();
+        if (!lc || !ph || !op) return;
+        if (!byLaunch.has(lc)) byLaunch.set(lc, []);
+        byLaunch.get(lc).push({ Phase: ph, CodeRubrique: rub, CodeOperation: op });
+    });
+    return byLaunch;
+}
+
+async function getFabricationMapForLaunches(lancements) {
+    // Map: `${CodeLancement}_${Phase}_${CodeRubrique}` -> "CodeOperation" (or joined list)
+    const byLaunch = await getLctcStepsByLaunch(lancements);
+    const out = new Map();
+    byLaunch.forEach((steps, lc) => {
+        const acc = new Map(); // key -> Set
+        steps.forEach(s => {
+            const key = `${lc}_${s.Phase}_${s.CodeRubrique}`;
+            if (!acc.has(key)) acc.set(key, new Set());
+            acc.get(key).add(s.CodeOperation);
+        });
+        acc.forEach((set, key) => out.set(key, Array.from(set).join(' / ')));
+    });
+    return out;
+}
+
+const EVENT_MARKER_PHASES = new Set(['PRODUCTION', 'PAUSE', 'REPRISE', 'TERMINE', 'TERMINÉE', 'ADMIN']);
+
+function isStoredPhaseInvalidForDisplay(phase, operatorCode) {
+    const p = String(phase || '').trim();
+    if (!p) return true;
+    if (EVENT_MARKER_PHASES.has(p.toUpperCase())) return true;
+    const op = String(operatorCode || '').trim();
+    // Ne jamais afficher le code opérateur à la place de la phase ERP
+    if (op && p === op) return true;
+    return false;
+}
+
+/**
+ * Pose Phase + Fabrication depuis LCTC (phase du lancement), pas depuis le code opérateur.
+ */
+function applyLctcPhaseFabrication(record, byLaunch) {
+    const lc = String(record?.LancementCode || record?.lancementCode || '').trim();
+    const steps = byLaunch.get(lc) || [];
+    const operatorCode = String(
+        record?.OperatorCode || record?.operatorId || record?.operatorCode || ''
+    ).trim();
+    let phase = String(record?.Phase || record?.phase || '').trim();
+    let rubrique = String(record?.CodeRubrique || record?.codeRubrique || '').trim();
+
+    if (isStoredPhaseInvalidForDisplay(phase, operatorCode)) {
+        // 1) match par CodeRubrique ERP (si ce n'est pas le code opérateur)
+        let match = null;
+        if (rubrique && rubrique !== operatorCode) {
+            match = steps.find(s => s.CodeRubrique === rubrique) || null;
+        }
+        // 2) une seule étape sur le lancement
+        if (!match && steps.length === 1) {
+            match = steps[0];
+        }
+        // 3) sinon première phase ERP du lancement (affichage)
+        if (!match && steps.length > 0) {
+            match = steps[0];
+        }
+        if (match) {
+            phase = match.Phase;
+            rubrique = match.CodeRubrique;
+            record.Phase = phase;
+            record.phase = phase;
+            record.CodeRubrique = rubrique;
+            record.codeRubrique = rubrique;
+        } else {
+            // Pas de phase ERP connue : ne pas afficher un code opérateur
+            record.Phase = null;
+            record.phase = null;
+            phase = '';
+        }
+    }
+
+    const fabPhase = String(record?.CodeRubrique || record?.codeRubrique || '').trim();
+    let fabrication = '-';
+    if (phase) {
+        const exact = steps.filter(s => s.Phase === phase && s.CodeRubrique === fabPhase);
+        const byPhase = exact.length ? exact : steps.filter(s => s.Phase === phase);
+        if (byPhase.length) {
+            fabrication = [...new Set(byPhase.map(s => s.CodeOperation))].join(' / ');
+        }
+    }
+    record.Fabrication = fabrication;
+    record.fabrication = fabrication;
+    return record;
+}
+
+async function getAdminOperations(date, page = 1, limit = 25, dateStart = null, dateEnd = null) {
+    try {
+        const targetDate = date ? moment(date).format('YYYY-MM-DD') : moment().format('YYYY-MM-DD');
+        const dStart = dateStart ? moment(dateStart).format('YYYY-MM-DD') : null;
+        const dEnd = dateEnd ? moment(dateEnd).format('YYYY-MM-DD') : null;
+        const isRange = !!(dStart && dEnd);
+
+        console.log('🚀 DEBUT getAdminOperations SÉCURISÉ - date:', targetDate, 'range:', dStart, '->', dEnd, 'page:', page);
+        
+        // ⚡ Perf: filtrer côté SQL (une date précise ou une plage)
+        const validationResult = isRange
+            ? await dataValidation.getAdminDataSecurely(null, dStart, dEnd)
+            : await dataValidation.getAdminDataSecurely(targetDate);
+        
+        if (!validationResult.valid) {
+            console.error('❌ Erreur de validation des données:', validationResult.error);
+            return { operations: [], pagination: null, error: validationResult.error };
+        }
+        
+        const allEvents = validationResult.events;
+        console.log('Résultats sécurisés:', allEvents.length, 'événements valides trouvés');
+        
+        if (validationResult.invalidEvents.length > 0) {
+            console.log(`🚨 ${validationResult.invalidEvents.length} événements avec associations invalides ignorés`);
+        }
+        
+        // Filtrer par date/plage (défense en profondeur côté JS)
+        // IMPORTANT: DateCreation est renvoyé en 'YYYY-MM-DD' (string) pour éviter les décalages timezone.
+        let filteredEvents;
+        if (isRange) {
+            filteredEvents = allEvents.filter(event => {
+                const d = String(event.DateCreation || '');
+                return d >= dStart && d <= dEnd;
+            });
+        } else {
+            filteredEvents = allEvents.filter(event => String(event.DateCreation || '') === targetDate);
+        }
+
+        // Ne pas retirer l'historique quand un ABTEMPS du même jour est déjà T.
+        // Une correction (heures modifiées, pas encore reconsolidées) doit rester visible.
+        // Le front masque seulement le doublon exact (même début et même fin qu'une ligne T).
+
+        // Regrouper les événements par lancement mais garder les pauses séparées
+        console.log('🔍 Événements avant regroupement:', filteredEvents.length);
+        // Debug des types d'heures (uniquement si problème détecté)
+        const problematicEvents = filteredEvents.filter(e => 
+            e.HeureDebut && typeof e.HeureDebut !== 'string' && !(e.HeureDebut instanceof Date)
+        );
+        if (problematicEvents.length > 0) {
+            console.log('⚠️ Événements avec types d\'heures problématiques:', problematicEvents.map(e => ({
+                ident: e.Ident,
+                lancement: e.CodeLanctImprod,
+                heureDebut: e.HeureDebut,
+                heureDebutType: typeof e.HeureDebut
+            })));
+        }
+        
+        // Utiliser la fonction de regroupement avec pauses séparées
+        const processedLancements = processLancementEventsWithPauses(filteredEvents, { includeWorkSegments: true });
+        console.log('🔍 Événements après regroupement:', processedLancements.length);
+        console.log('🔍 Détail des événements regroupés:', processedLancements.map(p => ({
+            lancement: p.lancementCode,
+            type: p.type,
+            status: p.status,
+            startTime: p.startTime,
+            endTime: p.endTime
+        })));
+        
+        // Appliquer la pagination
+        const startIndex = (page - 1) * limit;
+        const endIndex = startIndex + limit;
+        const limitedLancements = processedLancements.slice(startIndex, endIndex);
+        
+        const formattedOperations = limitedLancements.map(lancement => {
+            // Trouver les informations détaillées depuis les événements
+            const firstEvent = filteredEvents.find(e =>
+                e.CodeLanctImprod === lancement.lancementCode &&
+                e.OperatorCode === lancement.operatorId
+            );
+            // Utiliser le nom depuis lancement si disponible, sinon depuis les événements
+            const operatorName = lancement.operatorName || firstEvent?.operatorName || `Opérateur ${lancement.operatorId}` || 'Non assigné';
+            
+            return {
+                id: lancement.id,
+                operatorId: lancement.operatorId,
+                operatorName: operatorName,
+                lancementCode: lancement.lancementCode,
+                article: firstEvent?.Article || lancement.article || 'N/A',
+                articleDetail: firstEvent?.ArticleDetail || lancement.articleDetail || '',
+                phase: lancement.phase || null,
+                codeRubrique: lancement.codeRubrique || null,
+                // Duplicates of same fields with ERP-like casing (used by frontend normalizers)
+                Phase: lancement.phase || null,
+                CodeRubrique: lancement.codeRubrique || null,
+                startTime: lancement.startTime,
+                endTime: lancement.endTime,
+                pauseTime: lancement.pauseTime,
+                duration: lancement.duration,
+                pauseDuration: lancement.pauseDuration,
+                status: lancement.status,
+                statusCode: lancement.statusCode,
+                generalStatus: lancement.generalStatus,
+                events: lancement.events,
+                type: lancement.type || 'lancement',
+                _isPauseRow: lancement._isPauseRow === true,
+                _isWorkSegment: lancement._isWorkSegment === true,
+                editable: lancement.editable !== false,
+                dateCreation: lancement.dateCreation || null
+            };
+        });
+
+        // Phase + libellé depuis LCTC (phase du lancement), jamais le code opérateur
+        try {
+            const lts = [...new Set(formattedOperations.map(o => String(o?.lancementCode || '').trim()).filter(Boolean))];
+            const byLaunch = await getLctcStepsByLaunch(lts);
+            formattedOperations.forEach(o => applyLctcPhaseFabrication(o, byLaunch));
+        } catch (e) {
+            console.warn('⚠️ Impossible d\'enrichir les opérations admin avec la phase LCTC:', e.message);
+        }
+
+        console.log(`🎯 Envoi de ${formattedOperations.length} lancements regroupés (page ${page}/${Math.ceil(processedLancements.length / limit)})`);
+        return {
+            operations: formattedOperations,
+            pagination: {
+                currentPage: page,
+                totalPages: Math.ceil(processedLancements.length / limit),
+                totalItems: processedLancements.length,
+                itemsPerPage: limit,
+                hasNextPage: page < Math.ceil(processedLancements.length / limit),
+                hasPrevPage: page > 1
+            }
+        };
+
+    } catch (error) {
+        console.error('❌ Erreur lors de la récupération des opérations:', error);
+        return { operations: [], pagination: null };
+    }
+}
+
+// PUT /api/admin/operations/:id - Modifier une opération
+router.put('/operations/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { lancementCode } = req.body;
+        
+        console.log(`🔧 Modification opération ${id}:`, req.body);
+        
+        const timeUpdates = collectOperationTimeUpdates(req.body);
+        if (timeUpdates.error) {
+            return res.status(400).json({
+                success: false,
+                error: timeUpdates.error
+            });
+        }
+        const updateFields = timeUpdates.updateFields;
+        const params = { id: Number.parseInt(id), ...timeUpdates.params };
+        let formattedEndTimeForFinEvent = timeUpdates.formattedEndTimeForFinEvent;
+        let requestedLancementCode = lancementCode;
+        
+        if (params.startTime) {
+            console.log(`🔧 startTime -> ${params.startTime}`);
+        }
+        if (params.endTime) {
+            console.log(`🔧 endTime -> ${params.endTime}`);
+        }
+        if (params.status) {
+            console.log(`🔧 status: ${params.status}`);
+        }
+        
+        // Validation de cohérence des heures
+        if (params.startTime && params.endTime) {
+            const startMinutes = timeToMinutes(params.startTime);
+            const endMinutes = timeToMinutes(params.endTime);
+            
+            if (endMinutes < startMinutes) {
+                console.warn(`⚠️ Heure de fin (${params.endTime}) antérieure à l'heure de début (${params.startTime})`);
+                // Ne pas bloquer, juste avertir
+            }
+        }
+        
+        // Normaliser lancementCode si fourni (admin: correction LT)
+        if (requestedLancementCode !== undefined) {
+            const normalized = String(requestedLancementCode || '').trim().toUpperCase();
+            if (!normalized) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'LancementCode invalide (vide)'
+                });
+            }
+            // Format attendu: LT + 7 ou 8 chiffres
+            if (!/^LT\d{7,8}$/.test(normalized)) {
+            return res.status(400).json({ 
+                success: false, 
+                    error: 'Format de lancement invalide (attendu: LT1234567 ou LT12345678)'
+            });
+            }
+            requestedLancementCode = normalized;
+        }
+        
+        // 🔒 VÉRIFICATION DE SÉCURITÉ : Vérifier que l'enregistrement existe et récupérer l'OperatorCode
+        const checkQuery = `
+            SELECT TOP 1
+                OperatorCode,
+                CodeLanctImprod,
+                Ident,
+                Phase,
+                CodeRubrique,
+                DateCreation,
+                SessionId,
+                RequestId
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            WHERE NoEnreg = @id
+        `;
+        const existing = await executeQuery(checkQuery, { id: Number.parseInt(id) });
+        
+        if (existing.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Opération non trouvée'
+            });
+        }
+        
+        // Si un operatorId est fourni dans le body, vérifier qu'il correspond
+        if (req.body.operatorId && req.body.operatorId !== existing[0].OperatorCode) {
+            return res.status(403).json({
+                success: false,
+                error: 'Vous ne pouvez modifier que vos propres opérations',
+                security: 'DATA_OWNERSHIP_VIOLATION'
+            });
+        }
+
+        const base = existing[0];
+        const baseOperatorCode = base.OperatorCode;
+        let baseLancementCode = base.CodeLanctImprod;
+        const baseDate = base.DateCreation; // DATE
+        const basePhase = base.Phase;
+        const baseCodeRubrique = base.CodeRubrique;
+        const baseSessionId = base.SessionId || null;
+
+        // Admin: allow correcting LT for non-consolidated operations by updating the whole step group
+        // We update all events for the same (Operator + Phase + CodeRubrique + day), and prefer SessionId when available.
+        let didLancementUpdate = false;
+        if (requestedLancementCode !== undefined && requestedLancementCode !== String(baseLancementCode || '').trim().toUpperCase()) {
+            try {
+                if (baseSessionId) {
+                    await executeQuery(
+                        `UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                         SET CodeLanctImprod = @newLancementCode
+                         WHERE OperatorCode = @operatorCode
+                           AND SessionId = @sessionId
+                           AND Phase = @phase
+                           AND CodeRubrique = @codeRubrique
+                           AND CAST(DateCreation AS DATE) = CAST(@date AS DATE)`,
+                        {
+                            newLancementCode: requestedLancementCode,
+                            operatorCode: baseOperatorCode,
+                            sessionId: baseSessionId,
+                            phase: basePhase,
+                            codeRubrique: baseCodeRubrique,
+                            date: baseDate
+                        }
+                    );
+                } else {
+                    await executeQuery(
+                        `UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                         SET CodeLanctImprod = @newLancementCode
+                         WHERE OperatorCode = @operatorCode
+                           AND CodeLanctImprod = @oldLancementCode
+                           AND Phase = @phase
+                           AND CodeRubrique = @codeRubrique
+                           AND CAST(DateCreation AS DATE) = CAST(@date AS DATE)`,
+                        {
+                            newLancementCode: requestedLancementCode,
+                            oldLancementCode: baseLancementCode,
+                            operatorCode: baseOperatorCode,
+                            phase: basePhase,
+                            codeRubrique: baseCodeRubrique,
+                            date: baseDate
+                        }
+                    );
+                }
+                didLancementUpdate = true;
+                baseLancementCode = requestedLancementCode; // Important for FIN propagation below
+                console.log(`✅ LancementCode corrigé: ${String(base.CodeLanctImprod || '').trim()} -> ${requestedLancementCode}`);
+            } catch (e) {
+                console.warn(`⚠️ Impossible de corriger le lancement: ${e.message}`);
+                return res.status(500).json({
+                    success: false,
+                    error: 'Erreur serveur lors de la correction du lancement'
+                });
+            }
+        }
+
+        // If nothing to change (including LT), treat as no-op success
+        if (updateFields.length === 0 && !didLancementUpdate) {
+            return res.json({
+                success: true,
+                message: 'Aucune modification',
+                noChange: true
+            });
+        }
+
+        // If user edits endTime, ensure the FIN event is updated (or created) for the same (LT + operator + phase + rubrique + date)
+        if (params.endTime && base.Ident !== 'FIN') {
+            try {
+                const finLookup = `
+                    SELECT TOP 1 NoEnreg
+                    FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                    WHERE OperatorCode = @operatorCode
+                      AND CodeLanctImprod = @lancementCode
+                      AND Ident = 'FIN'
+                      AND Phase = @phase
+                      AND CodeRubrique = @codeRubrique
+                      AND CAST(DateCreation AS DATE) = CAST(@date AS DATE)
+                    ORDER BY CreatedAt DESC, NoEnreg DESC
+                `;
+                const finRows = await executeQuery(finLookup, {
+                    operatorCode: baseOperatorCode,
+                    lancementCode: baseLancementCode,
+                    phase: basePhase,
+                    codeRubrique: baseCodeRubrique,
+                    date: baseDate
+                });
+
+                if (finRows.length > 0) {
+                    const finId = finRows[0].NoEnreg;
+                    await executeQuery(
+                        `UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                         SET HeureFin = @endTime
+                         WHERE NoEnreg = @id`,
+                        { id: finId, endTime: params.endTime }
+                    );
+                    console.log(`✅ HeureFin propagée sur l'événement FIN NoEnreg=${finId}`);
+                } else {
+                    // Create FIN event if missing (keeps UI and data consistent)
+                    const insertFin = `
+                        INSERT INTO [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                        (OperatorCode, CodeLanctImprod, CodeRubrique, Ident, Phase, Statut, HeureDebut, HeureFin, DateCreation, SessionId, RequestId, CreatedAt)
+                        VALUES (
+                            @operatorCode,
+                            @lancementCode,
+                            @codeRubrique,
+                            'FIN',
+                            @phase,
+                            'TERMINE',
+                            NULL,
+                            @endTime,
+                            CAST(@date AS DATE),
+                            @sessionId,
+                            @requestId,
+                            GETDATE()
+                        )
+                    `;
+                    await executeQuery(insertFin, {
+                        operatorCode: baseOperatorCode,
+                        lancementCode: baseLancementCode,
+                        codeRubrique: baseCodeRubrique,
+                        phase: basePhase,
+                        endTime: params.endTime,
+                        date: baseDate,
+                        sessionId: base.SessionId || null,
+                        requestId: base.RequestId || null
+                    });
+                    console.log(`✅ Événement FIN créé car absent (propagation endTime)`);
+                }
+            } catch (e) {
+                console.warn(`⚠️ Impossible de propager endTime sur FIN: ${e.message}`);
+            }
+        }
+
+        // 🔒 RÈGLE: interdiction de passer une opération en TERMINE sans endTime (sinon EndTime restera vide)
+        const desiredStatus = req.body.status ? String(req.body.status).toUpperCase().trim() : null;
+        if (desiredStatus === 'TERMINE' && !formattedEndTimeForFinEvent) {
+            return res.status(400).json({
+                success: false,
+                error: 'Impossible de marquer TERMINE sans heure de fin (endTime).'
+            });
+        }
+
+        // Si l'enregistrement modifié est un FIN, on peut mettre à jour HeureFin directement sur cette ligne.
+        // Sinon (cas le plus courant côté UI: ligne "DEBUT"), on crée/maj l'événement FIN correspondant pour que l'heure de fin s'affiche
+        // et que la consolidation dispose d'un FIN réel.
+        if (formattedEndTimeForFinEvent && String(base.Ident || '').toUpperCase() === 'FIN') {
+            updateFields.push('HeureFin = @endTime');
+        }
+        
+        const updateQuery = `
+            UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            SET ${updateFields.join(', ')}
+            WHERE NoEnreg = @id
+        `;
+        
+        if (updateFields.length > 0) {
+        console.log(`🔧 Requête de mise à jour:`, updateQuery);
+        console.log(`🔧 Paramètres:`, params);
+            console.log(`🔒 Opération appartenant à l'opérateur: ${baseOperatorCode}`);
+        await executeQuery(updateQuery, params);
+        }
+
+        // Mettre à jour / créer l'événement FIN si on a reçu endTime et que la ligne modifiée n'est pas FIN
+        if (formattedEndTimeForFinEvent && String(base.Ident || '').toUpperCase() !== 'FIN') {
+            const findFinQuery = `
+                SELECT TOP 1 NoEnreg
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                WHERE OperatorCode = @operatorCode
+                  AND CodeLanctImprod = @lancementCode
+                  AND Ident = 'FIN'
+                  AND CAST(DateCreation AS DATE) = CAST(@date AS DATE)
+                ORDER BY CreatedAt DESC, NoEnreg DESC
+            `;
+            const finRows = await executeQuery(findFinQuery, {
+                operatorCode: baseOperatorCode,
+                lancementCode: baseLancementCode,
+                date: baseDate
+            });
+
+            if (finRows.length > 0) {
+                const finId = finRows[0].NoEnreg;
+                console.log(`🔧 Mise à jour FIN existant NoEnreg=${finId} pour ${baseOperatorCode}/${baseLancementCode}`);
+                await executeQuery(`
+                    UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                    SET HeureFin = @endTime,
+                        Statut = 'TERMINE'
+                    WHERE NoEnreg = @finId
+                `, { endTime: formattedEndTimeForFinEvent, finId });
+            } else {
+                console.log(`➕ Création d'un événement FIN pour ${baseOperatorCode}/${baseLancementCode} (heure fin: ${formattedEndTimeForFinEvent})`);
+                await executeQuery(`
+                    INSERT INTO [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                    (OperatorCode, CodeLanctImprod, CodeRubrique, Ident, Phase, Statut, HeureDebut, HeureFin, DateCreation, SessionId, RequestId, CreatedAt)
+                    VALUES (
+                        @operatorCode,
+                        @lancementCode,
+                        @codeRubrique,
+                        'FIN',
+                        @phase,
+                        'TERMINE',
+                        NULL,
+                        @endTime,
+                        CAST(@date AS DATE),
+                        @sessionId,
+                        @requestId,
+                        DATEADD(SECOND, DATEDIFF(SECOND, '00:00:00', @endTime), CAST(@date AS DATETIME2))
+                    )
+                `, {
+                    operatorCode: baseOperatorCode,
+                    lancementCode: baseLancementCode,
+                    codeRubrique: base.CodeRubrique || baseOperatorCode,
+                    phase: base.Phase || 'ADMIN',
+                    endTime: formattedEndTimeForFinEvent,
+                    date: baseDate,
+                    sessionId: base.SessionId || null,
+                    requestId: base.RequestId || null
+                });
+            }
+
+            // Optionnel: aligner le statut sur la ligne de base pour cohérence d'affichage
+            try {
+                await executeQuery(`
+                    UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                    SET Statut = 'TERMINE'
+                    WHERE NoEnreg = @id
+                `, { id: Number.parseInt(id) });
+            } catch (e) {
+                console.warn('Alignement statut TERMINE non bloquant:', e.message);
+            }
+
+        }
+        // Consolider dès qu'une heure de fin a été renseignée (FIN créé ou mis à jour) pour ne pas laisser de lancement non consolidé
+        if (formattedEndTimeForFinEvent) {
+            try {
+                const ConsolidationService = require('../services/ConsolidationService');
+                let baseDateStr = null;
+                if (typeof base.DateCreation === 'string') {
+                    baseDateStr = base.DateCreation.split('T')[0];
+                }
+                await ConsolidationService.consolidateOperation(baseOperatorCode, baseLancementCode, {
+                    autoFix: true,
+                    phase: base.Phase || 'ADMIN',
+                    codeRubrique: base.CodeRubrique || baseOperatorCode,
+                    dateCreation: baseDateStr || baseDate
+                });
+            } catch (consErr) {
+                console.warn('Consolidation après édition (non bloquant):', consErr?.message || consErr);
+            }
+        }
+        
+        console.log(`✅ Opération ${id} modifiée avec succès`);
+        
+        res.json({
+            success: true,
+            message: 'Opération modifiée avec succès',
+            id: id
+        });
+        
+    } catch (error) {
+        console.error('Erreur lors de la modification:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la modification de l\'opération',
+            details: error.message
+        });
+    }
+});
+
+// POST /api/admin/operations - Ajouter une nouvelle opération
+router.post('/operations', async (req, res) => {
+    try {
+        const { operatorId, lancementCode, status = 'DEBUT', phase = '', codeOperation } = req.body;
+        const workDate = normalizeAdminWorkDate(req.body.date);
+        if (workDate === false) {
+            return res.status(400).json({
+                success: false,
+                error: 'Date invalide (AAAA-MM-JJ, aujourd\'hui ou dans le passé)'
+            });
+        }
+        const startHms = formatTimeForSQL(req.body.startTime);
+        const endHms = formatTimeForSQL(req.body.endTime);
+        if (req.body.startTime && !startHms) {
+            return res.status(400).json({ success: false, error: 'Heure de début invalide (HH:mm)' });
+        }
+        if (req.body.endTime && !endHms) {
+            return res.status(400).json({ success: false, error: 'Heure de fin invalide (HH:mm)' });
+        }
+        if (endHms && !startHms) {
+            return res.status(400).json({ success: false, error: 'Heure de début requise quand une heure de fin est saisie' });
+        }
+        if (startHms && endHms && timeToMinutes(endHms) <= timeToMinutes(startHms)) {
+            return res.status(400).json({ success: false, error: 'L\'heure de fin doit être après l\'heure de début' });
+        }
+        
+        console.log('=== AJOUT NOUVELLE OPERATION ===');
+        console.log('Données reçues:', req.body);
+
+        // Valider le numéro de lancement dans LCTE (optionnel pour l'admin)
+        const validation = await validateLancement(lancementCode);
+        let lancementInfo = null;
+        let warning = null;
+        
+        if (!validation.valid) {
+            // Pour l'admin, on permet de créer une opération même si le lancement n'existe pas
+            // mais on enregistre un avertissement
+            warning = `Attention: Le lancement ${lancementCode} n'existe pas dans la table LCTE. L'opération sera créée mais le lancement devra être créé dans LCTE pour être valide.`;
+            console.warn('⚠️', warning);
+            lancementInfo = {
+                CodeLancement: lancementCode,
+                CodeArticle: null,
+                DesignationLct1: `Lancement ${lancementCode} (non trouvé dans LCTE)`,
+                CodeModele: null,
+                DesignationArt1: null,
+                DesignationArt2: null
+            };
+        } else {
+            lancementInfo = validation.data;
+            console.log('✅ Lancement validé:', lancementInfo);
+        }
+
+        // Si lancement valide, appliquer la logique "choisir uniquement si plusieurs étapes (Phase+CodeRubrique)"
+        // et résoudre Phase/CodeRubrique depuis l'ERP quand codeOperation est fourni.
+        let erpPhase = null;
+        let erpRubrique = null;
+
+        if (validation.valid) {
+            const { steps, uniqueOps, uniqueSteps, ctx } = await resolveStep(lancementCode, codeOperation);
+            if (uniqueSteps.length > 1 && !codeOperation) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'CODE_OPERATION_REQUIRED',
+                    message: 'Plusieurs étapes sont disponibles. Choisissez une étape (Phase).',
+                    lancementCode,
+                    steps,
+                    uniqueOperations: uniqueOps,
+                    uniqueSteps,
+                    stepCount: uniqueSteps.length,
+                    operationCount: uniqueOps.length
+                });
+            }
+            if (codeOperation) {
+                if (!ctx) {
+                    return res.status(400).json({
+                        success: false,
+                        error: 'INVALID_CODE_OPERATION',
+                        message: `CodeOperation invalide pour ${lancementCode}`,
+                        lancementCode,
+                        received: { codeOperation },
+                        steps,
+                        uniqueOperations: uniqueOps,
+                        uniqueSteps,
+                        stepCount: uniqueSteps.length,
+                        operationCount: uniqueOps.length
+                    });
+                }
+                erpPhase = ctx.Phase || null;
+                erpRubrique = ctx.CodeRubrique || null;
+            } else if (uniqueSteps.length === 1) {
+                // Auto-sélection implicite pour cohérence des clés ERP (clé = Phase + CodeRubrique)
+                const only = steps[0] || null;
+                erpPhase = only?.Phase || null;
+                erpRubrique = only?.CodeRubrique || null;
+            }
+        }
+        
+        // Insérer dans ABHISTORIQUE_OPERATEURS
+        // Clés ERP: Phase + CodeRubrique (si disponibles via CodeOperation), sinon fallback admin.
+        const codeRubrique = erpRubrique || phase || operatorId;
+        let finalStatus = status;
+        if (status === 'DEBUT') {
+            finalStatus = 'EN_COURS';
+        } else if (status === 'FIN') {
+            finalStatus = 'TERMINE';
+        }
+        const finalPhase = erpPhase || phase || 'ADMIN';
+
+        // Corrélation requête/session (peut être NULL côté admin si pas de session active)
+        const requestId = req.audit?.requestId || generateRequestId();
+        const activeSession = operatorId ? await SessionService.getActiveSession(operatorId) : null;
+        
+        const dateSql = workDate ? 'CAST(@workDate AS DATE)' : 'CAST(GETDATE() AS DATE)';
+        const debutHeureSql = startHms ? 'CAST(@startHms AS TIME)' : 'CAST(GETDATE() AS TIME)';
+        const createdAtSql = (workDate && startHms)
+            ? "DATEADD(SECOND, DATEDIFF(SECOND, '00:00:00', CAST(@startHms AS TIME)), CAST(@workDate AS DATETIME2))"
+            : 'GETDATE()';
+        const insertIdent = endHms ? 'DEBUT' : status;
+        const insertStatut = endHms ? 'EN_COURS' : finalStatus;
+        const insertHeureDebut = (insertIdent === 'DEBUT' || startHms) ? debutHeureSql : 'NULL';
+        const insertHeureFin = (!endHms && insertIdent === 'FIN')
+            ? (startHms ? 'CAST(@startHms AS TIME)' : 'CAST(GETDATE() AS TIME)')
+            : 'NULL';
+
+        const insertQuery = `
+            INSERT INTO [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            (OperatorCode, CodeLanctImprod, CodeRubrique, Ident, Phase, Statut, HeureDebut, HeureFin, DateCreation, SessionId, RequestId, CreatedAt)
+            OUTPUT INSERTED.NoEnreg
+            VALUES (
+                @operatorId,
+                @lancementCode,
+                @codeRubrique,
+                @status,
+                @phase,
+                @finalStatus,
+                ${insertHeureDebut},
+                ${insertHeureFin},
+                ${dateSql},
+                @sessionId,
+                @requestId,
+                ${createdAtSql}
+            )
+        `;
+        
+        const params = {
+            operatorId,
+            lancementCode,
+            codeRubrique,
+            status: insertIdent,
+            phase: finalPhase,
+            finalStatus: insertStatut,
+            sessionId: activeSession ? activeSession.SessionId : null,
+            requestId,
+            workDate,
+            startHms
+        };
+        
+        console.log('Requête SQL à exécuter:', insertQuery);
+        console.log('Paramètres:', params);
+        
+        const insertResult = await executeQuery(insertQuery, params);
+        const insertedId = insertResult?.[0]?.NoEnreg ?? null;
+        
+        console.log('✅ Opération ajoutée avec succès dans ABHISTORIQUE_OPERATEURS, ID:', insertedId);
+
+        if (endHms) {
+            const finCreatedAtSql = workDate
+                ? "DATEADD(SECOND, DATEDIFF(SECOND, '00:00:00', CAST(@endHms AS TIME)), CAST(@workDate AS DATETIME2))"
+                : 'GETDATE()';
+            await executeQuery(`
+                INSERT INTO [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                (OperatorCode, CodeLanctImprod, CodeRubrique, Ident, Phase, Statut, HeureDebut, HeureFin, DateCreation, SessionId, RequestId, CreatedAt)
+                VALUES (
+                    @operatorId,
+                    @lancementCode,
+                    @codeRubrique,
+                    'FIN',
+                    @phase,
+                    'TERMINE',
+                    NULL,
+                    CAST(@endHms AS TIME),
+                    ${dateSql},
+                    @sessionId,
+                    @requestId,
+                    ${finCreatedAtSql}
+                )
+            `, { ...params, endHms });
+            console.log(`✅ FIN ajoutée le ${workDate || 'jour courant'} à ${endHms}`);
+        }
+        
+        // Si c'est une fin de lancement, consolider les temps sur le jour choisi
+        if (endHms || status === 'FIN' || status === 'TERMINE') {
+            const ConsolidationService = require('../services/ConsolidationService');
+            await ConsolidationService.consolidateOperation(operatorId, lancementCode, {
+                autoFix: true,
+                phase: finalPhase,
+                codeRubrique,
+                dateCreation: workDate || undefined
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: warning ? 'Opération ajoutée avec succès (avec avertissement)' : 'Opération ajoutée avec succès',
+            warning: warning || null,
+            data: {
+                id: insertedId,
+                operatorId,
+                lancementCode,
+                phase,
+                lancementInfo: lancementInfo
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ ERREUR lors de l\'ajout:', error);
+        console.error('Message d\'erreur:', error.message);
+        console.error('Stack:', error.stack);
+        
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de l\'ajout de l\'opération',
+            details: error.message
+        });
+    }
+});
+
+// DELETE /api/admin/operations/:id - Supprimer une opération complète (tous les événements du lancement)
+router.delete('/operations/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        console.log(`🗑️ Suppression opération ${id} (type: ${typeof id})`);
+        
+        // D'abord, récupérer les informations du lancement à partir de l'ID
+        const getLancementQuery = `
+            SELECT CodeLanctImprod, OperatorCode, Phase, CodeRubrique
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            WHERE NoEnreg = @id
+        `;
+        
+        const lancementInfo = await executeQuery(getLancementQuery, { id: Number.parseInt(id) });
+        
+        console.log(`🔍 Résultat de la requête pour ID ${id}:`, lancementInfo);
+        
+        if (lancementInfo.length === 0) {
+            console.log(`❌ Aucune opération trouvée avec l'ID ${id}`);
+            return res.status(404).json({
+                success: false,
+                error: 'Opération non trouvée'
+            });
+        }
+        
+        const { CodeLanctImprod, OperatorCode, Phase, CodeRubrique } = lancementInfo[0];
+        
+        // Compatibilité:
+        // - Nouveau modèle: OperatorCode est renseigné, CodeRubrique = vrai code rubrique ERP
+        // - Ancien modèle: OperatorCode parfois NULL et CodeRubrique contenait le code opérateur
+        const operatorCodeToUse = (OperatorCode || '').toString().trim() || (CodeRubrique || '').toString().trim();
+
+        // Détection heuristique "legacy": OperatorCode absent + CodeRubrique ressemble à un code opérateur numérique
+        const isLegacy = !OperatorCode && typeof CodeRubrique === 'string' && /^\d+$/.test(CodeRubrique.trim());
+
+        if (!operatorCodeToUse) {
+            console.warn(`⚠️ Suppression impossible: OperatorCode/CodeRubrique manquants pour NoEnreg=${id}`);
+            return res.status(400).json({
+                success: false,
+                error: 'Impossible de déterminer le code opérateur pour supprimer cette opération'
+            });
+        }
+
+        if (isLegacy) {
+            console.log(`🗑️ Suppression (legacy) des événements pour ${CodeLanctImprod} (opérateur via CodeRubrique=${operatorCodeToUse})`);
+        
+            // Ancien modèle: supprimer tous les événements du lancement pour cet opérateur (stocké dans CodeRubrique)
+            const deleteLegacyQuery = `
+            DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                WHERE CodeLanctImprod = @lancementCode
+                  AND OperatorCode IS NULL
+                  AND CodeRubrique = @operatorCode
+        `;
+        
+            await executeQuery(deleteLegacyQuery, {
+            lancementCode: CodeLanctImprod, 
+            operatorCode: operatorCodeToUse 
+        });
+        } else {
+            console.log(`🗑️ Suppression (par étape) pour ${CodeLanctImprod} (opérateur=${operatorCodeToUse}, phase=${Phase || 'NULL'}, rubrique=${CodeRubrique || 'NULL'})`);
+
+            // Nouveau modèle: supprimer tous les événements pour CETTE étape (Phase+CodeRubrique) du lancement et opérateur
+            const deleteStepQuery = `
+                DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                WHERE CodeLanctImprod = @lancementCode
+                  AND (
+                        OperatorCode = @operatorCode
+                        OR (OperatorCode IS NULL AND CodeRubrique = @operatorCode) -- compatibilité si des lignes ont encore OperatorCode NULL
+                      )
+                  AND ISNULL(LTRIM(RTRIM(Phase)), '') = ISNULL(LTRIM(RTRIM(@phase)), '')
+                  AND ISNULL(LTRIM(RTRIM(CodeRubrique)), '') = ISNULL(LTRIM(RTRIM(@codeRubrique)), '')
+            `;
+
+            await executeQuery(deleteStepQuery, {
+                lancementCode: CodeLanctImprod,
+                operatorCode: operatorCodeToUse,
+                phase: Phase ?? null,
+                codeRubrique: CodeRubrique ?? null
+            });
+        }
+
+        // Vérifier s'il reste des événements pour ce "scope" (utile pour debug)
+        const remainingQuery = isLegacy
+            ? `
+                SELECT COUNT(*) AS remaining
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                WHERE CodeLanctImprod = @lancementCode
+                  AND OperatorCode IS NULL
+                  AND CodeRubrique = @operatorCode
+              `
+            : `
+                SELECT COUNT(*) AS remaining
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                WHERE CodeLanctImprod = @lancementCode
+                  AND (
+                        OperatorCode = @operatorCode
+                        OR (OperatorCode IS NULL AND CodeRubrique = @operatorCode)
+                      )
+                  AND ISNULL(LTRIM(RTRIM(Phase)), '') = ISNULL(LTRIM(RTRIM(@phase)), '')
+                  AND ISNULL(LTRIM(RTRIM(CodeRubrique)), '') = ISNULL(LTRIM(RTRIM(@codeRubrique)), '')
+              `;
+
+        const remaining = await executeQuery(remainingQuery, {
+            lancementCode: CodeLanctImprod,
+            operatorCode: operatorCodeToUse,
+            phase: Phase ?? null,
+            codeRubrique: CodeRubrique ?? null
+        });
+
+        const remainingCount = remaining?.[0]?.remaining ?? null;
+        console.log(`✅ Suppression terminée. remaining=${remainingCount}`);
+        
+        res.json({
+            success: true,
+            message: 'Opération supprimée avec succès',
+            remaining: remainingCount
+        });
+        
+    } catch (error) {
+        console.error('Erreur lors de la suppression:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la suppression de l\'opération'
+        });
+    }
+});
+
+// Route pour récupérer les opérateurs en ligne (historique du jour + sessions ABSESSIONS actives)
+router.get('/operators', async (req, res) => {
+    try {
+        const ttlHours = Math.max(1, Math.min(Number.parseInt(process.env.OPERATOR_SESSION_TTL_HOURS || '12', 10) || 12, 72));
+        // Éviter le cache (sinon le navigateur peut recevoir 304 sans body JSON)
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+
+        console.log('🔍 Récupération des opérateurs en ligne (historique + sessions actives)...');
+
+        // "En ligne" = dernier événement du jour = travail EN_COURS/EN_PAUSE
+        // OU session ABSESSIONS encore ACTIVE (tablette déverrouillée, entre deux LT, etc.).
+        const operatorsQuery = `
+            ;WITH last_per_operator AS (
+                SELECT
+                    h.OperatorCode,
+                    h.Ident,
+                    h.Statut,
+                    h.DateCreation,
+                    h.NoEnreg,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY h.OperatorCode
+                        ORDER BY h.DateCreation DESC, h.NoEnreg DESC
+                    ) AS rn
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h WITH (NOLOCK)
+                WHERE h.DateCreation >= CONVERT(date, GETDATE())
+                  AND h.DateCreation <  DATEADD(day, 1, CONVERT(date, GETDATE()))
+                  AND h.OperatorCode IS NOT NULL
+                  AND LTRIM(RTRIM(h.OperatorCode)) <> ''
+                  AND h.OperatorCode <> '0'
+            ),
+            last_event AS (
+                SELECT OperatorCode, Ident, Statut, DateCreation, NoEnreg
+                FROM last_per_operator
+                WHERE rn = 1
+            ),
+            histo_online AS (
+                SELECT le.OperatorCode, le.DateCreation AS LastActivityTime, CAST(1 AS BIT) AS enProduction
+                FROM last_event le
+                WHERE UPPER(LTRIM(RTRIM(COALESCE(le.Ident, '')))) <> 'FIN'
+                  AND UPPER(LTRIM(RTRIM(COALESCE(le.Statut, '')))) IN ('EN_COURS', 'EN_PAUSE')
+            ),
+            session_active AS (
+                SELECT
+                    s.OperatorCode,
+                    COALESCE(s.LastActivityTime, s.LoginTime, s.DateCreation) AS LastActivityTime,
+                    CAST(0 AS BIT) AS enProduction
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] s WITH (NOLOCK)
+                WHERE s.SessionStatus = 'ACTIVE'
+                  AND COALESCE(s.LastActivityTime, s.LoginTime, s.DateCreation) >= DATEADD(HOUR, -@ttlHours, GETDATE())
+                  AND s.OperatorCode IS NOT NULL
+                  AND LTRIM(RTRIM(s.OperatorCode)) <> ''
+                  AND s.OperatorCode <> '0'
+            ),
+            merged AS (
+                SELECT ho.OperatorCode, ho.LastActivityTime, ho.enProduction
+                FROM histo_online ho
+                UNION ALL
+                SELECT sa.OperatorCode, sa.LastActivityTime, sa.enProduction
+                FROM session_active sa
+                WHERE NOT EXISTS (SELECT 1 FROM histo_online ho2 WHERE ho2.OperatorCode = sa.OperatorCode)
+            )
+            SELECT
+                m.OperatorCode AS OperatorCode,
+                COALESCE(r.Designation1, 'Opérateur ' + CAST(m.OperatorCode AS VARCHAR)) AS NomOperateur,
+                CAST(NULL AS DATETIME2) AS LoginTime,
+                CAST('ACTIVE' AS VARCHAR(20)) AS SessionStatus,
+                CAST(CASE WHEN m.enProduction = 1 THEN 'EN_OPERATION' ELSE 'CONNECTE' END AS VARCHAR(30)) AS ActivityStatus,
+                m.LastActivityTime AS LastActivityTime,
+                r.Coderessource AS RessourceCode,
+                CAST(NULL AS VARCHAR(255)) AS DeviceInfo,
+                CAST(CASE WHEN m.enProduction = 1 THEN 'EN_OPERATION' ELSE 'CONNECTE' END AS VARCHAR(30)) AS CurrentStatus
+            FROM merged m
+            LEFT JOIN [SEDI_ERP].[dbo].[RESSOURC] r WITH (NOLOCK)
+              ON m.OperatorCode = r.Coderessource
+            ORDER BY m.OperatorCode
+        `;
+
+        const operators = await executeQuery(operatorsQuery, { ttlHours });
+        
+        console.log(`✅ ${operators.length} opérateurs connectés récupérés`);
+
+        res.json({
+            success: true,
+            operators: operators.map(op => ({
+                code: op.OperatorCode,
+                name: op.NomOperateur || `Opérateur ${op.OperatorCode}`,
+                loginTime: op.LoginTime,
+                status: op.SessionStatus,
+                activityStatus: op.ActivityStatus || 'INACTIVE',
+                lastActivityTime: op.LastActivityTime,
+                currentStatus: op.CurrentStatus,
+                resourceCode: op.RessourceCode,
+                deviceInfo: op.DeviceInfo,
+                // Validation de l'association
+                isProperlyLinked: op.RessourceCode === op.OperatorCode,
+                isActive: op.CurrentStatus === 'EN_OPERATION' || op.CurrentStatus === 'CONNECTE'
+            }))
+        });
+
+    } catch (error) {
+        console.error('❌ Erreur lors de la récupération des opérateurs:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la récupération des opérateurs connectés',
+            details: error.message
+        });
+    }
+});
+
+// Route pour récupérer tous les opérateurs (liste globale depuis RESSOURC)
+router.get('/operators/all', async (req, res) => {
+    try {
+        // Éviter le cache
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+
+        console.log('🔍 Récupération de tous les opérateurs depuis RESSOURC...');
+
+        const ttlHours = Math.max(1, Math.min(Number.parseInt(process.env.OPERATOR_SESSION_TTL_HOURS || '12', 10) || 12, 72));
+
+        const allOperatorsQuery = `
+            WITH last_per_operator AS (
+                SELECT
+                    h.OperatorCode,
+                    h.Ident,
+                    h.Statut,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY h.OperatorCode
+                        ORDER BY h.DateCreation DESC, h.NoEnreg DESC
+                    ) AS rn
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h WITH (NOLOCK)
+                WHERE h.DateCreation >= CONVERT(date, GETDATE())
+                  AND h.DateCreation <  DATEADD(day, 1, CONVERT(date, GETDATE()))
+                  AND h.OperatorCode IS NOT NULL
+                  AND LTRIM(RTRIM(h.OperatorCode)) <> ''
+                  AND h.OperatorCode <> '0'
+            ),
+            last_event AS (
+                SELECT OperatorCode, Ident, Statut
+                FROM last_per_operator
+                WHERE rn = 1
+            ),
+            session_active AS (
+                SELECT DISTINCT s.OperatorCode
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] s WITH (NOLOCK)
+                WHERE s.SessionStatus = 'ACTIVE'
+                  AND COALESCE(s.LastActivityTime, s.LoginTime, s.DateCreation) >= DATEADD(HOUR, -@ttlHours, GETDATE())
+                  AND s.OperatorCode IS NOT NULL
+                  AND LTRIM(RTRIM(s.OperatorCode)) <> ''
+                  AND s.OperatorCode <> '0'
+            )
+            SELECT TOP 500
+                r.Coderessource as OperatorCode,
+                r.Designation1 as NomOperateur,
+                r.Typeressource,
+                CASE 
+                    WHEN le.OperatorCode IS NOT NULL
+                     AND UPPER(LTRIM(RTRIM(COALESCE(le.Ident, '')))) <> 'FIN'
+                     AND UPPER(LTRIM(RTRIM(COALESCE(le.Statut, '')))) IN ('EN_COURS', 'EN_PAUSE')
+                    THEN 'CONNECTE'
+                    WHEN sess.OperatorCode IS NOT NULL THEN 'CONNECTE'
+                    ELSE 'INACTIVE'
+                END as ConnectionStatus,
+                CAST(NULL AS DATETIME2) AS LoginTime,
+                CAST(NULL AS VARCHAR(20)) AS SessionStatus
+            FROM [SEDI_ERP].[dbo].[RESSOURC] r
+            LEFT JOIN last_event le
+              ON r.Coderessource = le.OperatorCode
+            LEFT JOIN session_active sess
+              ON r.Coderessource = sess.OperatorCode
+            WHERE r.Typeressource IN ('OP', 'OPERATEUR', 'O')
+            ORDER BY r.Coderessource
+        `;
+
+        const allOperators = await executeQuery(allOperatorsQuery, { ttlHours });
+        
+        console.log(`✅ ${allOperators.length} opérateurs globaux récupérés`);
+
+        res.json({
+            success: true,
+            operators: allOperators.map(op => ({
+                code: op.OperatorCode,
+                name: op.NomOperateur || `Opérateur ${op.OperatorCode}`,
+                type: op.Typeressource,
+                isConnected: op.ConnectionStatus === 'CONNECTE',
+                loginTime: op.LoginTime,
+                sessionStatus: op.SessionStatus
+            }))
+        });
+
+    } catch (error) {
+        console.error('❌ Erreur lors de la récupération de tous les opérateurs:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la récupération de tous les opérateurs',
+            details: error.message
+        });
+    }
+});
+
+// Route pour résoudre les conflits de lancements
+router.post('/resolve-conflict', async (req, res) => {
+    try {
+        const { lancementCode, action, operatorId } = req.body;
+        
+        if (!lancementCode || !action) {
+            return res.status(400).json({
+                success: false,
+                error: 'lancementCode et action sont requis'
+            });
+        }
+
+        if (action === 'force-stop') {
+            // Forcer l'arrêt de tous les lancements en cours pour ce code
+            const stopQuery = `
+                UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                SET Statut = 'FORCE_STOP', HeureFin = CAST(GETDATE() AS TIME)
+                WHERE CodeLanctImprod = @lancementCode
+                AND Statut IN ('EN_COURS', 'EN_PAUSE')
+                AND CAST(DateCreation AS DATE) = CAST(GETDATE() AS DATE)
+            `;
+            
+            await executeQuery(stopQuery, { lancementCode });
+            
+            res.json({
+                success: true,
+                message: `Tous les lancements ${lancementCode} ont été forcés à l'arrêt`
+            });
+            
+        } else if (action === 'assign-to-operator' && operatorId) {
+            // Réassigner le lancement à un opérateur spécifique
+            // D'abord arrêter tous les autres
+            const stopOthersQuery = `
+                UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                SET Statut = 'REASSIGNED', HeureFin = CAST(GETDATE() AS TIME)
+                WHERE CodeLanctImprod = @lancementCode
+                AND Statut IN ('EN_COURS', 'EN_PAUSE')
+                AND OperatorCode != @operatorId
+                AND CAST(DateCreation AS DATE) = CAST(GETDATE() AS DATE)
+            `;
+            
+            await executeQuery(stopOthersQuery, { lancementCode, operatorId });
+            
+            res.json({
+                success: true,
+                message: `Lancement ${lancementCode} réassigné à l'opérateur ${operatorId}`
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: 'Action non reconnue'
+            });
+        }
+
+    } catch (error) {
+        console.error('❌ Erreur lors de la résolution du conflit:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la résolution du conflit',
+            details: error.message
+        });
+    }
+});
+
+// Route pour nettoyage complet manuel
+router.post('/cleanup-all', async (req, res) => {
+    try {
+        console.log('🧹 Nettoyage complet manuel...');
+        
+        // Importer et exécuter le script de nettoyage
+        const { performFullCleanup } = require('../scripts/auto-cleanup');
+        await performFullCleanup();
+        
+        res.json({
+            success: true,
+            message: 'Nettoyage complet terminé avec succès',
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors du nettoyage complet:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du nettoyage complet',
+            details: error.message
+        });
+    }
+});
+
+// Route pour nettoyer les sessions expirées
+router.post('/cleanup-sessions', async (req, res) => {
+    try {
+        console.log('🧹 Nettoyage des sessions expirées...');
+        
+        // Supprimer les sessions de plus de 24h
+        const cleanupQuery = `
+            DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]
+            WHERE DateCreation < DATEADD(hour, -24, GETDATE())
+        `;
+        
+        await executeQuery(cleanupQuery);
+        console.log('✅ Sessions expirées supprimées');
+        
+        // Compter les sessions restantes
+        const countQuery = `
+            SELECT COUNT(*) as activeSessions
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]
+            WHERE SessionStatus = 'ACTIVE'
+        `;
+        
+        const countResult = await executeQuery(countQuery);
+        const activeSessions = countResult[0].activeSessions;
+        
+        res.json({
+            success: true,
+            message: `Nettoyage des sessions terminé: ${activeSessions} sessions actives restantes`,
+            activeSessions: activeSessions
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors du nettoyage des sessions:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du nettoyage des sessions',
+            details: error.message
+        });
+    }
+});
+
+// Route pour terminer les opérations orphelines (actives sans opérateur connecté)
+router.post('/cleanup-orphan-operations', async (req, res) => {
+    try {
+        console.log('🧹 Nettoyage des opérations orphelines...');
+        
+        // Trouver les opérations actives sans session active
+        const findOrphanQuery = `
+            SELECT 
+                h.NoEnreg,
+                h.OperatorCode,
+                h.CodeLanctImprod,
+                h.Statut,
+                h.DateCreation,
+                h.HeureDebut
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+            LEFT JOIN [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] s 
+                ON h.OperatorCode = s.OperatorCode 
+                AND s.SessionStatus = 'ACTIVE'
+                AND CAST(s.DateCreation AS DATE) = CAST(GETDATE() AS DATE)
+            WHERE h.Statut IN ('EN_COURS', 'EN_PAUSE')
+                AND CAST(h.DateCreation AS DATE) = CAST(GETDATE() AS DATE)
+                AND s.OperatorCode IS NULL
+                AND h.OperatorCode IS NOT NULL
+                AND h.OperatorCode != ''
+                AND h.OperatorCode != '0'
+        `;
+        
+        const orphanOperations = await executeQuery(findOrphanQuery);
+        console.log(`🔍 ${orphanOperations.length} opérations orphelines trouvées`);
+        
+        if (orphanOperations.length === 0) {
+            return res.json({
+                success: true,
+                message: 'Aucune opération orpheline trouvée',
+                terminatedCount: 0
+            });
+        }
+        
+        // Terminer ces opérations
+        const terminateQuery = `
+            UPDATE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            SET Statut = 'TERMINE',
+                HeureFin = CAST(GETDATE() AS TIME)
+            WHERE NoEnreg IN (
+                SELECT h.NoEnreg
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+                LEFT JOIN [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] s 
+                    ON h.OperatorCode = s.OperatorCode 
+                    AND s.SessionStatus = 'ACTIVE'
+                    AND CAST(s.DateCreation AS DATE) = CAST(GETDATE() AS DATE)
+                WHERE h.Statut IN ('EN_COURS', 'EN_PAUSE')
+                    AND CAST(h.DateCreation AS DATE) = CAST(GETDATE() AS DATE)
+                    AND s.OperatorCode IS NULL
+                    AND h.OperatorCode IS NOT NULL
+                    AND h.OperatorCode != ''
+                    AND h.OperatorCode != '0'
+            )
+        `;
+        
+        await executeQuery(terminateQuery);
+        
+        console.log(`✅ ${orphanOperations.length} opérations orphelines terminées`);
+        
+        res.json({
+            success: true,
+            message: `${orphanOperations.length} opération(s) orpheline(s) terminée(s)`,
+            terminatedCount: orphanOperations.length,
+            operations: orphanOperations.map(op => ({
+                id: op.NoEnreg,
+                operatorCode: op.OperatorCode,
+                lancementCode: op.CodeLanctImprod,
+                status: op.Statut
+            }))
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors du nettoyage des opérations orphelines:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du nettoyage des opérations orphelines',
+            details: error.message
+        });
+    }
+});
+
+// Route pour nettoyer les doublons d'opérations
+router.post('/cleanup-duplicates', async (req, res) => {
+    try {
+        console.log('🧹 Nettoyage des doublons d\'opérations...');
+        
+        // Identifier les doublons (même opérateur, même lancement, même jour)
+        const duplicatesQuery = `
+            SELECT 
+                OperatorCode,
+                CodeLanctImprod,
+                CAST(DateCreation AS DATE) as DateOp,
+                COUNT(*) as count
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            WHERE OperatorCode IS NOT NULL 
+                AND OperatorCode != ''
+                AND OperatorCode != '0'
+            GROUP BY OperatorCode, CodeLanctImprod, CAST(DateCreation AS DATE)
+            HAVING COUNT(*) > 1
+            ORDER BY count DESC
+        `;
+        
+        const duplicates = await executeQuery(duplicatesQuery);
+        console.log(`🔍 ${duplicates.length} groupes de doublons trouvés`);
+        
+        let cleanedCount = 0;
+        
+        for (const duplicate of duplicates) {
+            // Récupérer tous les événements du groupe
+            const groupQuery = `
+                SELECT *
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                WHERE OperatorCode = @operatorCode
+                    AND CodeLanctImprod = @lancementCode
+                    AND CAST(DateCreation AS DATE) = @dateOp
+                ORDER BY DateCreation ASC, NoEnreg ASC
+            `;
+            
+            const groupEvents = await executeQuery(groupQuery, {
+                operatorCode: duplicate.OperatorCode,
+                lancementCode: duplicate.CodeLanctImprod,
+                dateOp: duplicate.DateOp
+            });
+            
+            console.log(`🔍 Groupe ${duplicate.OperatorCode}_${duplicate.CodeLanctImprod}: ${groupEvents.length} événements`);
+            
+            // Garder seulement le premier événement de chaque type
+            const keptEvents = [];
+            const seenTypes = new Set();
+            
+            for (const event of groupEvents) {
+                const eventKey = `${event.Ident}_${event.Phase}`;
+                if (!seenTypes.has(eventKey)) {
+                    keptEvents.push(event);
+                    seenTypes.add(eventKey);
+                }
+            }
+            
+            // Supprimer les événements en doublon
+            const eventsToDelete = groupEvents.filter(event => 
+                !keptEvents.some(kept => kept.NoEnreg === event.NoEnreg)
+            );
+            
+            if (eventsToDelete.length > 0) {
+                const deleteIds = eventsToDelete.map(e => e.NoEnreg);
+                const idPlaceholders = deleteIds.map((_, i) => `@delId${i}`).join(',');
+                const deleteParams = {};
+                deleteIds.forEach((id, i) => { deleteParams[`delId${i}`] = id; });
+                const deleteQuery = `
+                    DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                    WHERE NoEnreg IN (${idPlaceholders})
+                `;
+                
+                await executeQuery(deleteQuery, deleteParams);
+                cleanedCount += eventsToDelete.length;
+                console.log(`✅ Supprimé ${eventsToDelete.length} doublons pour ${duplicate.OperatorCode}_${duplicate.CodeLanctImprod}`);
+            }
+        }
+        
+        res.json({
+            success: true,
+            message: `Nettoyage terminé: ${cleanedCount} doublons supprimés`,
+            cleanedCount: cleanedCount,
+            duplicateGroups: duplicates.length
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors du nettoyage des doublons:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du nettoyage des doublons',
+            details: error.message
+        });
+    }
+});
+
+// ============================================
+// TESTING HELPERS (safe purge, no DROP)
+// ============================================
+// ⚠️ Disabled by default. To enable: set ALLOW_TEST_PURGE=true on the backend container.
+// Purpose: allow re-running tests by deleting ONLY rows in ABHISTORIQUE_OPERATEURS / ABTEMPS_OPERATEURS (and optionally sessions)
+// without dropping tables.
+router.post('/testing/purge', requireDangerousRoute('ALLOW_TEST_PURGE'), async (req, res) => {
+    try {
+        if (String(process.env.ALLOW_TEST_PURGE || '').toLowerCase() !== 'true') {
+            return res.status(403).json({
+                success: false,
+                error: 'TEST_PURGE_DISABLED',
+                message: 'Purge test désactivée. Définissez ALLOW_TEST_PURGE=true côté backend pour l\'autoriser.'
+            });
+        }
+
+        const {
+            scope = 'today', // 'today' | 'range' | 'all'
+            dateStart,
+            dateEnd,
+            lancementCode,
+            lancementPrefix,
+            operatorCode,
+            includeSessions = false,
+            confirm
+        } = req.body || {};
+
+        if (confirm !== 'PURGE') {
+            return res.status(400).json({
+                success: false,
+                error: 'CONFIRM_REQUIRED',
+                message: 'Pour éviter une suppression accidentelle, envoyez { confirm: "PURGE" }.'
+            });
+        }
+
+        if (!['today', 'range', 'all'].includes(scope)) {
+            return res.status(400).json({ success: false, error: 'INVALID_SCOPE' });
+        }
+
+        const prefix = (lancementPrefix || '').trim() || null;
+        const lt = (lancementCode || '').trim().toUpperCase() || null;
+        const op = (operatorCode || '').trim() || null;
+
+        // Date boundaries
+        let dStart = null;
+        let dEnd = null;
+        if (scope === 'today') {
+            dStart = moment().format('YYYY-MM-DD');
+            dEnd = moment().format('YYYY-MM-DD');
+        } else if (scope === 'range') {
+            if (!dateStart || !dateEnd) {
+                return res.status(400).json({ success: false, error: 'DATE_RANGE_REQUIRED' });
+            }
+            dStart = moment(dateStart).format('YYYY-MM-DD');
+            dEnd = moment(dateEnd).format('YYYY-MM-DD');
+        } else if (scope === 'all') {
+            // keep nulls -> delete without date filter (still can be constrained by LT/operator)
+        }
+
+        // Final safety: if scope=all and no filters, refuse
+        if (scope === 'all' && !lt && !prefix && !op) {
+            return res.status(400).json({
+                success: false,
+                error: 'REFUSED',
+                message: 'Refusé: scope=all sans filtre. Fournissez lancementCode, lancementPrefix ou operatorCode.'
+            });
+        }
+
+        const whereHistorique = [];
+        const whereTemps = [];
+        const params = {};
+
+        if (op) {
+            whereHistorique.push('OperatorCode = @operatorCode');
+            whereTemps.push('OperatorCode = @operatorCode');
+            params.operatorCode = op;
+        }
+
+        if (lt) {
+            whereHistorique.push('CodeLanctImprod = @lancementCode');
+            whereTemps.push('LancementCode = @lancementCode');
+            params.lancementCode = lt;
+        } else if (prefix) {
+            whereHistorique.push('CodeLanctImprod LIKE @prefix');
+            whereTemps.push('LancementCode LIKE @prefix');
+            params.prefix = `${prefix.trim().toUpperCase()}%`;
+        }
+
+        if (dStart && dEnd) {
+            whereHistorique.push('CAST(DateCreation AS DATE) BETWEEN @dateStart AND @dateEnd');
+            whereTemps.push('CAST(DateCreation AS DATE) BETWEEN @dateStart AND @dateEnd');
+            params.dateStart = dStart;
+            params.dateEnd = dEnd;
+        }
+
+        const whereHistSql = whereHistorique.length ? `WHERE ${whereHistorique.join(' AND ')}` : '';
+        const whereTempsSql = whereTemps.length ? `WHERE ${whereTemps.join(' AND ')}` : '';
+
+        // Counts first
+        const countHist = await executeQuery(
+            `SELECT COUNT(*) AS c FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] ${whereHistSql}`,
+            params
+        );
+        const countTemps = await executeQuery(
+            `SELECT COUNT(*) AS c FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] ${whereTempsSql}`,
+            params
+        );
+
+        const histC = countHist?.[0]?.c ?? 0;
+        const tempsC = countTemps?.[0]?.c ?? 0;
+
+        // Delete (no DROP)
+        await executeQuery(
+            `DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] ${whereHistSql}`,
+            params
+        );
+        await executeQuery(
+            `DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] ${whereTempsSql}`,
+            params
+        );
+
+        let sessionsC = 0;
+        if (includeSessions) {
+            const whereSess = [];
+            const sessParams = {};
+            if (op) {
+                whereSess.push('OperatorCode = @operatorCode');
+                sessParams.operatorCode = op;
+            }
+            if (dStart && dEnd) {
+                whereSess.push('CAST(DateCreation AS DATE) BETWEEN @dateStart AND @dateEnd');
+                sessParams.dateStart = dStart;
+                sessParams.dateEnd = dEnd;
+            }
+            const whereSessSql = whereSess.length ? `WHERE ${whereSess.join(' AND ')}` : '';
+            const countSess = await executeQuery(
+                `SELECT COUNT(*) AS c FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] ${whereSessSql}`,
+                sessParams
+            );
+            sessionsC = countSess?.[0]?.c ?? 0;
+            await executeQuery(
+                `DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] ${whereSessSql}`,
+                sessParams
+            );
+        }
+
+        return res.json({
+            success: true,
+            message: 'Purge test effectuée',
+            deleted: {
+                ABHISTORIQUE_OPERATEURS: histC,
+                ABTEMPS_OPERATEURS: tempsC,
+                ABSESSIONS_OPERATEURS: sessionsC
+            },
+            scope,
+            filters: {
+                operatorCode: op || null,
+                lancementCode: lt || null,
+                lancementPrefix: prefix || null,
+                dateStart: dStart,
+                dateEnd: dEnd
+            }
+        });
+    } catch (error) {
+        console.error('❌ Erreur purge test:', error);
+        return res.status(500).json({ success: false, error: 'INTERNAL_ERROR', message: error.message });
+    }
+});
+
+// ============================================
+// PRODUCTION: Reset historique (DANGEROUS)
+// ============================================
+// But: démarrer une nouvelle phase (prod) sans historique opérateur.
+// Sécurités:
+// - nécessite auth admin (router.use(authenticateAdmin) déjà en place)
+// - nécessite env ALLOW_PRODUCTION_HISTORY_RESET=true
+// - nécessite confirm explicite: "RESET_HISTORY"
+router.post('/maintenance/reset-history', async (req, res) => {
+    try {
+        if (String(process.env.ALLOW_PRODUCTION_HISTORY_RESET || '').toLowerCase() !== 'true') {
+            return res.status(403).json({
+                success: false,
+                error: 'HISTORY_RESET_DISABLED',
+                message: 'Reset historique désactivé. Définissez ALLOW_PRODUCTION_HISTORY_RESET=true côté backend pour l\'autoriser.'
+            });
+        }
+
+        const { confirm, includeSessions = true } = req.body || {};
+        if (confirm !== 'RESET_HISTORY') {
+            return res.status(400).json({
+                success: false,
+                error: 'CONFIRM_REQUIRED',
+                message: 'Pour éviter une suppression accidentelle, envoyez { confirm: "RESET_HISTORY" }.'
+            });
+        }
+
+        // Counts first (audit-friendly)
+        const countHist = await executeQuery(
+            `SELECT COUNT(*) AS c FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]`
+        );
+        const countTemps = await executeQuery(
+            `SELECT COUNT(*) AS c FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]`
+        );
+        const histC = countHist?.[0]?.c ?? 0;
+        const tempsC = countTemps?.[0]?.c ?? 0;
+
+        let sessionsC = 0;
+        if (includeSessions) {
+            const countSess = await executeQuery(
+                `SELECT COUNT(*) AS c FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]`
+            );
+            sessionsC = countSess?.[0]?.c ?? 0;
+        }
+
+        // Delete (no DROP) dans une transaction atomique
+        const resetQuery = `
+            BEGIN TRAN;
+            BEGIN TRY
+                DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS];
+                DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS];
+                ${includeSessions ? 'DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS];' : ''}
+                COMMIT TRAN;
+            END TRY
+            BEGIN CATCH
+                IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+                THROW;
+            END CATCH
+        `;
+
+        await executeNonQuery(resetQuery);
+
+        return res.json({
+            success: true,
+            message: 'Historique opérateurs réinitialisé',
+            deleted: {
+                ABHISTORIQUE_OPERATEURS: histC,
+                ABTEMPS_OPERATEURS: tempsC,
+                ABSESSIONS_OPERATEURS: sessionsC
+            }
+        });
+    } catch (error) {
+        console.error('❌ Erreur reset historique:', error);
+        return res.status(500).json({ success: false, error: 'INTERNAL_ERROR', message: error.message });
+    }
+});
+
+// Route pour récupérer les lancements d'un opérateur spécifique
+router.get('/operators/:operatorCode/operations', async (req, res) => {
+    try {
+        const { operatorCode } = req.params;
+        console.log(`🔍 Récupération des événements pour l'opérateur ${operatorCode}...`);
+
+        // Récupérer tous les événements de cet opérateur depuis ABHISTORIQUE_OPERATEURS
+        // Admin: ne pas masquer les opérations transférées.
+        // Sinon on peut masquer un cycle actif redémarré après un transfert (ex: LT2500795 / opératrice 592).
+        // ⚡ OPTIMISATION : Utiliser LEFT JOIN avec sous-requête dérivée au lieu de sous-requête corrélée
+        // IMPORTANT: Convertir HeureDebut et HeureFin en VARCHAR(5) (HH:mm) directement dans SQL
+        // pour éviter les problèmes de timezone lors de la conversion par Node.js
+        const operatorEventsQuery = `
+        SELECT 
+                h.NoEnreg,
+                h.Ident,
+                h.DateCreation,
+                h.CreatedAt,
+                h.CodeLanctImprod,
+                COALESCE(h.Phase, 'PRODUCTION') as Phase,
+                h.OperatorCode,
+                h.CodeRubrique,
+                h.Statut,
+                CONVERT(VARCHAR(5), h.HeureDebut, 108) AS HeureDebut,
+                CONVERT(VARCHAR(5), h.HeureFin, 108) AS HeureFin,
+                r.Designation1 as operatorName,
+                l.DesignationLct1 as Article,
+                l.DesignationLct2 as ArticleDetail,
+                t.StatutTraitement
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+            LEFT JOIN [SEDI_ERP].[dbo].[RESSOURC] r ON h.OperatorCode = r.Coderessource
+            LEFT JOIN [SEDI_ERP].[dbo].[LCTE] l ON l.CodeLancement = h.CodeLanctImprod
+            -- OUTER APPLY TOP 1 : évite de dupliquer chaque événement HIST
+            -- quand plusieurs ABTEMPS existent le même jour pour le même LT/étape.
+            OUTER APPLY (
+                SELECT TOP 1 t.StatutTraitement
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] t
+                WHERE t.OperatorCode = h.OperatorCode
+                  AND t.LancementCode = h.CodeLanctImprod
+                  AND CAST(t.DateCreation AS DATE) = CAST(h.DateCreation AS DATE)
+                  -- t.Phase/t.CodeRubrique NULL = clés ERP non résolues : rattachement lancement + date
+                  AND (t.Phase IS NULL OR ISNULL(t.Phase, '') = ISNULL(h.Phase, ''))
+                  AND (t.CodeRubrique IS NULL OR ISNULL(t.CodeRubrique, '') = ISNULL(h.CodeRubrique, ''))
+                ORDER BY CASE WHEN t.StatutTraitement = 'T' THEN 1 ELSE 0 END, t.TempsId DESC
+            ) t
+            WHERE h.OperatorCode = @operatorCode
+            ORDER BY h.DateCreation DESC
+        `;
+        
+        const operatorEvents = await executeQuery(operatorEventsQuery, { operatorCode });
+        
+        // Utiliser la même fonction que getAdminOperations pour la cohérence
+        const processedLancements = processLancementEventsWithPauses(operatorEvents);
+        
+        // Formater les données pour l'interface opérateur (sans pauseTime)
+        const formattedOperations = processedLancements.map(lancement => ({
+            id: lancement.id,
+            operatorId: lancement.operatorId,
+            operatorName: operatorEvents.find(e => e.OperatorCode === lancement.operatorId)?.operatorName || 'Non assigné',
+            lancementCode: lancement.lancementCode,
+            article: operatorEvents.find(e => e.CodeLanctImprod === lancement.lancementCode)?.Article || 'N/A',
+            articleDetail: operatorEvents.find(e => e.CodeLanctImprod === lancement.lancementCode)?.ArticleDetail || '',
+            startTime: lancement.startTime,
+            endTime: lancement.endTime,
+            duration: lancement.duration,
+            status: lancement.status,
+            statusCode: lancement.statusCode,
+            generalStatus: lancement.generalStatus,
+            events: lancement.events,
+            editable: true
+        }));
+
+        console.log(`✅ ${formattedOperations.length} lancements traités pour l'opérateur ${operatorCode}`);
+
+        res.json({
+            success: true,
+            operations: formattedOperations,
+            operatorCode: operatorCode,
+            count: formattedOperations.length
+        });
+
+    } catch (error) {
+        console.error(`❌ Erreur lors de la récupération des lancements:`, error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la récupération des lancements de l\'opérateur',
+            details: error.message
+        });
+    }
+});
+
+router.get('/tables-info', async (req, res) => {
+    try {
+        console.log('🔍 Récupération des informations des tables abetemps');
+
+        // Requête pour abetemps_Pause avec informations opérateur
+        const pauseQuery = `
+            SELECT TOP 50
+                p.NoEnreg,
+            p.Ident,
+                p.DateTravail,
+                p.CodeLanctImprod,
+            p.Phase,
+            p.CodePoste,
+                p.CodeOperateur,
+                r.Designation1 as NomOperateur
+        FROM [SEDI_ERP].[GPSQL].[abetemps_Pause] p
+        LEFT JOIN [SEDI_ERP].[dbo].[RESSOURC] r ON p.CodeOperateur = r.Coderessource
+            ORDER BY p.DateTravail DESC
+        `;
+
+        // Requête pour abetemps_temp avec informations opérateur
+        const tempQuery = `
+            SELECT TOP 50
+                t.NoEnreg,
+                t.Ident,
+                t.DateTravail,
+                t.CodeLanctImprod,
+                t.Phase,
+                t.CodePoste,
+                t.CodeOperateur,
+                r.Designation1 as NomOperateur
+            FROM [SEDI_ERP].[GPSQL].[abetemps_temp] t
+            LEFT JOIN [SEDI_ERP].[dbo].[RESSOURC] r ON t.CodeOperateur = r.Coderessource
+            ORDER BY t.DateTravail DESC
+        `;
+
+        console.log('📊 Exécution des requêtes pour abetemps_Pause et abetemps_temp');
+
+        const [pauseData, tempData] = await Promise.all([
+            executeQuery(pauseQuery),
+            executeQuery(tempQuery)
+        ]);
+
+        console.log(`✅ Données récupérées: ${pauseData.length} entrées Pause, ${tempData.length} entrées Temp`);
+
+        res.json({
+            success: true,
+            data: {
+                abetemps_Pause: pauseData,
+                abetemps_temp: tempData
+            },
+            counts: {
+                pause: pauseData.length,
+                temp: tempData.length
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la récupération des tables:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la récupération des informations des tables',
+            details: error.message
+        });
+    }
+});
+
+// Route pour transférer les opérations terminées vers SEDI_APP_INDEPENDANTE
+router.post('/transfer', async (req, res) => {
+    try {
+        console.log('🔄 Fonction de transfert temporairement désactivée pour debug...');
+        
+        // Retourner un message informatif
+        res.json({
+            success: true,
+            message: 'Fonction de transfert temporairement désactivée - Fonctionnalités principales opérationnelles',
+            note: 'Cette fonction sera réactivée après résolution du problème de colonnes'
+        });
+
+    } catch (error) {
+        console.error(' Erreur lors du transfert:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du transfert vers SEDI_APP_INDEPENDANTE',
+            details: error.message
+        });
+    }
+});
+
+// Toutes les routes /debug/* sont bloquées en production (ALLOW_DEBUG_ROUTES=true pour activer)
+router.use('/debug', requireDebugMode);
+
+// Route de test pour abetemps_temp
+router.get('/debug/temp-table', async (req, res) => {
+    try {
+        const query = `SELECT TOP 10 * FROM [SEDI_ERP].[GPSQL].[abetemps_temp]`;
+        const results = await executeQuery(query);
+        res.json({ 
+            success: true, 
+            count: results.length,
+            data: results
+        });
+    } catch (error) {
+        console.error('Erreur debug abetemps_temp:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Route de débogage pour voir le contenu des 3 tables
+router.get('/debug/tables-content', async (req, res) => {
+    try {
+        const tempQuery = `SELECT COUNT(*) as count FROM [SEDI_ERP].[GPSQL].[abetemps_temp]`;
+        const pauseQuery = `SELECT COUNT(*) as count FROM [SEDI_ERP].[GPSQL].[abetemps_Pause]`;
+        const completedQuery = `SELECT COUNT(*) as count FROM [SEDI_ERP].[GPSQL].[abetemps] WHERE Ident = 'Prod'`;
+        
+        const [tempResults, pauseResults, completedResults] = await Promise.all([
+            executeQuery(tempQuery),
+            executeQuery(pauseQuery),
+            executeQuery(completedQuery)
+        ]);
+        
+        res.json({ 
+            success: true, 
+            tables: {
+                abetemps_temp: tempResults[0].count,
+                abetemps_Pause: pauseResults[0].count,
+                abetemps_completed: completedResults[0].count
+            }
+        });
+    } catch (error) {
+        console.error('Erreur debug tables:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Route de débogage pour voir les valeurs de Ident
+router.get('/debug/ident-values', async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                Ident, 
+                COUNT(*) as count
+            FROM [SEDI_ERP].[GPSQL].[abetemps]
+            GROUP BY Ident
+            ORDER BY count DESC
+        `;
+        
+        const results = await executeQuery(query);
+        res.json({ success: true, identValues: results });
+    } catch (error) {
+        console.error('Erreur debug ident:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// GET /api/admin/validate-lancement/:code - Valider un code de lancement
+router.get('/validate-lancement/:code', async (req, res) => {
+    try {
+        const { code } = req.params;
+        
+        console.log(`🔍 Validation du code lancement: ${code}`);
+        
+        // Valider le format du code (LT + 7 chiffres)
+        const codePattern = /^LT\d{7}$/;
+        if (!codePattern.test(code)) {
+            return res.json({
+                success: false,
+                valid: false,
+                error: 'Format invalide. Le code doit être au format LT + 7 chiffres (ex: LT2501145)'
+            });
+        }
+        
+        // Vérifier l'existence dans la base de données
+        const validationQuery = `
+            SELECT TOP 1 
+                CodeLancement,
+                DesignationLct1,
+                DesignationLct2,
+                StatutLancement
+            FROM [SEDI_ERP].[dbo].[LCTE] 
+            WHERE CodeLancement = @code
+        `;
+        
+        const result = await executeQuery(validationQuery, { code });
+        
+        if (result.length === 0) {
+            return res.json({
+                success: true,
+                valid: false,
+                error: 'Code de lancement non trouvé dans la base de données'
+            });
+        }
+        
+        const lancement = result[0];
+        
+        res.json({
+            success: true,
+            valid: true,
+            data: {
+                code: lancement.CodeLancement,
+                designation: lancement.DesignationLct1,
+                designationDetail: lancement.DesignationLct2,
+                statut: lancement.StatutLancement
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur validation code lancement:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la validation'
+        });
+    }
+});
+
+// Route pour supprimer toutes les tables SEDI_APP_INDEPENDANTE
+// ⚠️ Extrêmement dangereux : nécessite une confirmation explicite ET un flag d'environnement.
+router.post('/delete-all-sedi-tables', async (req, res) => {
+    try {
+        const { confirm } = req.body || {};
+        if (confirm !== 'DELETE_ALL_TABLES') {
+            return res.status(400).json({
+                success: false,
+                error: 'CONFIRM_REQUIRED',
+                message: 'Pour supprimer toutes les tables, envoyez { confirm: "DELETE_ALL_TABLES" }.'
+            });
+        }
+
+        if (String(process.env.ALLOW_DELETE_ALL_SEDI_TABLES || '').toLowerCase() !== 'true') {
+            return res.status(403).json({
+                success: false,
+                error: 'DELETE_ALL_SEDI_TABLES_DISABLED',
+                message: 'Suppression de toutes les tables désactivée. Définissez ALLOW_DELETE_ALL_SEDI_TABLES=true côté backend pour l\'autoriser explicitement.'
+            });
+        }
+
+        console.log('🗑️ Suppression de toutes les tables SEDI_APP_INDEPENDANTE...');
+        
+        // Supprimer toutes les données des tables
+        const deleteQueries = [
+            'DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]',
+            'DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]',
+            'DELETE FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]'
+        ];
+        
+        for (const query of deleteQueries) {
+            try {
+                await executeNonQuery(query);
+                console.log(`✅ Données supprimées: ${query.split('.')[3]}`);
+            } catch (error) {
+                console.log(`⚠️ Table peut-être inexistante: ${query.split('.')[3]}`, error.message);
+            }
+        }
+        
+        // Optionnel: Supprimer complètement les tables
+        const dropQueries = [
+            'DROP TABLE IF EXISTS [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]',
+            'DROP TABLE IF EXISTS [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]',
+            'DROP TABLE IF EXISTS [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]'
+        ];
+        
+        for (const query of dropQueries) {
+            try {
+                await executeNonQuery(query);
+                console.log(`✅ Table supprimée: ${query.split('.')[3]}`);
+            } catch (error) {
+                console.log(`⚠️ Erreur suppression table: ${error.message}`);
+            }
+        }
+        
+        console.log('✅ Suppression terminée');
+        
+        res.json({
+            success: true,
+            message: 'Toutes les tables SEDI_APP_INDEPENDANTE ont été supprimées',
+            deletedTables: [
+                'ABHISTORIQUE_OPERATEURS',
+                'ABSESSIONS_OPERATEURS', 
+                'ABTEMPS_OPERATEURS'
+            ]
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la suppression des tables:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la suppression des tables',
+            details: error.message
+        });
+    }
+});
+
+router.post('/recreate-tables', requireDangerousRoute('ALLOW_RECREATE_TABLES'), async (req, res) => {
+    try {
+        console.log('🔧 Recréation des tables SEDI_APP_INDEPENDANTE...');
+
+        // Supprimer et recréer ABSESSIONS_OPERATEURS
+        const dropSessionsTable = `
+            IF OBJECT_ID('[SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]', 'U') IS NOT NULL
+            DROP TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]
+        `;
+
+        const createSessionsTable = `
+            CREATE TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] (
+                SessionId INT IDENTITY(1,1) PRIMARY KEY,
+                OperatorCode NVARCHAR(50) NOT NULL,
+                LoginTime DATETIME2 NOT NULL,
+                LogoutTime DATETIME2 NULL,
+                SessionStatus NVARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                DeviceInfo NVARCHAR(255) NULL,
+                DateCreation DATETIME2 NOT NULL DEFAULT GETDATE()
+            )
+        `;
+
+        // Supprimer et recréer ABTEMPS_OPERATEURS
+        const dropTempsTable = `
+            IF OBJECT_ID('[SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]', 'U') IS NOT NULL
+            DROP TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]
+        `;
+
+        const createTempsTable = `
+            CREATE TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] (
+                TempsId INT IDENTITY(1,1) PRIMARY KEY,
+                OperatorCode NVARCHAR(50) NOT NULL,
+                LancementCode NVARCHAR(50) NOT NULL,
+                StartTime DATETIME2 NOT NULL,
+                EndTime DATETIME2 NOT NULL,
+                TotalDuration INT NOT NULL, -- en minutes
+                PauseDuration INT NOT NULL DEFAULT 0, -- en minutes
+                ProductiveDuration INT NOT NULL, -- en minutes
+                EventsCount INT NOT NULL DEFAULT 0,
+                DateCreation DATETIME2 NOT NULL DEFAULT GETDATE(),
+                UNIQUE(OperatorCode, LancementCode, StartTime)
+            )
+        `;
+
+        await executeQuery(dropSessionsTable);
+        await executeQuery(createSessionsTable);
+        console.log('✅ Table ABSESSIONS_OPERATEURS recréée');
+
+        await executeQuery(dropTempsTable);
+        await executeQuery(createTempsTable);
+        console.log('✅ Table ABTEMPS_OPERATEURS recréée');
+
+        // Supprimer et recréer ABHISTORIQUE_OPERATEURS
+        const dropHistoriqueTable = `
+            IF OBJECT_ID('[SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]', 'U') IS NOT NULL
+            DROP TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+        `;
+
+        const createHistoriqueTable = `
+            CREATE TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] (
+                NoEnreg INT IDENTITY(1,1) PRIMARY KEY,
+                OperatorCode NVARCHAR(50) NOT NULL,
+                CodeLanctImprod NVARCHAR(50) NOT NULL,
+                CodeRubrique NVARCHAR(50) NOT NULL,
+                Ident NVARCHAR(20) NOT NULL, -- DEBUT, PAUSE, REPRISE, FIN
+                Phase NVARCHAR(50) NULL,
+                Statut NVARCHAR(20) NULL,
+                HeureDebut TIME NULL, -- Format HH:mm seulement
+                HeureFin TIME NULL, -- Format HH:mm seulement
+                DateCreation DATE NOT NULL DEFAULT CAST(GETDATE() AS DATE), -- Date seulement
+                SessionId INT NULL,
+                RequestId NVARCHAR(100) NULL,
+                CreatedAt DATETIME2 NOT NULL DEFAULT GETDATE(),
+                INDEX IX_Historique_Operator_Lancement (OperatorCode, CodeLanctImprod),
+                INDEX IX_Historique_Date (DateCreation)
+            )
+        `;
+
+        try {
+            await executeQuery(dropHistoriqueTable);
+            console.log('🗑️ Table ABHISTORIQUE_OPERATEURS supprimée (si elle existait)');
+        } catch (error) {
+            console.log('⚠️ Table ABHISTORIQUE_OPERATEURS n\'existait pas', error.message);
+        }
+        
+        await executeQuery(createHistoriqueTable);
+        console.log('✅ Table ABHISTORIQUE_OPERATEURS recréée');
+
+        res.json({
+            success: true,
+            message: 'Tables SEDI_APP_INDEPENDANTE recréées avec succès',
+            tables: ['ABHISTORIQUE_OPERATEURS', 'ABSESSIONS_OPERATEURS', 'ABTEMPS_OPERATEURS']
+        });
+
+    } catch (error) {
+        console.error('❌ Erreur recréation tables:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la recréation des tables',
+            details: error.message
+        });
+    }
+});
+
+// Route pour initialiser les tables manquantes SEDI_APP_INDEPENDANTE
+router.post('/init-tables', requireDangerousRoute('ALLOW_INIT_TABLES'), async (req, res) => {
+    try {
+        console.log('🔧 Initialisation des tables SEDI_APP_INDEPENDANTE...');
+
+        // Créer ABSESSIONS_OPERATEURS si elle n'existe pas
+        const createSessionsTable = `
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ABSESSIONS_OPERATEURS' AND xtype='U')
+            CREATE TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS] (
+                SessionId INT IDENTITY(1,1) PRIMARY KEY,
+                OperatorCode NVARCHAR(50) NOT NULL,
+                LoginTime DATETIME2 NOT NULL,
+                LogoutTime DATETIME2 NULL,
+                SessionStatus NVARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                DeviceInfo NVARCHAR(255) NULL,
+                DateCreation DATETIME2 NOT NULL DEFAULT GETDATE()
+            )
+        `;
+
+        // Créer ABTEMPS_OPERATEURS si elle n'existe pas
+        const createTempsTable = `
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ABTEMPS_OPERATEURS' AND xtype='U')
+            CREATE TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] (
+                TempsId INT IDENTITY(1,1) PRIMARY KEY,
+                OperatorCode NVARCHAR(50) NOT NULL,
+                LancementCode NVARCHAR(50) NOT NULL,
+                StartTime DATETIME2 NOT NULL,
+                EndTime DATETIME2 NOT NULL,
+                TotalDuration INT NOT NULL, -- en minutes
+                PauseDuration INT NOT NULL DEFAULT 0, -- en minutes
+                ProductiveDuration INT NOT NULL, -- en minutes
+                EventsCount INT NOT NULL DEFAULT 0,
+                DateCreation DATETIME2 NOT NULL DEFAULT GETDATE(),
+                UNIQUE(OperatorCode, LancementCode, StartTime)
+            )
+        `;
+
+        await executeQuery(createSessionsTable);
+        console.log('✅ Table ABSESSIONS_OPERATEURS créée/vérifiée');
+
+        await executeQuery(createTempsTable);
+        console.log('✅ Table ABTEMPS_OPERATEURS créée/vérifiée');
+
+        res.json({
+            success: true,
+            message: 'Tables SEDI_APP_INDEPENDANTE initialisées avec succès',
+            tables: ['ABHISTORIQUE_OPERATEURS', 'ABSESSIONS_OPERATEURS', 'ABTEMPS_OPERATEURS']
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur initialisation tables:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de l\'initialisation des tables',
+            details: error.message
+        });
+    }
+});
+
+// Route de débogage pour analyser les 3 tables SEDI_APP_INDEPENDANTE
+router.get('/debug/sedi-tables', async (req, res) => {
+    try {
+        console.log('🔍 Analyse des 3 tables SEDI_APP_INDEPENDANTE...');
+
+        // Analyser ABHISTORIQUE_OPERATEURS
+        const historiqueQuery = `
+            SELECT TOP 5 * 
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            ORDER BY DateCreation DESC
+        `;
+
+        // Analyser ABSESSIONS_OPERATEURS
+        const sessionsQuery = `
+            SELECT TOP 5 * 
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]
+            ORDER BY DateCreation DESC
+        `;
+
+        // Analyser ABTEMPS_OPERATEURS
+        const tempsQuery = `
+            SELECT TOP 5 * 
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]
+            -- Note: Les colonnes Phase, CodeRubrique, StatutTraitement sont maintenant disponibles
+            ORDER BY DateCreation DESC
+        `;
+
+        const [historiqueResults, sessionsResults, tempsResults] = await Promise.all([
+            executeQuery(historiqueQuery).catch(err => ({ error: err.message })),
+            executeQuery(sessionsQuery).catch(err => ({ error: err.message })),
+            executeQuery(tempsQuery).catch(err => ({ error: err.message }))
+        ]);
+
+        // Compter les enregistrements
+        const countHistoriqueQuery = `SELECT COUNT(*) as count FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]`;
+        const countSessionsQuery = `SELECT COUNT(*) as count FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABSESSIONS_OPERATEURS]`;
+        const countTempsQuery = `SELECT COUNT(*) as count FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]`;
+
+        const [countHistorique, countSessions, countTemps] = await Promise.all([
+            executeQuery(countHistoriqueQuery).catch(err => [{ count: 0, error: err.message }]),
+            executeQuery(countSessionsQuery).catch(err => [{ count: 0, error: err.message }]),
+            executeQuery(countTempsQuery).catch(err => [{ count: 0, error: err.message }])
+        ]);
+
+        res.json({
+            success: true,
+            tables: {
+                ABHISTORIQUE_OPERATEURS: {
+                    count: countHistorique[0]?.count || 0,
+                    sample: historiqueResults.error ? { error: historiqueResults.error } : historiqueResults,
+                    columns: historiqueResults.length > 0 ? Object.keys(historiqueResults[0]) : []
+                },
+                ABSESSIONS_OPERATEURS: {
+                    count: countSessions[0]?.count || 0,
+                    sample: sessionsResults.error ? { error: sessionsResults.error } : sessionsResults,
+                    columns: sessionsResults.length > 0 ? Object.keys(sessionsResults[0]) : []
+                },
+                ABTEMPS_OPERATEURS: {
+                    count: countTemps[0]?.count || 0,
+                    sample: tempsResults.error ? { error: tempsResults.error } : tempsResults,
+                    columns: tempsResults.length > 0 ? Object.keys(tempsResults[0]) : []
+                }
+            }
+        });
+        
+    } catch (error) {
+        console.error('Erreur debug tables SEDI:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// GET /api/admin/lancement/:code - Rechercher un lancement dans LCTE
+router.get('/lancement/:code', async (req, res) => {
+    try {
+        const { code } = req.params;
+        
+        console.log(` Recherche du lancement ${code}...`);
+        
+        const validation = await validateLancement(code);
+        
+        if (validation.valid) {
+            res.json({
+                success: true,
+                data: validation.data
+            });
+        } else {
+            res.status(404).json({
+                success: false,
+                error: validation.error
+            });
+        }
+        
+    } catch (error) {
+        console.error(' Erreur lors de la recherche du lancement:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la recherche du lancement'
+        });
+    }
+});
+
+// GET /api/admin/abetemps - Voir les données de la table abetemps
+router.get('/abetemps', async (req, res) => {
+    try {
+        const { lancement } = req.query;
+        
+        if (lancement) {
+            console.log(`🔍 Recherche du lancement ${lancement} dans abetemps...`);
+            
+            const query = `
+                SELECT TOP 10
+                    [NoEnreg],
+                    [Ident],
+                    [CodeLanctImprod],
+                    [Phase],
+                    [CodeOperateur]
+                FROM [SEDI_ERP].[GPSQL].[abetemps]
+                WHERE [CodeLanctImprod] = @lancement
+                ORDER BY [NoEnreg] DESC
+            `;
+            
+            const result = await executeQuery(query, { lancement });
+            console.log(`✅ ${result.length} entrées trouvées pour ${lancement} dans abetemps`);
+            
+            res.json({
+                success: true,
+                data: result || [],
+                lancement: lancement
+            });
+        } else {
+            console.log('🔍 Récupération de 10 entrées depuis abetemps...');
+            
+            const query = `
+                SELECT TOP 10
+                    [NoEnreg],
+                    [Ident],
+                    [CodeLanctImprod],
+                    [Phase],
+                    [CodeOperateur]
+                FROM [SEDI_ERP].[GPSQL].[abetemps]
+                ORDER BY [NoEnreg] DESC
+            `;
+            
+            const result = await executeQuery(query);
+            console.log(`✅ ${result.length} entrées récupérées depuis abetemps`);
+            
+            res.json({
+                success: true,
+                data: result || []
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la récupération de abetemps:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la récupération de abetemps'
+        });
+    }
+});
+
+// GET /api/admin/lcte - Voir les données de la table LCTE
+router.get('/lcte', async (req, res) => {
+    try {
+        const { limit = 10 } = req.query;
+        
+        console.log(`🔍 Récupération de ${limit} lancements depuis LCTE...`);
+        
+        const limitNum = Math.max(1, Math.min(Number.parseInt(limit, 10) || 10, 500));
+        const query = `
+            SELECT TOP (@limitNum) 
+                [CodeLancement],
+                [CodeArticle],
+                [DesignationLct1],
+                [CodeModele],
+                [DesignationArt1],
+                [DesignationArt2]
+            FROM [SEDI_ERP].[dbo].[LCTE]
+            ORDER BY [CodeLancement]
+        `;
+        
+        const result = await executeQuery(query, { limitNum });
+        
+        console.log(` ${result.length} lancements récupérés depuis LCTE`);
+        
+        res.json({
+            success: true,
+            data: result || [],
+            count: result.length
+        });
+        
+    } catch (error) {
+        console.error(' Erreur lors de la récupération des lancements LCTE:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la récupération des lancements'
+        });
+    }
+});
+
+// GET /api/admin/lancements/search - Rechercher des lancements par terme
+router.get('/lancements/search', async (req, res) => {
+    try {
+        const { term, limit = 10 } = req.query;
+        
+        if (!term || term.length < 2) {
+            return res.json({
+                success: true,
+                data: []
+            });
+        }
+        
+        console.log(`🔍 Recherche de lancements avec le terme: ${term}`);
+        
+        const searchTerm = `%${term}%`;
+        const limitNum = Math.max(1, Math.min(Number.parseInt(limit, 10) || 10, 500));
+        const query = `
+            SELECT TOP (@limitNum) 
+                [CodeLancement],
+                [CodeArticle],
+                [DesignationLct1],
+                [CodeModele],
+                [DesignationArt1],
+                [DesignationArt2]
+            FROM [SEDI_ERP].[dbo].[LCTE]
+            WHERE [CodeLancement] LIKE @searchTerm
+               OR [DesignationLct1] LIKE @searchTerm
+               OR [CodeArticle] LIKE @searchTerm
+            ORDER BY [CodeLancement]
+        `;
+        
+        const result = await executeQuery(query, { searchTerm, limitNum });
+        
+        console.log(` ${result.length} lancements trouvés`);
+        
+        res.json({
+            success: true,
+            data: result || []
+        });
+        
+    } catch (error) {
+        console.error(' Erreur lors de la recherche de lancements:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la recherche'
+        });
+    }
+});
+
+// Route spécifique pour créer ABHISTORIQUE_OPERATEURS
+router.post('/create-historique-table', requireDangerousRoute('ALLOW_RECREATE_TABLES'), async (req, res) => {
+    try {
+        console.log('🔧 Création de la table ABHISTORIQUE_OPERATEURS...');
+
+        // Supprimer et recréer ABHISTORIQUE_OPERATEURS
+        const dropHistoriqueTable = `
+            IF OBJECT_ID('[SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]', 'U') IS NOT NULL
+            DROP TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+        `;
+
+        const createHistoriqueTable = `
+            CREATE TABLE [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] (
+                NoEnreg INT IDENTITY(1,1) PRIMARY KEY,
+                OperatorCode NVARCHAR(50) NOT NULL,
+                CodeLanctImprod NVARCHAR(50) NOT NULL,
+                CodeRubrique NVARCHAR(50) NOT NULL,
+                Ident NVARCHAR(20) NOT NULL, -- DEBUT, PAUSE, REPRISE, FIN
+                Phase NVARCHAR(50) NULL,
+                Statut NVARCHAR(20) NULL,
+                HeureDebut TIME NULL, -- Format HH:mm seulement
+                HeureFin TIME NULL, -- Format HH:mm seulement
+                DateCreation DATE NOT NULL DEFAULT CAST(GETDATE() AS DATE), -- Date seulement
+                SessionId INT NULL,
+                RequestId NVARCHAR(100) NULL,
+                CreatedAt DATETIME2 NOT NULL DEFAULT GETDATE(),
+                INDEX IX_Historique_Operator_Lancement (OperatorCode, CodeLanctImprod),
+                INDEX IX_Historique_Date (DateCreation)
+            )
+        `;
+
+        await executeQuery(dropHistoriqueTable);
+        await executeQuery(createHistoriqueTable);
+        console.log(' Table ABHISTORIQUE_OPERATEURS créée avec succès');
+
+        res.json({
+            success: true,
+            message: 'Table ABHISTORIQUE_OPERATEURS créée avec succès'
+        });
+
+    } catch (error) {
+        console.error(' Erreur création table ABHISTORIQUE_OPERATEURS:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la création de la table ABHISTORIQUE_OPERATEURS',
+            details: error.message
+        });
+    }
+});
+
+// Route de debug pour tester la logique de tous les lancements
+router.get('/debug/all-lancements-status', async (req, res) => {
+    try {
+        console.log('🔍 Debug de tous les lancements...');
+        
+        // Récupérer tous les événements
+        const eventsQuery = `
+            SELECT 
+                h.NoEnreg,
+                h.Ident,
+                h.CodeLanctImprod,
+                h.CodeRubrique,
+                h.HeureDebut,
+                h.HeureFin,
+                h.DateCreation
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+            ORDER BY h.CodeLanctImprod, h.CodeRubrique, h.DateCreation ASC
+        `;
+        
+        const events = await executeQuery(eventsQuery);
+        
+        // Grouper par lancement
+        const lancementGroups = {};
+        events.forEach(event => {
+            const key = `${event.CodeLanctImprod}_${event.CodeRubrique}`;
+            if (!lancementGroups[key]) {
+                lancementGroups[key] = [];
+            }
+            lancementGroups[key].push(event);
+        });
+        
+        const analysis = [];
+        
+        Object.keys(lancementGroups).forEach(key => {
+            const groupEvents = lancementGroups[key].slice();
+            groupEvents.sort((a, b) => new Date(a.DateCreation) - new Date(b.DateCreation));
+            
+            const [lancementCode, operatorCode] = key.split('_');
+            const lastEvent = groupEvents[groupEvents.length - 1];
+            const hasFin = groupEvents.some(e => e.Ident === 'FIN');
+            const pauseEvents = groupEvents.filter(e => e.Ident === 'PAUSE');
+            const repriseEvents = groupEvents.filter(e => e.Ident === 'REPRISE');
+            
+            // Déterminer le statut selon la nouvelle logique
+            let currentStatus = 'EN_COURS';
+            if (hasFin) {
+                currentStatus = 'TERMINE';
+            } else if (lastEvent.Ident === 'PAUSE') {
+                currentStatus = 'PAUSE';
+            }
+            
+            analysis.push({
+                lancementCode,
+                operatorCode,
+                totalEvents: groupEvents.length,
+                pauseEvents: pauseEvents.length,
+                repriseEvents: repriseEvents.length,
+                lastEvent: lastEvent ? {
+                    ident: lastEvent.Ident,
+                    date: lastEvent.DateCreation,
+                    heure: lastEvent.HeureDebut
+                } : null,
+                currentStatus,
+                isFinished: !!finEvent,
+                events: groupEvents.map(e => ({
+                    id: e.NoEnreg,
+                    ident: e.Ident,
+                    date: e.DateCreation,
+                    heure: e.HeureDebut
+                }))
+            });
+        });
+        
+        console.log(`📊 Analyse de ${analysis.length} lancements terminée`);
+        
+        res.json({
+            success: true,
+            totalLancements: analysis.length,
+            analysis: [...analysis].sort((a, b) => a.lancementCode.localeCompare(b.lancementCode))
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur debug tous les lancements:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du debug de tous les lancements',
+            details: error.message
+        });
+    }
+});
+
+// Route pour nettoyer les données de test et créer des pauses terminées
+router.post('/debug/create-test-pause-reprise', async (req, res) => {
+    try {
+        console.log('🧪 Création de données de test pause/reprise...');
+        
+        const { operatorCode = '929', lancementCode = 'LT2501148' } = req.body;
+        const requestId = req.audit?.requestId || generateRequestId();
+        
+        // Créer une pause terminée pour tester
+        const pauseQuery = `
+            INSERT INTO [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            (OperatorCode, CodeLanctImprod, CodeRubrique, Ident, Phase, Statut, HeureDebut, HeureFin, DateCreation, SessionId, RequestId, CreatedAt)
+            VALUES (
+                @operatorCode,
+                @lancementCode,
+                @operatorCode,
+                'PAUSE',
+                'PRODUCTION',
+                'EN_PAUSE',
+                CAST('14:30:00' AS TIME),
+                NULL,
+                CAST(GETDATE() AS DATE),
+                NULL,
+                @requestId,
+                GETDATE()
+            )
+        `;
+        
+        const repriseQuery = `
+            INSERT INTO [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+            (OperatorCode, CodeLanctImprod, CodeRubrique, Ident, Phase, Statut, HeureDebut, HeureFin, DateCreation, SessionId, RequestId, CreatedAt)
+            VALUES (
+                @operatorCode,
+                @lancementCode,
+                @operatorCode,
+                'REPRISE',
+                'PRODUCTION',
+                'EN_COURS',
+                CAST('14:45:00' AS TIME),
+                NULL,
+                CAST(GETDATE() AS DATE),
+                NULL,
+                @requestId,
+                GETDATE()
+            )
+        `;
+        
+        const debugParams = { operatorCode, lancementCode, requestId };
+        await executeQuery(pauseQuery, debugParams);
+        await executeQuery(repriseQuery, debugParams);
+        
+        console.log('✅ Données de test créées');
+        
+        res.json({
+            success: true,
+            message: 'Données de test pause/reprise créées',
+            data: {
+                operatorCode,
+                lancementCode,
+                pauseTime: '14:30:00',
+                repriseTime: '14:45:00'
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur création données test:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors de la création des données de test',
+            details: error.message
+        });
+    }
+});
+
+// Route de debug pour voir tous les lancements avec leurs pauses
+router.get('/debug/all-pauses', async (req, res) => {
+    try {
+        console.log('🔍 Debug de tous les lancements avec pauses...');
+        
+        // Récupérer tous les événements
+        const eventsQuery = `
+            SELECT 
+                h.NoEnreg,
+                h.Ident,
+                h.CodeLanctImprod,
+                h.CodeRubrique,
+                h.HeureDebut,
+                h.HeureFin,
+                h.DateCreation
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+            ORDER BY h.CodeLanctImprod, h.CodeRubrique, h.DateCreation ASC
+        `;
+        
+        const events = await executeQuery(eventsQuery);
+        
+        // Grouper par lancement
+        const lancementGroups = {};
+        events.forEach(event => {
+            const key = `${event.CodeLanctImprod}_${event.CodeRubrique}`;
+            if (!lancementGroups[key]) {
+                lancementGroups[key] = [];
+            }
+            lancementGroups[key].push(event);
+        });
+        
+        const analysis = [];
+        
+        Object.keys(lancementGroups).forEach(key => {
+            const groupEvents = lancementGroups[key].slice();
+            groupEvents.sort((a, b) => new Date(a.DateCreation) - new Date(b.DateCreation));
+            
+            const [lancementCode, operatorCode] = key.split('_');
+            const pauseEvents = groupEvents.filter(e => e.Ident === 'PAUSE');
+            const repriseEvents = groupEvents.filter(e => e.Ident === 'REPRISE');
+            
+            analysis.push({
+                lancementCode,
+                operatorCode,
+                totalEvents: groupEvents.length,
+                pauseEvents: pauseEvents.length,
+                repriseEvents: repriseEvents.length,
+                events: groupEvents.map(e => ({
+                    id: e.NoEnreg,
+                    ident: e.Ident,
+                    date: e.DateCreation,
+                    heure: e.HeureDebut
+                })),
+                pauseAnalysis: pauseEvents.map(pause => {
+                    const reprise = repriseEvents.find(r => 
+                        new Date(r.DateCreation) > new Date(pause.DateCreation) &&
+                        r.CodeLanctImprod === pause.CodeLanctImprod &&
+                        r.CodeRubrique === pause.CodeRubrique
+                    );
+                    return {
+                        pauseId: pause.NoEnreg,
+                        pauseDate: pause.DateCreation,
+                        pauseHeure: pause.HeureDebut,
+                        hasReprise: !!reprise,
+                        repriseDate: reprise ? reprise.DateCreation : null,
+                        repriseHeure: reprise ? reprise.HeureDebut : null,
+                        status: reprise ? 'PAUSE_TERMINEE' : 'PAUSE'
+                    };
+                })
+            });
+        });
+        
+        res.json({
+            success: true,
+            totalLancements: analysis.length,
+            analysis: [...analysis].sort((a, b) => a.lancementCode.localeCompare(b.lancementCode))
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur debug toutes les pauses:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du debug de toutes les pauses',
+            details: error.message
+        });
+    }
+});
+
+// Route de debug pour tester la logique pause/reprise
+router.get('/debug/pause-reprise/:lancementCode', async (req, res) => {
+    try {
+        const { lancementCode } = req.params;
+        
+        console.log(`🔍 Debug pause/reprise pour le lancement ${lancementCode}...`);
+        
+        // Récupérer tous les événements pour ce lancement
+        const eventsQuery = `
+            SELECT 
+                h.NoEnreg,
+                h.Ident,
+                h.CodeLanctImprod,
+                h.CodeRubrique,
+                h.HeureDebut,
+                h.HeureFin,
+                h.DateCreation
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+            WHERE h.CodeLanctImprod = @lancementCode
+            ORDER BY h.DateCreation ASC, h.NoEnreg ASC
+        `;
+        
+        const events = await executeQuery(eventsQuery, { lancementCode });
+        
+        // Analyser les événements
+        const pauseEvents = events.filter(e => e.Ident === 'PAUSE');
+        const repriseEvents = events.filter(e => e.Ident === 'REPRISE');
+        
+        console.log(`📊 Événements trouvés pour ${lancementCode}:`, {
+            total: events.length,
+            pauses: pauseEvents.length,
+            reprises: repriseEvents.length,
+            events: events.map(e => ({
+                id: e.NoEnreg,
+                ident: e.Ident,
+                operator: e.CodeRubrique,
+                date: e.DateCreation,
+                heure: e.HeureDebut
+            }))
+        });
+        
+        res.json({
+            success: true,
+            lancementCode,
+            analysis: {
+                totalEvents: events.length,
+                pauseEvents: pauseEvents.length,
+                repriseEvents: repriseEvents.length,
+                events: events.map(e => ({
+                    id: e.NoEnreg,
+                    ident: e.Ident,
+                    operator: e.CodeRubrique,
+                    date: e.DateCreation,
+                    heure: e.HeureDebut
+                })),
+                pauseReprisePairs: pauseEvents.map(pause => {
+                    const reprise = repriseEvents.find(r => 
+                        new Date(r.DateCreation) > new Date(pause.DateCreation) &&
+                        r.CodeLanctImprod === pause.CodeLanctImprod &&
+                        r.CodeRubrique === pause.CodeRubrique
+                    );
+                    return {
+                        pause: {
+                            id: pause.NoEnreg,
+                            date: pause.DateCreation,
+                            heure: pause.HeureDebut
+                        },
+                        reprise: reprise ? {
+                            id: reprise.NoEnreg,
+                            date: reprise.DateCreation,
+                            heure: reprise.HeureDebut
+                        } : null,
+                        status: reprise ? 'PAUSE_TERMINEE' : 'PAUSE'
+                    };
+                })
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur debug pause/reprise:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du debug pause/reprise',
+            details: error.message
+        });
+    }
+});
+
+// Route de test pour vérifier le format HH:mm
+router.get('/test/time-format', async (req, res) => {
+    try {
+        console.log('🧪 Test du format HH:mm...');
+        
+        // Tests de formatTimeForSQL
+        const testCases = [
+            '14:30',      // Format HH:mm standard
+            '09:15',      // Format HH:mm avec zéro
+            '14:30:45',   // Format HH:mm:ss existant
+            '9:5',        // Format H:m (sans zéros)
+            null,         // Valeur null
+            '',           // Chaîne vide
+            'invalid'     // Format invalide
+        ];
+        
+        const results = testCases.map(input => ({
+            input: input,
+            output: formatTimeForSQL(input),
+            type: typeof input
+        }));
+        
+        console.log('🧪 Résultats des tests:', results);
+        
+        res.json({
+            success: true,
+            message: 'Tests du format HH:mm terminés',
+            format: 'HH:mm → HH:mm:ss (pour SQL)',
+            tests: results,
+            examples: {
+                'Frontend': '14:30',
+                'API': '14:30', 
+                'SQL': '14:30:00',
+                'Display': '14:30'
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur test format:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur lors du test du format'
+        });
+    }
+});
+
+// ============================================
+// ROUTES MONITORING - Gestion des enregistrements de temps
+// ============================================
+
+const MonitoringService = require('../services/MonitoringService');
+
+// GET /api/admin/monitoring - Récupérer tous les enregistrements de temps avec filtres
+router.get('/monitoring', async (req, res) => {
+    try {
+        // Éviter le cache (sinon le navigateur peut recevoir 304 sans body JSON)
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+
+        const { statutTraitement, operatorCode, lancementCode, date, dateStart, dateEnd, includeAllStatuses } = req.query;
+
+        const filters = {};
+        if (statutTraitement !== undefined) filters.statutTraitement = statutTraitement;
+        if (operatorCode) filters.operatorCode = operatorCode;
+        if (lancementCode) filters.lancementCode = lancementCode;
+        if (date) filters.date = date;
+        if (dateStart) filters.dateStart = dateStart;
+        if (dateEnd) filters.dateEnd = dateEnd;
+        if (includeAllStatuses === '1' || String(includeAllStatuses || '').toLowerCase() === 'true') {
+            filters.includeAllStatuses = true;
+        }
+        
+        const result = await MonitoringService.getTempsRecords(filters);
+        
+        if (result.success) {
+            // Enrichir Phase + libellé depuis LCTC (phase du lancement)
+            try {
+                const lts = [...new Set((result.data || []).map(r => String(r?.LancementCode || '').trim()).filter(Boolean))];
+                const byLaunch = await getLctcStepsByLaunch(lts);
+                (result.data || []).forEach(r => applyLctcPhaseFabrication(r, byLaunch));
+            } catch (e) {
+                console.warn('⚠️ Impossible d\'enrichir /admin/monitoring avec la phase LCTC:', e.message);
+            }
+
+            res.json({
+                success: true,
+                data: result.data,
+                count: result.count
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                error: result.error
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la récupération des enregistrements:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la récupération des enregistrements'
+        });
+    }
+});
+
+// PUT /api/admin/monitoring/:tempsId - Corriger un enregistrement
+router.put('/monitoring/:tempsId', async (req, res) => {
+    try {
+        const { tempsId } = req.params;
+        const corrections = req.body;
+        
+        // Convertir tempsId en nombre
+        const tempsIdNum = Number.parseInt(tempsId, 10);
+        if (Number.isNaN(tempsIdNum)) {
+            console.error(`❌ TempsId invalide reçu: ${tempsId}`);
+            return res.status(400).json({
+                success: false,
+                error: 'ID d\'enregistrement invalide'
+            });
+        }
+        
+        console.log(`🔍 Recherche de l'enregistrement TempsId: ${tempsIdNum} (type: ${typeof tempsIdNum})`);
+        
+        // 🔒 VÉRIFICATION DE SÉCURITÉ : Vérifier que l'enregistrement existe
+        const checkQuery = `
+            SELECT OperatorCode, LancementCode, StatutTraitement
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]
+            WHERE TempsId = @tempsId
+        `;
+        const existing = await executeQuery(checkQuery, { tempsId: tempsIdNum });
+        
+        console.log(`📊 Résultat de la recherche: ${existing.length} enregistrement(s) trouvé(s) pour TempsId ${tempsIdNum}`);
+        
+        if (existing.length === 0) {
+            // Si un NoEnreg existe dans ABHISTORIQUE_OPERATEURS avec ce même numéro,
+            // alors l'UI est très probablement en train d'envoyer un ID d'événement (non consolidé)
+            // vers la route de monitoring (consolidé).
+            try {
+                const histCheckQuery = `
+                    SELECT TOP 1 NoEnreg, OperatorCode, CodeLanctImprod, Ident, DateCreation
+                    FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS]
+                    WHERE NoEnreg = @id
+                `;
+                const hist = await executeQuery(histCheckQuery, { id: tempsIdNum });
+                if (hist.length > 0) {
+                    return res.status(400).json({
+                        success: false,
+                        error: 'ID invalide pour le monitoring',
+                        hint: 'Cet ID correspond à un événement (ABHISTORIQUE_OPERATEURS.NoEnreg) et non à un TempsId consolidé. Utilisez /api/admin/operations/:id ou consolidez avant correction.',
+                        received: { tempsId: tempsIdNum },
+                        detectedEvent: {
+                            NoEnreg: hist[0].NoEnreg,
+                            OperatorCode: hist[0].OperatorCode,
+                            LancementCode: hist[0].CodeLanctImprod,
+                            Ident: hist[0].Ident,
+                            DateCreation: hist[0].DateCreation
+                        }
+                    });
+                }
+            } catch (e) {
+                console.warn('Vérification historique best-effort:', e.message);
+            }
+
+            // Vérifier si l'enregistrement existe avec un autre type de données
+            const debugQuery = `
+                SELECT TOP 5 TempsId, OperatorCode, LancementCode, StatutTraitement
+                FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]
+                ORDER BY TempsId DESC
+            `;
+            const recentRecords = await executeQuery(debugQuery, {});
+            console.log(`🔍 Enregistrements récents (pour debug):`, recentRecords.map(r => ({ TempsId: r.TempsId, type: typeof r.TempsId })));
+            
+            return res.status(404).json({
+                success: false,
+                error: 'Enregistrement non trouvé',
+                tempsId: tempsIdNum
+            });
+        }
+        
+        // Si un operatorCode est fourni dans le body, vérifier qu'il correspond
+        if (corrections.OperatorCode && corrections.OperatorCode !== existing[0].OperatorCode) {
+            return res.status(403).json({
+                success: false,
+                error: 'Vous ne pouvez modifier que vos propres enregistrements',
+                security: 'DATA_OWNERSHIP_VIOLATION'
+            });
+        }
+        
+        const result = await MonitoringService.correctRecord(Number.parseInt(tempsId), corrections);
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                message: result.message,
+                data: result
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la correction:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la correction'
+        });
+    }
+});
+
+// DELETE /api/admin/monitoring/:tempsId - Supprimer un enregistrement
+router.delete('/monitoring/:tempsId', async (req, res) => {
+    try {
+        const { tempsId } = req.params;
+        const tempsIdNum = Number.parseInt(tempsId, 10);
+
+        if (!Number.isFinite(tempsIdNum)) {
+            return res.status(400).json({
+                success: false,
+                error: 'TempsId invalide'
+            });
+        }
+        
+        // 🔒 VÉRIFICATION DE SÉCURITÉ : Vérifier que l'enregistrement existe
+        const checkQuery = `
+            SELECT OperatorCode, LancementCode, StatutTraitement
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]
+            WHERE TempsId = @tempsId
+        `;
+        const existing = await executeQuery(checkQuery, { tempsId: tempsIdNum });
+        
+        if (existing.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Enregistrement non trouvé'
+            });
+        }
+        
+        // Si un operatorCode est fourni dans le body, vérifier qu'il correspond
+        if (req.body?.operatorCode && req.body.operatorCode !== existing[0].OperatorCode) {
+            return res.status(403).json({
+                success: false,
+                error: 'Vous ne pouvez supprimer que vos propres enregistrements',
+                security: 'DATA_OWNERSHIP_VIOLATION'
+            });
+        }
+        
+        const result = await MonitoringService.deleteRecord(tempsIdNum);
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                message: result.message,
+                data: result
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la suppression:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la suppression',
+            details: error?.message
+        });
+    }
+});
+
+// POST /api/admin/monitoring/:tempsId/validate - Valider un enregistrement
+router.post('/monitoring/:tempsId/validate', async (req, res) => {
+    try {
+        const { tempsId } = req.params;
+        
+        const result = await MonitoringService.validateRecord(Number.parseInt(tempsId));
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                message: result.message,
+                data: result
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la validation:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la validation'
+        });
+    }
+});
+
+// POST /api/admin/monitoring/:tempsId/on-hold - Mettre en attente un enregistrement
+router.post('/monitoring/:tempsId/on-hold', async (req, res) => {
+    try {
+        const { tempsId } = req.params;
+        
+        const result = await MonitoringService.setOnHold(Number.parseInt(tempsId, 10));
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                message: result.message,
+                data: result
+            });
+        } else {
+            res.status(400).json({
+                success: false,
+                error: result.error
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la mise en attente:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la mise en attente'
+        });
+    }
+});
+
+// POST /api/admin/monitoring/:tempsId/release-hold - Débloquer (A → NULL)
+router.post('/monitoring/:tempsId/release-hold', async (req, res) => {
+    try {
+        const { tempsId } = req.params;
+        const result = await MonitoringService.releaseHold(Number.parseInt(tempsId, 10));
+        if (result.success) {
+            return res.json({ success: true, message: result.message, data: result });
+        }
+        return res.status(400).json({ success: false, error: result.error });
+    } catch (error) {
+        console.error('❌ Erreur lors du déblocage:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors du déblocage'
+        });
+    }
+});
+
+// POST /api/admin/monitoring/on-hold-batch - Bloquer plusieurs lignes (A)
+router.post('/monitoring/on-hold-batch', async (req, res) => {
+    try {
+        const { tempsIds } = req.body || {};
+        const result = await MonitoringService.setOnHoldBatch(tempsIds);
+        if (result.success) {
+            return res.json({ success: true, message: result.message, data: result });
+        }
+        return res.status(400).json({
+            success: false,
+            error: result.error || 'Aucune ligne bloquée',
+            data: result
+        });
+    } catch (error) {
+        console.error('❌ Erreur on-hold-batch:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors du blocage batch'
+        });
+    }
+});
+
+// POST /api/admin/monitoring/release-hold-batch - Débloquer plusieurs lignes
+router.post('/monitoring/release-hold-batch', async (req, res) => {
+    try {
+        const { tempsIds } = req.body || {};
+        const result = await MonitoringService.releaseHoldBatch(tempsIds);
+        if (result.success) {
+            return res.json({ success: true, message: result.message, data: result });
+        }
+        return res.status(400).json({
+            success: false,
+            error: result.error || 'Aucune ligne débloquée',
+            data: result
+        });
+    } catch (error) {
+        console.error('❌ Erreur release-hold-batch:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors du déblocage batch'
+        });
+    }
+});
+
+// POST /api/admin/monitoring/:tempsId/transmit - Marquer comme transmis et déclencher EDI_JOB
+router.post('/monitoring/:tempsId/transmit', async (req, res) => {
+    try {
+        const { tempsId } = req.params;
+        const { triggerEdiJob = false, codeTache = null } = req.body;
+
+        const remoteMode = String(process.env.SILOG_REMOTE_MODE || '').trim().toLowerCase();
+        const isScheduledMode = ['scheduled', 'disable', 'disabled', 'none'].includes(remoteMode);
+
+        // Nouveau flux:
+        // 1) Valider en 'O' (si nécessaire)
+        // 2) Exécuter EDI_JOB (si demandé)
+        // 3) Marquer en 'T' uniquement si EDI_JOB OK (sinon laisser en 'O' pour retry)
+        const idNum = Number.parseInt(tempsId, 10);
+        const validate = await MonitoringService.validateRecord(idNum);
+        if (!validate.success) {
+            return res.status(400).json({ success: false, error: validate.error });
+        }
+
+        let ediJobResult = null;
+        if (triggerEdiJob && !isScheduledMode) {
+            ediJobResult = await EdiJobService.executeEdiJobForTransmittedRecords([idNum], codeTache);
+            if (!ediJobResult.success) {
+                return res.status(500).json({
+                    success: false,
+                    error: 'EDI_JOB_FAILED',
+                    details: ediJobResult.error || 'EDI_JOB a échoué'
+                });
+            }
+        } else if (triggerEdiJob && isScheduledMode) {
+            ediJobResult = {
+                success: true,
+                skipped: true,
+                message: `EDI_JOB non déclenché par le backend (SILOG_REMOTE_MODE=${remoteMode}). Tâche planifiée Windows attendue.`
+            };
+        }
+
+        // En mode scheduled/disabled, ne pas marquer en 'T' (laisser 'O' pour consommation par SILOG).
+        let mark = null;
+        if (!isScheduledMode) {
+            mark = await MonitoringService.markAsTransmitted(idNum);
+            if (!mark.success) {
+                return res.status(400).json({ success: false, error: mark.error });
+            }
+        }
+
+        return res.json({
+            success: true,
+                message: isScheduledMode ? 'Enregistrement validé (planifié: tâche SILOG sur SVC_SILOG/runner Windows)' : 'Enregistrement transmis',
+            data: isScheduledMode ? { validated: validate } : { validated: validate, transmitted: mark },
+            ediJob: ediJobResult
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors du marquage comme transmis:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors du marquage comme transmis'
+        });
+    }
+});
+
+// POST /api/admin/monitoring/consolidate-batch - Consolider un lot d'opérations terminées
+router.post('/monitoring/consolidate-batch', async (req, res) => {
+    try {
+        const { operations, options = {} } = req.body; // Array of { OperatorCode, LancementCode }
+        
+        if (!Array.isArray(operations) || operations.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Liste d\'opérations requise'
+            });
+        }
+        
+        // Utiliser le nouveau service de consolidation
+        const ConsolidationService = require('../services/ConsolidationService');
+        const results = await ConsolidationService.consolidateBatch(operations, {
+            force: options.force || false,
+            autoFix: options.autoFix !== false // true par défaut
+        });
+        
+        res.json({
+            success: true,
+            message: `${results.success.length} opération(s) consolidée(s), ${results.skipped.length} ignorée(s), ${results.errors.length} erreur(s)`,
+            results: results
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la consolidation par lot:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la consolidation par lot',
+            details: error.message
+        });
+    }
+});
+
+// POST /api/admin/monitoring/validate-and-transmit-batch - Valider et transmettre un lot
+router.post('/monitoring/validate-and-transmit-batch', async (req, res) => {
+    try {
+        const { tempsIds, triggerEdiJob = true, codeTache = null, adminMarkTransmitted = false } = req.body;
+        const adminMarkT = adminMarkTransmitted === true || String(adminMarkTransmitted).toLowerCase() === 'true';
+        
+        if (!Array.isArray(tempsIds) || tempsIds.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Liste d\'IDs requise'
+            });
+        }
+        
+        const result = await MonitoringService.validateAndTransmitBatch(tempsIds);
+        
+        if (!result.success) {
+            // Si des enregistrements invalides sont retournés, les inclure dans l'erreur
+            let errorMessage = result.error || 'Erreur lors de la validation/transmission';
+            if (result.invalidIds && result.invalidIds.length > 0) {
+                const invalidDetails = result.invalidIds.map(inv => {
+                    const errors = Array.isArray(inv.errors) ? inv.errors.join(', ') : inv.errors;
+                    return `TempsId ${inv.tempsId}: ${errors}`;
+                }).join('; ');
+                errorMessage += ` - Détails: ${invalidDetails}`;
+            }
+            return res.status(400).json({
+                success: false,
+                error: errorMessage,
+                invalidIds: result.invalidIds
+            });
+        }
+        
+        const remoteMode = String(process.env.SILOG_REMOTE_MODE || '').trim().toLowerCase();
+        const isScheduledMode = ['scheduled', 'disable', 'disabled', 'none'].includes(remoteMode);
+
+        // Déclencher l'EDI_JOB après validation (les lignes sont en 'O', donc visibles via V_REMONTE_TEMPS)
+        // En mode "scheduled/disabled", on ne déclenche rien ici: une tâche planifiée Windows sur SVC_SILOG (ou runner) s'en charge.
+        let ediJobResult = null;
+        if (triggerEdiJob && !isScheduledMode) {
+            try {
+                const idsForJob = result.validatedIds || tempsIds;
+                console.log(`[EDI_JOB][ROUTE] validate-and-transmit-batch: déclenchement pour ${idsForJob.length} IDs`);
+                ediJobResult = await EdiJobService.executeEdiJobForTransmittedRecords(idsForJob, codeTache);
+            } catch (ediError) {
+                console.error(`[EDI_JOB][ROUTE][ERROR] validate-and-transmit-batch: ${ediError.message}`);
+                ediJobResult = { success: false, error: ediError.message };
+            }
+        } else if (triggerEdiJob && isScheduledMode) {
+            ediJobResult = {
+                success: true,
+                skipped: true,
+                message: `EDI_JOB non déclenché par le backend (SILOG_REMOTE_MODE=${remoteMode}). Tâche planifiée Windows attendue.`
+            };
+        }
+
+        // Marquer comme transmis (T) pour retirer les lignes du dashboard admin :
+        // - mode direct : comme avant, seulement si EDI OK ou si EDI non demandé
+        // - mode planifié (SILOG tâche Windows) : sans marquage T par défaut, sauf action admin explicite (adminMarkTransmitted)
+        let markResult = null;
+        const idsToMark = result.validatedIds || tempsIds;
+        const shouldMarkFromAdmin = adminMarkT && isScheduledMode && Array.isArray(idsToMark) && idsToMark.length > 0;
+        const shouldMarkFromDirect = !isScheduledMode && (!triggerEdiJob || (ediJobResult?.success && !ediJobResult?.skipped));
+
+        if (shouldMarkFromAdmin || shouldMarkFromDirect) {
+            markResult = await MonitoringService.markBatchAsTransmitted(idsToMark);
+            if (shouldMarkFromAdmin && markResult?.success === false) {
+                return res.status(500).json({
+                    success: false,
+                    error: markResult.error || 'Impossible de marquer les enregistrements comme transmis (T)',
+                    validated: result.count
+                });
+            }
+        }
+
+        const successCore = !triggerEdiJob || ediJobResult?.success;
+        const success = shouldMarkFromAdmin
+            ? !!(result.success && markResult?.success !== false)
+            : (isScheduledMode || successCore);
+
+        return res.json({
+            success,
+            message: isScheduledMode && !adminMarkT
+                ? `${result.message} (planifié: tâche SILOG sur SVC_SILOG/runner Windows)`
+                : result.message,
+            count: result.count,
+            validatedIds: result.validatedIds || [],
+            invalidIds: result.invalidIds || [],
+            ediJob: ediJobResult,
+            marked: markResult,
+            adminMarkedTransmitted: shouldMarkFromAdmin
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la validation/transmission par lot:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la validation/transmission par lot'
+        });
+    }
+});
+
+// POST /api/admin/monitoring/repair-times-batch - Réparer StartTime/EndTime depuis ABHISTORIQUE_OPERATEURS
+router.post('/monitoring/repair-times-batch', async (req, res) => {
+    try {
+        const { tempsIds } = req.body;
+        if (!Array.isArray(tempsIds) || tempsIds.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Liste d\'IDs requise'
+            });
+        }
+
+        const results = { success: [], errors: [] };
+        for (const id of tempsIds) {
+            const tempsId = Number.parseInt(id, 10);
+            if (!Number.isFinite(tempsId)) {
+                results.errors.push({ tempsId: id, error: 'TempsId invalide' });
+                continue;
+            }
+            const r = await MonitoringService.repairRecordTimes(tempsId);
+            if (r.success) results.success.push({ tempsId, ...r.data });
+            else results.errors.push({ tempsId, error: r.error });
+        }
+
+        return res.json({
+            success: results.errors.length === 0,
+            message: `${results.success.length} réparé(s), ${results.errors.length} erreur(s)`,
+            results
+        });
+    } catch (error) {
+        console.error('❌ Erreur repair-times-batch:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la réparation des heures',
+            details: error.message
+        });
+    }
+});
+
+// ============================================
+// ROUTES EDI_JOB - Exécution de l'EDI_JOB de SILOG
+// ============================================
+
+const EdiJobService = require('../services/EdiJobService');
+
+// POST /api/admin/edi-job/execute - Déclencher l'EDI_JOB
+router.post('/edi-job/execute', async (req, res) => {
+    try {
+        const { codeTache, options } = req.body;
+        
+        if (!codeTache) {
+            return res.status(400).json({
+                success: false,
+                error: 'codeTache requis'
+            });
+        }
+        
+        const result = await EdiJobService.executeEdiJob(codeTache, options || {});
+        
+        if (result.success) {
+            res.json({
+                success: true,
+                message: result.message,
+                data: {
+                    codeTache: result.codeTache,
+                    stdout: result.stdout,
+                    warnings: result.warnings || false
+                }
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+        
+    } catch (error) {
+        console.error(`[EDI_JOB][ROUTE][ERROR] edi-job/execute: ${error.message}`);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de l\'exécution de l\'EDI_JOB'
+        });
+    }
+});
+
+// GET /api/admin/edi-job/config - Vérifier la configuration de l'EDI_JOB
+router.get('/edi-job/config', async (req, res) => {
+    try {
+        const result = await EdiJobService.checkConfiguration();
+        
+        res.json({
+            success: result.success,
+            config: result.config,
+            pathExists: result.pathExists,
+            pathError: result.pathError,
+            ready: result.ready
+        });
+        
+    } catch (error) {
+        console.error('❌ Erreur lors de la vérification de la configuration:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Erreur serveur lors de la vérification de la configuration'
+        });
+    }
+});
+
+// ============================================
+// RECONSOLIDATION & DIAGNOSTIC
+// ============================================
+
+// POST /api/admin/reconsolidate
+// Reconsolide toutes les opérations terminées (ou un sous-ensemble filtré) en recalculant
+// les durées depuis ABHISTORIQUE_OPERATEURS → ABTEMPS_OPERATEURS.
+// Corrige les durées incohérentes ET crée les lignes manquantes.
+router.post('/reconsolidate', async (req, res) => {
+    try {
+        const ConsolidationService = require('../services/ConsolidationService');
+        const { operatorCode, lancementCode, dateStart, dateEnd, dryRun = false } = req.body || {};
+
+        let whereClause = `WHERE h.Ident = 'FIN'`;
+        const params = {};
+        if (operatorCode) {
+            whereClause += ` AND h.OperatorCode = @operatorCode`;
+            params.operatorCode = operatorCode;
+        }
+        if (lancementCode) {
+            whereClause += ` AND h.CodeLanctImprod = @lancementCode`;
+            params.lancementCode = lancementCode;
+        }
+        if (dateStart) {
+            whereClause += ` AND CAST(h.DateCreation AS DATE) >= @dateStart`;
+            params.dateStart = dateStart;
+        }
+        if (dateEnd) {
+            whereClause += ` AND CAST(h.DateCreation AS DATE) <= @dateEnd`;
+            params.dateEnd = dateEnd;
+        }
+
+        const opsQuery = `
+            SELECT DISTINCT h.OperatorCode, h.CodeLanctImprod AS LancementCode
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+            ${whereClause}
+        `;
+        const ops = await executeQuery(opsQuery, params);
+
+        if (!ops || ops.length === 0) {
+            return res.json({ success: true, message: 'Aucune opération terminée à reconsolider.', count: 0, results: [] });
+        }
+
+        if (dryRun) {
+            return res.json({
+                success: true,
+                dryRun: true,
+                message: `${ops.length} opération(s) seraient reconsolidées.`,
+                operations: ops.slice(0, 200)
+            });
+        }
+
+        const results = await ConsolidationService.consolidateBatch(
+            ops.map(o => ({ OperatorCode: o.OperatorCode, LancementCode: o.LancementCode })),
+            { force: true, autoFix: true }
+        );
+
+        res.json({
+            success: true,
+            message: `Reconsolidation terminée: ${results.success.length} OK, ${results.skipped.length} ignorées, ${results.errors.length} erreurs.`,
+            count: ops.length,
+            successCount: results.success.length,
+            skippedCount: results.skipped.length,
+            errorCount: results.errors.length,
+            errors: results.errors.slice(0, 50)
+        });
+    } catch (error) {
+        console.error('❌ Erreur reconsolidation:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /api/admin/validate-temps — remplacé par la version avec contrôle LCTC (plus bas)
+
+// GET /api/admin/diagnostic-temps
+// Compare ABTEMPS_OPERATEURS avec ABHISTORIQUE_OPERATEURS pour identifier les incohérences.
+router.get('/diagnostic-temps', async (req, res) => {
+    try {
+        const { dateStart, dateEnd, operatorCode } = req.query;
+        let whereClause = 'WHERE 1=1';
+        const params = {};
+        if (operatorCode) {
+            whereClause += ` AND t.OperatorCode = @operatorCode`;
+            params.operatorCode = operatorCode;
+        }
+        if (dateStart) {
+            whereClause += ` AND CAST(t.DateCreation AS DATE) >= @dateStart`;
+            params.dateStart = dateStart;
+        }
+        if (dateEnd) {
+            whereClause += ` AND CAST(t.DateCreation AS DATE) <= @dateEnd`;
+            params.dateEnd = dateEnd;
+        }
+
+        const diagnosticQuery = `
+            SELECT
+                t.TempsId,
+                t.OperatorCode,
+                t.LancementCode,
+                t.Phase,
+                t.CodeRubrique,
+                t.DateCreation,
+                t.StatutTraitement,
+                t.ProductiveDuration AS Temps_ProductiveDuration_min,
+                t.TotalDuration      AS Temps_TotalDuration_min,
+                t.PauseDuration      AS Temps_PauseDuration_min,
+                t.StartTime,
+                t.EndTime,
+                -- Durée recalculée depuis l'historique
+                (SELECT COUNT(*) FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+                 WHERE h.OperatorCode = t.OperatorCode AND h.CodeLanctImprod = t.LancementCode
+                   AND CAST(h.DateCreation AS DATE) = CAST(t.DateCreation AS DATE)) AS NbEvenements,
+                CASE
+                    WHEN t.ProductiveDuration = 0 AND t.TotalDuration = 0 THEN 'ZERO_DUREE'
+                    WHEN t.StatutTraitement IS NULL THEN 'NON_VALIDE'
+                    ELSE 'OK'
+                END AS DiagStatus
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] t
+            ${whereClause}
+            ORDER BY t.DateCreation DESC, t.OperatorCode
+        `;
+
+        const rows = await executeQuery(diagnosticQuery, params);
+
+        const summary = {
+            total: rows.length,
+            zeroDuree: rows.filter(r => r.DiagStatus === 'ZERO_DUREE').length,
+            nonValide: rows.filter(r => r.DiagStatus === 'NON_VALIDE').length,
+            ok: rows.filter(r => r.DiagStatus === 'OK').length
+        };
+
+        res.json({ success: true, summary, data: rows });
+    } catch (error) {
+        console.error('❌ Erreur diagnostic-temps:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// GET /api/admin/diagnostic-orphans
+// Opérations terminées dans ABHISTORIQUE sans correspondance dans ABTEMPS (non consolidées).
+router.get('/diagnostic-orphans', async (req, res) => {
+    try {
+        const { dateStart, dateEnd } = req.query;
+        let dateCond = '';
+        const params = {};
+        if (dateStart) {
+            dateCond += ` AND CAST(h.DateCreation AS DATE) >= @dateStart`;
+            params.dateStart = dateStart;
+        }
+        if (dateEnd) {
+            dateCond += ` AND CAST(h.DateCreation AS DATE) <= @dateEnd`;
+            params.dateEnd = dateEnd;
+        }
+
+        const orphanQuery = `
+            SELECT DISTINCT
+                h.OperatorCode,
+                h.CodeLanctImprod AS LancementCode,
+                CAST(h.DateCreation AS DATE) AS DateOp,
+                (SELECT COUNT(*) FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] e
+                 WHERE e.OperatorCode = h.OperatorCode AND e.CodeLanctImprod = h.CodeLanctImprod
+                   AND CAST(e.DateCreation AS DATE) = CAST(h.DateCreation AS DATE)) AS NbEvenements
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABHISTORIQUE_OPERATEURS] h
+            WHERE h.Ident = 'FIN'
+              ${dateCond}
+              AND NOT EXISTS (
+                  SELECT 1 FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] t
+                  WHERE t.OperatorCode = h.OperatorCode
+                    AND t.LancementCode = h.CodeLanctImprod
+                    AND CAST(t.DateCreation AS DATE) = CAST(h.DateCreation AS DATE)
+              )
+            ORDER BY DateOp DESC, h.OperatorCode
+        `;
+
+        const orphans = await executeQuery(orphanQuery, params);
+        res.json({
+            success: true,
+            count: orphans.length,
+            message: `${orphans.length} opération(s) terminée(s) sans ligne dans ABTEMPS_OPERATEURS.`,
+            data: orphans
+        });
+    } catch (error) {
+        console.error('❌ Erreur diagnostic-orphans:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// GET /api/admin/silog-pipeline-status
+// Santé du flux ABTEMPS → V_REMONTE_TEMPS → SEDI_ETDIFF (SILOG).
+// Détecte si des enregistrements 'O' traînent (SEDI_ETDIFF bloquée ou arrêtée).
+router.get('/silog-pipeline-status', async (req, res) => {
+    try {
+        const staleHours = Number.parseInt(process.env.SILOG_STALE_THRESHOLD_HOURS || '24', 10);
+        const remoteMode = String(process.env.SILOG_REMOTE_MODE || '').trim().toLowerCase();
+
+        const statusQuery = `
+            SELECT
+                StatutTraitement,
+                COUNT(*) AS Nb,
+                MIN(DateCreation) AS PlusAncien,
+                MAX(DateCreation) AS PlusRecent
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS]
+            GROUP BY StatutTraitement
+        `;
+
+        const erpDb = process.env.DB_ERP_DATABASE || 'SEDI_ERP';
+        const staleQuery = `
+            SELECT
+                COUNT(*) AS NbStale,
+                SUM(CASE WHEN ISNULL(E.LancementSolde, 'O') = 'N' THEN 1 ELSE 0 END) AS NbStaleActionable,
+                SUM(CASE WHEN ISNULL(E.LancementSolde, 'O') <> 'N' THEN 1 ELSE 0 END) AS NbStaleSoldes,
+                MIN(t.DateCreation) AS PlusAncienStale
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[ABTEMPS_OPERATEURS] t
+            LEFT JOIN [${erpDb}].[dbo].[LCTE] E ON E.CodeLancement = t.LancementCode
+            WHERE t.StatutTraitement = 'O'
+              AND DATEDIFF(HOUR, t.DateCreation, GETDATE()) > @staleHours
+        `;
+
+        const viewCountQuery = `
+            SELECT COUNT(*) AS NbVue
+            FROM [SEDI_APP_INDEPENDANTE].[dbo].[V_REMONTE_TEMPS]
+        `;
+
+        const [statuses, stale, viewCount] = await Promise.all([
+            executeQuery(statusQuery),
+            executeQuery(staleQuery, { staleHours }),
+            executeQuery(viewCountQuery).catch(() => [{ NbVue: -1 }])
+        ]);
+
+        const statusMap = {};
+        for (const row of statuses) {
+            const key = row.StatutTraitement === null ? 'NULL' : row.StatutTraitement;
+            statusMap[key] = { count: row.Nb, oldest: row.PlusAncien, newest: row.PlusRecent };
+        }
+
+        const nbStale = stale?.[0]?.NbStale || 0;
+        const nbStaleActionable = stale?.[0]?.NbStaleActionable || 0;
+        const nbStaleSoldes = stale?.[0]?.NbStaleSoldes || 0;
+        const oldestStale = stale?.[0]?.PlusAncienStale || null;
+        const nbInView = viewCount?.[0]?.NbVue ?? -1;
+
+        let health = 'OK';
+        const warnings = [];
+
+        if (nbStaleActionable > 0) {
+            health = 'WARNING';
+            warnings.push(
+                `${nbStaleActionable} enregistrement(s) en 'O' depuis >${staleHours}h sur lancements NON soldés ` +
+                `(plus ancien : ${oldestStale}). SEDI_ETDIFF est peut-être bloquée ou arrêtée sur SVC_SILOG.`
+            );
+        }
+        if (nbStaleSoldes > 0) {
+            warnings.push(
+                `${nbStaleSoldes} enregistrement(s) en 'O' stale sur lancements soldés (EDI ne peut pas intégrer — hors alerte critique).`
+            );
+        }
+
+        const nbNull = statusMap['NULL']?.count || 0;
+        const nbO = statusMap['O']?.count || 0;
+        const nbT = statusMap['T']?.count || 0;
+
+        if (nbNull > 0 && nbO === 0 && nbT === 0) {
+            health = 'WARNING';
+            warnings.push(
+                `Tous les enregistrements (${nbNull}) sont en StatutTraitement=NULL. ` +
+                `La validation automatique de 20h est désactivée. ` +
+                `Utilisez POST /api/admin/validate-temps pour forcer.`
+            );
+        }
+
+        if (nbInView === 0 && nbO > 0) {
+            health = 'WARNING';
+            warnings.push(
+                `V_REMONTE_TEMPS retourne 0 lignes alors que ${nbO} enregistrements sont en 'O'. Vérifiez la vue.`
+            );
+        }
+
+        res.json({
+            success: true,
+            health,
+            warnings,
+            pipeline: {
+                remoteMode: remoteMode || '(non défini)',
+                executionPoste: 'SVC_SILOG (tâche planifiée Windows)',
+                utilisateurSilog: process.env.SILOG_USER || 'Production8',
+                codeTache: process.env.SILOG_TASK_CODE || process.env.SILOG_CODE_TACHE || 'SEDI_ETDIFF',
+                staleThresholdHours: staleHours
+            },
+            counts: {
+                NULL: nbNull,
+                O: nbO,
+                T: nbT,
+                total: nbNull + nbO + nbT,
+                vueRemonteTemps: nbInView,
+                staleO: nbStale,
+                staleOActionable: nbStaleActionable,
+                staleOSoldes: nbStaleSoldes,
+                oldestStale
+            },
+            detail: statusMap
+        });
+    } catch (error) {
+        console.error('❌ Erreur silog-pipeline-status:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ============================================
+// Validation temps SILOG — cohérence LCTC
+// ============================================
+const OperationValidationService = require('../services/OperationValidationService');
+
+// POST /api/admin/validate-temps — passe StatutTraitement = 'O' si cohérent LCTC
+router.post('/validate-temps', authenticateAdmin, async (req, res) => {
+    try {
+        const { tempsIds, all = false, beforeDate } = req.body || {};
+        const result = await MonitoringService.validateEligibleTempsIds({
+            tempsIds,
+            all,
+            beforeDate
+        });
+
+        if (!result.success) {
+            return res.status(400).json(result);
+        }
+
+        res.json(result);
+    } catch (error) {
+        console.error('❌ Erreur validate-temps:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// GET /api/admin/diagnostic-lctc — temps non intégrables (pas de ligne LCTC correspondante)
+router.get('/diagnostic-lctc', authenticateAdmin, async (req, res) => {
+    try {
+        const { dateStart, dateEnd, operatorCode, statutTraitement } = req.query;
+        const rows = await OperationValidationService.listLctcIncoherentRecords({
+            dateStart,
+            dateEnd,
+            operatorCode,
+            statutTraitement
+        });
+
+        res.json({
+            success: true,
+            count: rows.length,
+            data: rows,
+            hint: 'Ces lignes ne peuvent pas être validées pour SILOG tant que CodeLancement/Phase/CodeRubrique ne correspondent pas à LCTC.'
+        });
+    } catch (error) {
+        console.error('❌ Erreur diagnostic-lctc:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+module.exports = router;
+module.exports.processLancementEventsWithPauses = processLancementEventsWithPauses;
+module.exports.getAdminOperations = getAdminOperations;
+module.exports.normalizeAdminWorkDate = normalizeAdminWorkDate;
